@@ -3,6 +3,7 @@ use eframe::egui::{self, RichText};
 use g_terminal::{
     config::RemoteProfile,
     remote::{self, ConnectJob, Connection, Credentials, Direction, Transfer},
+    ztransfer,
 };
 use std::{
     path::PathBuf,
@@ -143,7 +144,31 @@ impl Login {
     }
 }
 
-type Operation = Arc<Mutex<Option<Result<String, String>>>>;
+/// Where a background operation leaves its final message.
+type Outcome = Arc<Mutex<Option<Result<String, String>>>>;
+
+/// A ZMODEM transfer the file window keeps on screen while it runs.
+struct Operation {
+    progress: Arc<Mutex<ztransfer::Progress>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    result: Outcome,
+}
+
+impl Operation {
+    fn state(&self) -> ztransfer::Progress {
+        self.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    fn outcome(&self) -> Option<Result<String, String>> {
+        self.result.lock().unwrap().clone()
+    }
+    fn running(&self) -> bool {
+        self.result.lock().unwrap().is_none()
+    }
+}
+
 pub struct Files {
     pub connection: Arc<Connection>,
     directory: Arc<Mutex<remote::DirectoryState>>,
@@ -156,8 +181,15 @@ pub struct Files {
     error: Option<String>,
     pub transfers: Vec<Transfer>,
     operation: Option<Operation>,
+    /// Conflict a running ZMODEM transfer is waiting on an answer for.
+    question: Option<ztransfer::Question>,
+    questions: Option<tokio::sync::mpsc::UnboundedReceiver<ztransfer::Question>>,
+    answers: Option<tokio::sync::mpsc::UnboundedSender<ztransfer::Decision>>,
+    rename: String,
     sudo_destination: String,
     split_ratio: f32,
+    /// Height of the two file lists, adapted to the window's shape.
+    list_height: f32,
     show_hidden: bool,
 }
 impl Files {
@@ -181,13 +213,42 @@ impl Files {
             error: None,
             transfers: vec![],
             operation: None,
+            question: None,
+            questions: None,
+            answers: None,
+            rename: String::new(),
             sudo_destination: String::new(),
             split_ratio: 0.5,
+            list_height: 280.0,
             show_hidden: !hide_dotfiles,
         };
         this.refresh_local();
         this
     }
+    /// Picks up a conflict a running transfer is blocked on.
+    fn poll_question(&mut self) {
+        if let Some(questions) = &mut self.questions {
+            while let Ok(question) = questions.try_recv() {
+                self.rename = question.name();
+                self.question = Some(question);
+            }
+        }
+    }
+
+    /// True while a ZMODEM transfer wants the window on screen.
+    pub fn busy(&self) -> bool {
+        self.operation.as_ref().is_some_and(Operation::running)
+    }
+
+    /// Asks a running transfer to stop; it aborts the peer and cleans up.
+    pub fn cancel(&self) {
+        if let Some(operation) = &self.operation {
+            operation
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     fn refresh_local(&mut self) {
         self.local_entries.clear();
         self.selected_local = None;
@@ -215,8 +276,7 @@ impl Files {
             Err(e) => self.error = Some(e.to_string()),
         }
     }
-    fn refresh_remote(&mut self, ctx: &egui::Context) {
-        self.directory =
+    fn refresh_remote(&mut self, ctx: &egui::Context) {        self.directory =
             remote::list_directory(self.connection.clone(), self.remote_path.clone(), wake(ctx));
         self.selected_remote = None;
     }
@@ -249,8 +309,9 @@ impl Files {
                 self.remote_child(&entry.name),
             )
         };
-        let state = Arc::new(Mutex::new(None));
-        self.operation = Some(state.clone());
+        let Some((handle, operation)) = self.begin("ZMODEM") else {
+            return;
+        };
         let connection = self.connection.clone();
         let wake = wake(ctx);
         remote::runtime().spawn(async move {
@@ -268,34 +329,151 @@ impl Files {
                 channel.exec(true, command).await?;
                 let mut stream = channel.into_stream();
                 if upload {
-                    g_terminal::ztransfer::send(&mut stream, &local).await?;
+                    g_terminal::ztransfer::send(&mut stream, &local, &handle).await?;
+                    Ok("ZMODEM 上传完成".into())
                 } else {
-                    g_terminal::ztransfer::receive(&mut stream, &local).await?;
+                    let saved = g_terminal::ztransfer::receive(&mut stream, &local, &handle).await?;
+                    Ok(format!("ZMODEM 已保存到 {}", saved.display()))
                 }
-                Ok("ZMODEM 完成".into())
             }
             .await;
-            *state.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+            *operation.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
             wake();
         });
     }
-    pub fn start_zmodem_from_terminal(&mut self, ctx: &egui::Context) {
-        let state = Arc::new(Mutex::new(None));
-        self.operation = Some(state.clone());
-        let connection = self.connection.clone();
-        let local = PathBuf::from(&self.local_path);
+
+    /// Reserves the single operation slot for a short SFTP-side action.
+    fn simple(&mut self, name: &str) -> Outcome {
+        let result = Arc::new(Mutex::new(None));
+        self.operation = Some(Operation {
+            progress: Arc::new(Mutex::new(ztransfer::Progress {
+                name: name.into(),
+                message: "进行中".into(),
+                ..Default::default()
+            })),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            result: result.clone(),
+        });
+        result
+    }
+
+    /// Reserves the single ZMODEM slot and wires up its question channel.
+    /// Refuses while another transfer still owns the slot.
+    fn begin(&mut self, name: &str) -> Option<(ztransfer::Handle, Outcome)> {
+        if self.busy() {
+            self.error = Some("已有传输正在进行，请等待完成或先取消".into());
+            return None;
+        }
+        let (ask, questions, answers) = ztransfer::ask_channel();
+        self.questions = Some(questions);
+        self.answers = Some(answers);
+        self.question = None;
+        self.rename.clear();
+        let result = Arc::new(Mutex::new(None));
+        let handle = ztransfer::Handle::new(name, Some(ask));
+        self.operation = Some(Operation {
+            progress: handle.progress.clone(),
+            cancel: handle.cancel.clone(),
+            result: result.clone(),
+        });
+        Some((handle, result))
+    }
+
+    /// Answers and progress of a running ZMODEM transfer, for the status bar.
+    pub fn operation_state(&self) -> Option<ztransfer::Progress> {
+        self.operation.as_ref().map(Operation::state)
+    }
+
+    /// Draws the overwrite / rename / resume prompt for an incoming file.
+    pub fn show_question(&mut self, ctx: &egui::Context, p: Palette) {
+        self.poll_question();
+        let Some(question) = self.question.clone() else {
+            return;
+        };
+        let mut answer = None;
+        egui::Window::new("ZMODEM 文件冲突")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(400.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "服务器正在发送 {}（{}）",
+                    question.name(),
+                    format_size(question.total)
+                ));
+                if let Some(size) = question.existing {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 160, 60),
+                        format!("目标位置已有同名文件，{}", format_size(size)),
+                    );
+                }
+                if let Some(size) = question.partial {
+                    ui.label(hint(
+                        &format!("存在未完成的下载，可续传（已完成 {}）", format_size(size)),
+                        p,
+                    ));
+                }
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if question.can_resume() && ui.button("续传").clicked() {
+                        answer = Some(ztransfer::Decision::Resume);
+                    }
+                    if ui
+                        .button("覆盖")
+                        .on_hover_text("传输完成后替换同名文件；中途失败不会破坏原文件")
+                        .clicked()
+                    {
+                        answer = Some(ztransfer::Decision::Overwrite);
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.rename)
+                            .desired_width(150.0)
+                            .hint_text(hint("另存为…", p)),
+                    );
+                    if ui.button("重命名").clicked() {
+                        answer = Some(ztransfer::Decision::Rename(self.rename.clone()));
+                    }
+                    if ui.button("取消传输").clicked() {
+                        answer = Some(ztransfer::Decision::Cancel);
+                    }
+                });
+            });
+        if let Some(answer) = answer
+            && let Some(answers) = &self.answers
+        {
+            let _ = answers.send(answer);
+            self.question = None;
+        }
+    }
+    pub fn start_terminal_zmodem(
+        &mut self,
+        stream: g_terminal::session::BridgeStream,
+        upload: bool,
+        local: PathBuf,
+        ctx: &egui::Context,
+    ) {
+        let name = local
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ZMODEM".into());
+        let Some((handle, operation)) = self.begin(&name) else {
+            return;
+        };
         let wake = wake(ctx);
         remote::runtime().spawn(async move {
             let result: anyhow::Result<String> = async {
-                let _permit = connection.transfer_gate.clone().acquire_owned().await?;
-                let channel = connection.handle.channel_open_session().await?;
-                channel.exec(true, "rz --binary --protect").await?;
-                let mut stream = channel.into_stream();
-                g_terminal::ztransfer::receive(&mut stream, &local).await?;
-                Ok("ZMODEM 接收完成".into())
+                let mut stream = stream;
+                if upload {
+                    g_terminal::ztransfer::send(&mut stream, &local, &handle).await?;
+                    Ok("ZMODEM 上传完成".into())
+                } else {
+                    let saved = g_terminal::ztransfer::receive(&mut stream, &local, &handle).await?;
+                    Ok(format!("ZMODEM 已保存到 {}", saved.display()))
+                }
             }
             .await;
-            *state.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+            *operation.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
             wake();
         });
     }
@@ -373,7 +551,7 @@ impl Files {
         });
         egui::ScrollArea::vertical()
             .id_salt("local-files")
-            .max_height(280.0)
+            .max_height(self.list_height)
             .show(ui, |ui| {
                 for (name, dir, size, symlink) in &self.local_entries {
                     if !self.show_hidden && name.starts_with('.') {
@@ -433,7 +611,7 @@ impl Files {
         }
         egui::ScrollArea::vertical()
             .id_salt("remote-files")
-            .max_height(280.0)
+            .max_height(self.list_height)
             .show(ui, |ui| {
                 for entry in &state.entries {
                     if !self.show_hidden && entry.name.starts_with('.') {
@@ -479,12 +657,13 @@ impl Files {
     }
     pub fn show(&mut self, ctx: &egui::Context, open: &mut bool, p: Palette, hide_dotfiles: bool) {
         self.show_hidden = self.show_hidden || !hide_dotfiles;
+        self.poll_question();
         egui::Window::new(format!("文件 · {}", self.connection.profile.label()))
             .open(open)
-            .default_size([760.0, 520.0])
-            .min_width(560.0)
+            .default_size([620.0, 460.0])
+            .min_width(340.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("SFTP").color(p.accent));
                     ui.label(hint(
                         "双击目录进入 · 文件以 .gterminal.part 续传 · 不自动覆盖同名目标",
@@ -500,28 +679,63 @@ impl Files {
                 let mut local_next = None;
                 let mut remote_next = None;
                 let available = ui.available_width();
-                let left_width = (available * self.split_ratio.clamp(0.25, 0.75)).round();
-                ui.horizontal(|ui| {
-                    let mut local_rect = ui.available_rect_before_wrap();
-                    local_rect.max.x = local_rect.min.x + left_width;
-                    ui.scope_builder(egui::UiBuilder::new().max_rect(local_rect), |ui| {
-                        self.show_local_pane(ui, p, &mut local_next)
-                    });
-                    let mut divider = local_rect;
-                    divider.min.x = divider.max.x - 3.0;
-                    let drag = ui.interact(divider, ui.id().with("files-split"), egui::Sense::drag());
-                    if drag.dragged()
-                        && let Some(pos) = drag.interact_pointer_pos()
-                    {
-                        self.split_ratio =
-                            ((pos.x - local_rect.min.x) / available).clamp(0.25, 0.75);
-                    }
-                    drag.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-                    let remote_rect = ui.available_rect_before_wrap();
-                    ui.scope_builder(egui::UiBuilder::new().max_rect(remote_rect), |ui| {
-                        self.show_remote_pane(ui, p, &mut remote_next)
-                    });
+                let area = ui.available_rect_before_wrap();
+                // Side by side needs room for two readable columns; a narrow
+                // window stacks them instead so it stays usable when shrunk.
+                let stacked = available < 520.0;
+                let pane = egui::Layout::top_down(egui::Align::LEFT);
+                let (local_rect, remote_rect, divider) = if stacked {
+                    let half = (area.height() * self.split_ratio.clamp(0.2, 0.8)).round();
+                    let cut = area.top() + half;
+                    (
+                        egui::Rect::from_min_max(area.min, egui::pos2(area.right(), cut - 3.0)),
+                        egui::Rect::from_min_max(egui::pos2(area.left(), cut + 3.0), area.max),
+                        egui::Rect::from_min_max(
+                            egui::pos2(area.left(), cut - 3.0),
+                            egui::pos2(area.right(), cut + 3.0),
+                        ),
+                    )
+                } else {
+                    let left = area.left() + (available * self.split_ratio.clamp(0.25, 0.75)).round();
+                    (
+                        egui::Rect::from_min_max(area.min, egui::pos2(left - 3.0, area.bottom())),
+                        egui::Rect::from_min_max(egui::pos2(left + 3.0, area.top()), area.max),
+                        egui::Rect::from_min_max(
+                            egui::pos2(left - 3.0, area.top()),
+                            egui::pos2(left + 3.0, area.bottom()),
+                        ),
+                    )
+                };
+                let mut local_ui = ui.new_child(
+                    egui::UiBuilder::new().max_rect(local_rect).layout(pane),
+                );
+                self.show_local_pane(&mut local_ui, p, &mut local_next);
+                let mut remote_ui = ui.new_child(
+                    egui::UiBuilder::new().max_rect(remote_rect).layout(pane),
+                );
+                self.show_remote_pane(&mut remote_ui, p, &mut remote_next);
+                let drag = ui.interact(divider, ui.id().with("files-split"), egui::Sense::drag());
+                if drag.dragged()
+                    && let Some(pos) = drag.interact_pointer_pos()
+                {
+                    self.split_ratio = if stacked {
+                        ((pos.y - area.top()) / area.height().max(1.0)).clamp(0.2, 0.8)
+                    } else {
+                        ((pos.x - area.left()) / available.max(1.0)).clamp(0.25, 0.75)
+                    };
+                }
+                drag.on_hover_cursor(if stacked {
+                    egui::CursorIcon::ResizeVertical
+                } else {
+                    egui::CursorIcon::ResizeHorizontal
                 });
+                ui.allocate_rect(area, egui::Sense::hover());
+                self.list_height = (if stacked {
+                    area.height() * self.split_ratio - 40.0
+                } else {
+                    280.0
+                })
+                .clamp(90.0, 600.0);
                 if let Some(path) = local_next {
                     self.local_path = path;
                     self.refresh_local();
@@ -531,7 +745,7 @@ impl Files {
                     self.refresh_remote(ctx);
                 }
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
                             self.selected_local.as_ref().is_some_and(|p| p.is_file()),
@@ -589,8 +803,7 @@ impl Files {
                                 .selected_remote
                                 .as_ref()
                                 .map(|e| self.remote_child(&e.name));
-                            let state = Arc::new(Mutex::new(None));
-                            self.operation = Some(state.clone());
+                            let state = self.simple("新建目录 / 重命名");
                             let wake = wake(ctx);
                             remote::runtime().spawn(async move {
                                 let result: anyhow::Result<()> = async {
@@ -631,8 +844,7 @@ impl Files {
                     {
                         let source = self.remote_child(&entry.name);
                         let target = self.sudo_destination.clone();
-                        let state = Arc::new(Mutex::new(None));
-                        self.operation = Some(state.clone());
+                        let state = self.simple("sudo 安装");
                         let connection = self.connection.clone();
                         let wake = wake(ctx);
                         remote::runtime().spawn(async move {
@@ -675,23 +887,49 @@ impl Files {
                         });
                     }
                 });
-                if let Some(operation) = &self.operation
-                    && let Some(result) = &*operation.lock().unwrap()
-                {
-                    match result {
-                        Ok(message) => {
+                if let Some(operation) = &self.operation {
+                    let state = operation.state();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(state.name.clone()).color(p.accent));
+                        if state.total > 0 {
+                            ui.add(
+                                egui::ProgressBar::new(state.fraction())
+                                    .desired_width(160.0)
+                                    .show_percentage(),
+                            );
+                            ui.label(hint(
+                                &format!(
+                                    "{} / {} · {}",
+                                    format_size(state.done),
+                                    format_size(state.total),
+                                    state.message
+                                ),
+                                p,
+                            ));
+                        } else {
+                            ui.label(hint(&state.message, p));
+                        }
+                        if operation.running() && ui.small_button("取消").clicked() {
+                            operation
+                                .cancel
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    });
+                    match operation.outcome() {
+                        Some(Ok(message)) => {
                             ui.colored_label(p.accent, message);
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             ui.colored_label(egui::Color32::LIGHT_RED, e);
                         }
+                        None => {}
                     }
                 }
                 if let Some(error) = &self.error {
                     ui.colored_label(egui::Color32::LIGHT_RED, error);
                 }
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(hint("ZMODEM（服务器需安装 rz / sz）", p));
                     if ui.button("上传选中文件").clicked() {
                         self.start_zmodem(true, ctx);
@@ -750,7 +988,7 @@ impl Files {
             });
     }
 }
-fn format_size(n: u64) -> String {
+pub fn format_size(n: u64) -> String {
     if n >= 1024 * 1024 {
         format!("{:.1} MiB", n as f64 / 1048576.0)
     } else if n >= 1024 {

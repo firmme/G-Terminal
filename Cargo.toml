@@ -26,6 +26,7 @@ base64 = "0.22"
 memmap2 = "0.9"
 cosmic-text = { version = "=0.17.0", default-features = false, features = ["std", "swash"] }
 zmodem2 = "=0.7.2"
+rfd = "0.15"
 # russh 0.58's RSA prerelease uses the pre-stable PKCS8 error API.
 pkcs8-compat = { package = "pkcs8", version = "=0.11.0-rc.11" }
 

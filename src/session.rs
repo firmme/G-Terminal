@@ -100,10 +100,105 @@ impl SessionKind {
 enum Control {
     Write(Vec<u8>),
     Resize(PtySize),
+    /// Route raw session bytes through a terminal-initiated ZMODEM transfer.
+    ZmodemBridge {
+        to_transfer: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        from_transfer: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    },
+}
+
+type ZmodemBridge = (
+    tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+);
+
+/// A ZMODEM endpoint wired into a live session channel: data arriving from the
+/// remote host is read here, and frames written here are sent back to it.
+pub struct BridgeStream {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    buffer: Vec<u8>,
+    position: usize,
+}
+
+impl tokio::io::AsyncRead for BridgeStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        loop {
+            if self.position < self.buffer.len() {
+                let n = (self.buffer.len() - self.position).min(buf.remaining());
+                buf.put_slice(&self.buffer[self.position..self.position + n]);
+                self.position += n;
+                if self.position == self.buffer.len() {
+                    self.buffer.clear();
+                    self.position = 0;
+                }
+                return std::task::Poll::Ready(Ok(()));
+            }
+            match self.rx.poll_recv(cx) {
+                std::task::Poll::Ready(Some(chunk)) => {
+                    self.buffer = chunk;
+                    self.position = 0;
+                }
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for BridgeStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.tx.send(buf.to_vec()).is_err() {
+            return std::task::Poll::Ready(Err(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            )));
+        }
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionStatus {
+    /// A saved pane that has not been connected yet.
+    Detached,
+    /// A live shell or SSH channel.
+    Live,
+    /// Ended on its own, or dropped without a clean exit.
+    Lost,
+}
+
+impl SessionStatus {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Detached => "未连接",
+            Self::Live => "已连接",
+            Self::Lost => "异常断开",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct SessionStatus {
+pub struct Status {
     pub exit_code: Option<u32>,
     pub error: Option<String>,
     pub eof: bool,
@@ -111,22 +206,39 @@ pub struct SessionStatus {
 
 pub struct Session {
     pub terminal: Arc<Mutex<Terminal>>,
-    pub status: Arc<Mutex<SessionStatus>>,
+    pub status: Arc<Mutex<Status>>,
     pub kind: SessionKind,
     pub pid: Option<u32>,
     pub size: (u16, u16),
     pub remote: Option<Arc<crate::remote::Connection>>,
+    /// False once the session has actually been started.
+    detached: bool,
     input: SyncSender<Control>,
     stop: Arc<AtomicBool>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
 }
 
 impl Session {
+    /// How the tab strip should light this session up.
+    pub fn link(&self) -> SessionStatus {
+        if self.detached {
+            return SessionStatus::Detached;
+        }
+        let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        match (status.exit_code, status.eof, &status.error) {
+            // A clean exit is a normal end, not a failure.
+            (Some(0), _, None) => SessionStatus::Detached,
+            (Some(_), _, _) => SessionStatus::Lost,
+            (None, true, _) | (None, _, Some(_)) => SessionStatus::Lost,
+            (None, false, None) => SessionStatus::Live,
+        }
+    }
+
     pub fn disconnected(kind: SessionKind, scrollback: usize) -> Self {
         let (input, _) = mpsc::sync_channel(1);
         Self {
             terminal: Arc::new(Mutex::new(Terminal::new(30, 100, scrollback))),
-            status: Arc::new(Mutex::new(SessionStatus {
+            status: Arc::new(Mutex::new(Status {
                 exit_code: Some(0),
                 eof: true,
                 error: None,
@@ -135,6 +247,7 @@ impl Session {
             pid: None,
             size: (30, 100),
             remote: None,
+            detached: true,
             input,
             stop: Arc::new(AtomicBool::new(true)),
             killer: None,
@@ -166,7 +279,7 @@ impl Session {
         let killer = child.clone_killer();
         drop(pair.slave);
         let terminal = Arc::new(Mutex::new(Terminal::new(size.rows, size.cols, scrollback)));
-        let status = Arc::new(Mutex::new(SessionStatus::default()));
+        let status = Arc::new(Mutex::new(Status::default()));
         let stop = Arc::new(AtomicBool::new(false));
         // Bounded input; output is parsed immediately into a bounded screen on a worker.
         let (input, receiver) = mpsc::sync_channel::<Control>(64);
@@ -224,6 +337,7 @@ impl Session {
                                     .unwrap()
                                     .resize(size.rows, size.cols)
                             }),
+                            Control::ZmodemBridge { .. } => Ok(()),
                         };
                         if let Err(e) = result {
                             control_status.lock().unwrap().error = Some(e.to_string());
@@ -255,6 +369,7 @@ impl Session {
             stop,
             killer: Some(killer),
             remote: None,
+            detached: false,
         })
     }
 
@@ -264,7 +379,7 @@ impl Session {
         wake: crate::remote::Wake,
     ) -> Self {
         let terminal = Arc::new(Mutex::new(Terminal::new(30, 100, scrollback)));
-        let status = Arc::new(Mutex::new(SessionStatus::default()));
+        let status = Arc::new(Mutex::new(Status::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let (input, receiver) = mpsc::sync_channel::<Control>(64);
         let (out, state, stopped, connection_task) = (
@@ -280,23 +395,51 @@ impl Session {
                 channel.request_pty(true, "xterm-256color", 100, 30, 0, 0, &[]).await?;
                 channel.request_shell(true).await?;
                 let mut tick = tokio::time::interval(Duration::from_millis(10));
+                let mut bridge: Option<ZmodemBridge> = None;
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {
                             if stopped.load(Ordering::Acquire) { channel.close().await?; break; }
+                            if let Some((_, frames)) = bridge.as_mut() {
+                                loop {
+                                    match frames.try_recv() {
+                                        Ok(data) => channel.data(&data[..]).await?,
+                                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                            // The transfer task finished; resume the shell.
+                                            bridge = None;
+                                            break;
+                                        }
+                                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                    }
+                                }
+                            }
                             for _ in 0..16 {
                                 match receiver.try_recv() {
-                                    Ok(Control::Write(bytes)) => channel.data(&bytes[..]).await?,
-                                    Ok(Control::Resize(size)) => { channel.window_change(size.cols as u32, size.rows as u32, 0, 0).await?; out.lock().unwrap().resize(size.rows, size.cols); },
+                                    Ok(Control::Write(bytes)) => {
+                                        // Keystrokes would corrupt an in-flight ZMODEM stream.
+                                        if !bridge.is_some() {
+                                            channel.data(&bytes[..]).await?;
+                                        }
+                                    }
+                                    Ok(Control::Resize(size)) => { channel.window_change(size.cols as u32, size.rows as u32, 0, 0).await?; out.lock().unwrap().resize(size.rows, size.cols); }
+                                    Ok(Control::ZmodemBridge { to_transfer, from_transfer }) => { bridge = Some((to_transfer, from_transfer)); }
                                     Err(_) => break,
                                 }
                             }
                         }
                         message = channel.wait() => match message {
                             Some(russh::ChannelMsg::Data { data }) | Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
-                                let replies = { let mut t=out.lock().unwrap(); t.process(&data); std::mem::take(&mut t.parser.callbacks_mut().replies) };
-                                if !replies.is_empty() { channel.data(&replies[..]).await?; }
-                                wake();
+                                if let Some((to_transfer, _)) = bridge.as_ref() {
+                                    // While a ZMODEM transfer owns the channel its
+                                    // binary stream must bypass the VT parser.
+                                    if to_transfer.send(data.to_vec()).is_err() {
+                                        bridge = None;
+                                    }
+                                } else {
+                                    let replies = { let mut t=out.lock().unwrap(); t.process(&data); std::mem::take(&mut t.parser.callbacks_mut().replies) };
+                                    if !replies.is_empty() { channel.data(&replies[..]).await?; }
+                                    wake();
+                                }
                             }
                             Some(russh::ChannelMsg::ExitStatus { exit_status }) => { state.lock().unwrap().exit_code=Some(exit_status); wake(); }
                             Some(russh::ChannelMsg::Close) | None => break,
@@ -322,7 +465,32 @@ impl Session {
             stop,
             killer: None,
             remote: Some(connection),
+            detached: false,
         }
+    }
+
+    /// Take over the session channel for a terminal-initiated ZMODEM transfer
+    /// (`rz`/`sz` typed at the remote prompt). Ends when the transfer task
+    /// drops the returned stream.
+    pub fn begin_terminal_zmodem(&self) -> Result<BridgeStream> {
+        anyhow::ensure!(
+            self.remote.is_some(),
+            "仅内置 SSH 会话支持 ZMODEM 抓取"
+        );
+        let (to_transfer, to_transfer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (from_transfer_tx, from_transfer) = tokio::sync::mpsc::unbounded_channel();
+        self.input
+            .try_send(Control::ZmodemBridge {
+                to_transfer,
+                from_transfer,
+            })
+            .context("会话已关闭，无法开始 ZMODEM 传输")?;
+        Ok(BridgeStream {
+            rx: to_transfer_rx,
+            tx: from_transfer_tx,
+            buffer: Vec::new(),
+            position: 0,
+        })
     }
 
     pub fn write(&self, bytes: Vec<u8>) -> Result<()> {

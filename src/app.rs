@@ -1,5 +1,5 @@
 use crate::{
-    remote_ui::{self, Files, Login, hint},
+    remote_ui::{self, Files, Login, format_size, hint},
     theme::{Palette, load_fonts},
     view::Pane,
 };
@@ -8,7 +8,7 @@ use g_terminal::{
     config::{Forward, RemoteProfile, Settings},
     layout::{Axis, Layout as PaneLayout, SavedTab},
     remote::Connection,
-    session::{Session, SessionKind},
+    session::{Session, SessionKind, SessionStatus},
 };
 use std::sync::Arc;
 
@@ -53,6 +53,7 @@ pub struct App {
     login_target: Option<(u64, u64)>,
     files: Option<Files>,
     files_open: bool,
+    split_chooser: Option<(u64, u64)>,
     screenshot: Option<std::path::PathBuf>,
     started: std::time::Instant,
     screenshot_requested: bool,
@@ -100,6 +101,7 @@ impl App {
             login_target: None,
             files: None,
             files_open: false,
+            split_chooser: None,
             screenshot,
             started: std::time::Instant::now(),
             screenshot_requested: false,
@@ -237,10 +239,13 @@ impl App {
                         self.spawn(SessionKind::Local(self.settings.default_shell.clone()), ctx)
                     };
                     if let Some(p) = pane {
+                        let pane_id = p.id;
+                        let tab_id = self.tabs[self.active].id;
                         let t = &mut self.tabs[self.active];
                         t.layout.split(t.focused, t.panes.len(), axis);
                         t.focused = t.panes.len();
                         t.panes.push(p);
+                        self.split_chooser = Some((tab_id, pane_id));
                     }
                 }
             }
@@ -394,6 +399,47 @@ impl App {
         });
         action
     }
+    fn begin_terminal_zmodem(
+        &mut self,
+        upload: bool,
+        local: std::path::PathBuf,
+        connection: &Arc<Connection>,
+        ctx: &egui::Context,
+    ) {
+        if let Some(files) = &self.files
+            && !Arc::ptr_eq(&files.connection, connection)
+            && files
+                .transfers
+                .iter()
+                .any(|t| t.state.lock().unwrap().running)
+        {
+            self.error = Some("文件窗口还有其他连接的传输任务，请完成后再试".into());
+            return;
+        }
+        if self.files.as_ref().is_some_and(Files::busy) {
+            self.error = Some("文件窗口还有 ZMODEM 传输任务，请完成或取消后再试".into());
+            return;
+        }
+        if self
+            .files
+            .as_ref()
+            .is_none_or(|f| !Arc::ptr_eq(&f.connection, connection))
+        {
+            self.files = Some(Files::new(connection.clone(), ctx, self.settings.hide_dotfiles));
+        }
+        self.files_open = true;
+        let grab = self.tabs[self.active].panes[self.tabs[self.active].focused]
+            .session
+            .begin_terminal_zmodem();
+        match grab {
+            Ok(stream) => {
+                if let Some(files) = self.files.as_mut() {
+                    files.start_terminal_zmodem(stream, upload, local, ctx);
+                }
+            }
+            Err(e) => self.error = Some(format!("{e:#}")),
+        }
+    }
     fn titlebar(&mut self, ctx: &egui::Context) {
         let p = self.palette;
         let bar = egui::TopBottomPanel::top("titlebar")
@@ -403,51 +449,57 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(6, 1)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("G-Terminal")
-                            .color(p.muted)
-                            .strong(),
-                    );
-                    let mut maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                    // Drag anywhere on the empty stretch to move the window.
-                    let drag = ui.allocate_ui_with_layout(
-                        egui::vec2(
-                            (ui.available_width()
-                                - 3.0 * 30.0
-                                - ui.style().spacing.item_spacing.x * 2.0)
-                                .max(10.0),
-                            ui.available_height(),
-                        ),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |_ui| {},
-                    );
-                    if drag.response.dragged_by(egui::PointerButton::Primary) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
-                    if drag.response.double_clicked() {
-                        maximized = !maximized;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
-                    }
+                let mut maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                let mut close = false;
+                // The buttons sit at the right edge, the drag strip fills what
+                // is left over between the title and them.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let button = |ui: &mut egui::Ui, label: &str, tip: &str| {
                         ui.add(
-                            egui::Button::new(RichText::new(label).size(13.0).color(p.muted))
-                                .frame(false),
+                            egui::Button::new(RichText::new(label).size(14.0).color(p.muted))
+                                .frame(false)
+                                .min_size(egui::vec2(32.0, 20.0)),
                         )
                         .on_hover_text(tip)
                     };
-                    if button(ui, "—", "最小化").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    if button(ui, "✕", "关闭").clicked() {
+                        close = true;
                     }
                     if button(ui, "▢", "最大化 / 还原").clicked() {
                         maximized = !maximized;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
                     }
-                    if button(ui, "✕", "关闭").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    if button(ui, "—", "最小化").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
-                })
-                .response
+                    // Everything left of the buttons drags the frameless window.
+                    let buttons_left = ui.min_rect().left() - 4.0;
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(RichText::new("G-Terminal").color(p.muted).strong());
+                        let drag_min = ui.cursor().min;
+                        if drag_min.x < buttons_left {
+                            let drag_rect = Rect::from_min_max(
+                                drag_min,
+                                egui::Pos2::new(buttons_left, drag_min.y + 20.0),
+                            );
+                            let drag = ui.interact(
+                                drag_rect,
+                                ui.id().with("titlebar-drag"),
+                                Sense::click_and_drag(),
+                            );
+                            if drag.drag_started_by(egui::PointerButton::Primary) {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                            if drag.double_clicked() {
+                                maximized = !maximized;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
+                            }
+                        }
+                    });
+                });
+                if close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             })
             .response;
         let _ = bar;
@@ -542,63 +594,119 @@ impl App {
                                             .fill(if i == self.active { p.raised } else { p.panel })
                                             .inner_margin(egui::Margin::symmetric(6, 0))
                                             .show(ui, |ui| {
+                                                let mut hit = None;
                                                 ui.horizontal(|ui| {
-                                                    let label =
-                                                        t.panes[t.focused].session.kind.label();
-                                                    let r = ui.add(
-                                                        Button::new(
-                                                            RichText::new(
-                                                                label
-                                                                    .chars()
-                                                                    .take(30)
-                                                                    .collect::<String>(),
-                                                            )
-                                                            .color(if i == self.active {
-                                                                p.text
-                                                            } else {
-                                                                p.muted
-                                                            }),
-                                                        )
-                                                        .frame(false),
+                                                    // Connection state of the whole tab, worst pane wins.
+                                                    let (dot, _) = ui.allocate_exact_size(
+                                                        egui::vec2(7.0, 7.0),
+                                                        Sense::hover(),
                                                     );
-                                                    if r.clicked() {
-                                                        self.active = i;
-                                                    }
-                                                    if r.clicked_by(egui::PointerButton::Middle) {
-                                                        *action = Some(Action::CloseTab(i));
-                                                    }
-                                                    r.context_menu(|ui| {
-                                                        for (text, a) in [
-                                                            (
-                                                                "左右分屏",
-                                                                Action::Split(Axis::Horizontal),
-                                                            ),
-                                                            (
-                                                                "上下分屏",
-                                                                Action::Split(Axis::Vertical),
-                                                            ),
-                                                            ("关闭标签", Action::CloseTab(i)),
-                                                        ] {
-                                                            if ui.button(text).clicked() {
-                                                                self.active = i;
-                                                                *action = Some(a);
-                                                                ui.close();
-                                                            }
-                                                        }
-                                                    });
-                                                    if ui
-                                                        .add(
-                                                            Button::new(
-                                                                RichText::new("×").color(p.muted),
-                                                            )
-                                                            .frame(false),
-                                                        )
-                                                        .clicked()
+                                                    ui.painter().circle_filled(
+                                                        dot.center(),
+                                                        3.5,
+                                                        link_color(tab_link(t), p),
+                                                    );
+                                                    ui.interact(
+                                                        dot,
+                                                        ui.id().with("tab-state"),
+                                                        Sense::hover(),
+                                                    )
+                                                    .on_hover_text(tab_link(t).describe());
+                                                    for (index, pane) in
+                                                        t.panes.iter().enumerate()
                                                     {
-                                                        *action = Some(Action::CloseTab(i));
+                                                        if index > 0 {
+                                                            ui.label(
+                                                                RichText::new("|").color(p.muted),
+                                                            );
+                                                        }
+                                                        let focused = index == t.focused;
+                                                        let color = if i == self.active {
+                                                            if focused { p.text } else { p.muted }
+                                                        } else {
+                                                            p.muted
+                                                        };
+                                                        let text = pane
+                                                            .session
+                                                            .kind
+                                                            .label()
+                                                            .chars()
+                                                            .take(18)
+                                                            .collect::<String>();
+                                                        let label = ui.label(
+                                                            if focused {
+                                                                RichText::new(text)
+                                                                    .color(color)
+                                                                    .strong()
+                                                            } else {
+                                                                RichText::new(text).color(color)
+                                                            },
+                                                        );
+                                                        if focused {
+                                                            ui.painter().line_segment(
+                                                                [
+                                                                    egui::pos2(
+                                                                        label.rect.left(),
+                                                                        label.rect.bottom() - 1.0,
+                                                                    ),
+                                                                    egui::pos2(
+                                                                        label.rect.right(),
+                                                                        label.rect.bottom() - 1.0,
+                                                                    ),
+                                                                ],
+                                                                egui::Stroke::new(1.5_f32, p.accent),
+                                                            );
+                                                        }
+                                                    }
+                                                    hit = Some(ui.min_rect());
+                                                });
+                                                let Some(rect) = hit else { return };
+                                                let r = ui
+                                                    .interact(
+                                                        rect,
+                                                        ui.id().with("tab-hit"),
+                                                        Sense::click(),
+                                                    )
+                                                    .on_hover_text(format!(
+                                                        "{} · {} 个窗格 · 中键关闭",
+                                                        t.panes[t.focused].session.kind.label(),
+                                                        t.panes.len()
+                                                    ));
+                                                if r.clicked() {
+                                                    self.active = i;
+                                                }
+                                                if r.clicked_by(egui::PointerButton::Middle) {
+                                                    *action = Some(Action::CloseTab(i));
+                                                }
+                                                r.context_menu(|ui| {
+                                                    for (text, a) in [
+                                                        (
+                                                            "左右分屏",
+                                                            Action::Split(Axis::Horizontal),
+                                                        ),
+                                                        (
+                                                            "上下分屏",
+                                                            Action::Split(Axis::Vertical),
+                                                        ),
+                                                        ("关闭标签", Action::CloseTab(i)),
+                                                    ] {
+                                                        if ui.button(text).clicked() {
+                                                            self.active = i;
+                                                            *action = Some(a);
+                                                            ui.close();
+                                                        }
                                                     }
                                                 });
                                             });
+                                        if ui
+                                            .add(
+                                                Button::new(RichText::new("×").color(p.muted))
+                                                    .frame(false),
+                                            )
+                                            .clicked()
+                                        {
+                                            *action = Some(Action::CloseTab(i));
+                                        }
                                     });
                                 }
                             });
@@ -632,13 +740,7 @@ impl App {
                             } else {
                                 vec![("shell", "Shell")]
                             } {
-                                if ui
-                                    .add_sized(
-                                        [ui.available_width(), 22.0],
-                                        Button::new(label).frame(false),
-                                    )
-                                    .clicked()
-                                {
+                                if list_row(ui, label, p.text, 22.0).clicked() {
                                     *action = Some(Action::New(SessionKind::Local(key.into())));
                                 }
                             }
@@ -687,10 +789,7 @@ impl App {
                                 .enumerate()
                                 .filter(|(_, p)| p.group == group)
                             {
-                                let r = ui.add_sized(
-                                    [ui.available_width(), 22.0],
-                                    Button::new(profile.label()).frame(false),
-                                );
+                                let r = list_row(ui, &profile.label(), p.text, 22.0);
                                 if r.double_clicked() {
                                     *action = Some(Action::New(SessionKind::Ssh(profile.clone())));
                                 }
@@ -1053,6 +1152,11 @@ impl App {
         }
         if let Some(files) = &mut self.files {
             files.show(ctx, &mut self.files_open, p, self.settings.hide_dotfiles);
+            // A running transfer has to keep ticking so its progress and any
+            // conflict prompt show up while the user is idle.
+            if files.busy() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(150));
+            }
         }
     }
     fn find(&mut self, next: bool) {
@@ -1148,59 +1252,193 @@ impl App {
                         ui.label(hint("UTF-8", p));
                     });
                 });
+                // A terminal-initiated transfer runs behind the terminal, so its
+                // progress has to be visible without the file window.
+                if let Some(state) = self.files.as_ref().and_then(Files::operation_state)
+                    && self.files.as_ref().is_some_and(Files::busy)
+                {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("ZMODEM").color(p.accent));
+                        ui.add(
+                            egui::ProgressBar::new(state.fraction())
+                                .desired_width(160.0)
+                                .show_percentage(),
+                        );
+                        ui.label(hint(
+                            &format!(
+                                "{} · {} / {} · {}",
+                                state.name,
+                                state.message,
+                                format_size(state.done),
+                                format_size(state.total)
+                            ),
+                            p,
+                        ));
+                        if ui.small_button("打开传输窗口").clicked() {
+                            self.files_open = true;
+                        }
+                        if ui.small_button("取消").clicked()
+                            && let Some(files) = &self.files
+                        {
+                            files.cancel();
+                        }
+                    });
+                    ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                }
             });
         if self.settings.sidebar {
             self.sidebar(ctx, &mut action);
         }
+        if let Some((tab_id, pane_id)) = self.split_chooser {
+            let exists = self.tabs.iter().any(|t| {
+                t.id == tab_id && t.panes.iter().any(|p| p.id == pane_id)
+            });
+            if !exists {
+                self.split_chooser = None;
+            } else {
+                let mut open = true;
+                let mut chosen: Option<SessionKind> = None;
+                let mut keep = false;
+                egui::Window::new("选择新窗格会话")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(260.0)
+                    .show(ctx, |ui| {
+                        ui.label(hint("已自动开启一个相同类型的会话，可选择其他会话替换。", p));
+                        if cfg!(windows) {
+                            for (key, label) in [
+                                ("powershell", "本地 PowerShell"),
+                                ("pwsh", "本地 PowerShell 7"),
+                                ("cmd", "本地 CMD"),
+                                ("wsl", "本地 WSL"),
+                            ] {
+                                if ui.button(label).clicked() {
+                                    chosen = Some(SessionKind::Local(key.into()));
+                                }
+                            }
+                        } else if ui.button("本地 Shell").clicked() {
+                            chosen = Some(SessionKind::Local("shell".into()));
+                        }
+                        ui.separator();
+                        for profile in &self.settings.profiles {
+                            if ui
+                                .button(format!("SSH · {}", profile.label()))
+                                .clicked()
+                            {
+                                chosen = Some(SessionKind::Ssh(profile.clone()));
+                            }
+                        }
+                        if ui.button("保持当前会话").clicked() {
+                            keep = true;
+                        }
+                    });
+                if !open || keep {
+                    // Closing the chooser keeps the auto-spawned session.
+                    self.split_chooser = None;
+                }
+                if let Some(kind) = chosen {
+                    let target = self
+                        .tabs
+                        .iter()
+                        .position(|t| t.id == tab_id)
+                        .and_then(|ti| {
+                            self.tabs[ti]
+                                .panes
+                                .iter()
+                                .position(|p| p.id == pane_id)
+                                .map(|pi| (ti, pi))
+                        });
+                    if let Some((ti, pi)) = target {
+                        match kind {
+                            SessionKind::Ssh(profile) => {
+                                self.login_target = Some((tab_id, pane_id));
+                                self.login = Some(remote_ui::Login::new(profile));
+                            }
+                            kind => {
+                                if let Some(pane) = self.spawn(kind, ctx) {
+                                    self.tabs[ti].panes[pi] = pane;
+                                    self.tabs[ti].focused = pi;
+                                }
+                            }
+                        }
+                    }
+                    self.split_chooser = None;
+                }
+            }
+        }
         if let Some(t) = self.tabs.get(self.active)
             && let Some(c) = t.panes[t.focused].session.remote.clone()
         {
-            let offer = t.panes[t.focused]
-                .session
-                .terminal
-                .lock()
-                .unwrap()
-                .zmodem_offer;
+            let (offer, upload) = {
+                let terminal = t.panes[t.focused].session.terminal.lock().unwrap();
+                if !terminal.zmodem_offer {
+                    (false, false)
+                } else {
+                    // lrzsz prints "rz waiting to receive." before its header
+                    // when the server runs `rz`; plain headers mean `sz`.
+                    let upload = terminal
+                        .parser
+                        .screen()
+                        .contents()
+                        .to_lowercase()
+                        .contains("waiting to receive");
+                    (true, upload)
+                }
+            };
+            let mut pick = false;
+            let mut cancel = false;
             if offer {
-                let mut accepted = false;
-                let mut declined = false;
-                egui::Window::new("ZMODEM 接收")
+                let mut open = true;
+                egui::Window::new("ZMODEM 传输")
+                    .open(&mut open)
                     .collapsible(false)
                     .resizable(false)
-                    .default_width(360.0)
+                    .default_width(380.0)
                     .show(ctx, |ui| {
-                        ui.label("服务器发起了 ZMODEM 传输（rz）。");
-                        ui.label(hint("文件将保存到当前文件窗口的本地目录。", p));
-                        ui.horizontal(|ui| {
-                            if ui.button("接收").clicked() {
-                                accepted = true;
+                        if upload {
+                            ui.label("服务器在等待接收文件（rz）。");
+                            ui.label(hint("选择要上传的本地文件。", p));
+                            if ui.button("选择文件并上传…").clicked() {
+                                pick = true;
                             }
-                            if ui.button("取消").clicked() {
-                                declined = true;
+                        } else {
+                            ui.label("服务器正在发送文件（sz）。");
+                            ui.label(hint("选择保存目录后开始接收。", p));
+                            if ui.button("选择目录并接收…").clicked() {
+                                pick = true;
                             }
-                        });
-                    });
-                if accepted || declined {
-                    self.tabs[self.active].panes[self.tabs[self.active].focused]
-                        .session
-                        .terminal
-                        .lock()
-                        .unwrap()
-                        .zmodem_offer = false;
-                }
-                if accepted {
-                    if self.files.as_ref().is_none_or(|f| {
-                        !Arc::ptr_eq(&f.connection, &c) || f.transfers.iter().any(|t| t.state.lock().unwrap().running)
-                    }) && self.files.as_ref().is_some_and(|f| f.transfers.iter().any(|t| t.state.lock().unwrap().running))
-                    {
-                        self.error = Some("文件窗口有传输任务，请稍后重试".into());
-                    } else {
-                        self.files = Some(Files::new(c.clone(), ctx, self.settings.hide_dotfiles));
-                        self.files_open = true;
-                        if let Some(files) = &mut self.files {
-                            files.start_zmodem_from_terminal(ctx);
                         }
-                    }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                if !open {
+                    cancel = true;
+                }
+            }
+            if offer && (pick || cancel) {
+                self.tabs[self.active].panes[self.tabs[self.active].focused]
+                    .session
+                    .terminal
+                    .lock()
+                    .unwrap()
+                    .zmodem_offer = false;
+            }
+            if offer && cancel {
+                // Five CAN bytes abort a waiting lrzsz transfer.
+                let _ = self.tabs[self.active].panes[self.tabs[self.active].focused]
+                    .session
+                    .write(vec![0x18; 8]);
+            }
+            if offer && pick {
+                let local = if upload {
+                    rfd::FileDialog::new().pick_file()
+                } else {
+                    rfd::FileDialog::new().pick_folder()
+                };
+                if let Some(local) = local {
+                    self.begin_terminal_zmodem(upload, local, &c, ctx);
                 }
             }
         }
@@ -1304,6 +1542,12 @@ impl App {
                 }
             });
         self.dialogs(ctx, &mut action);
+        if let Some(files) = &mut self.files {
+            files.show_question(ctx, p);
+            if files.busy() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(150));
+            }
+        }
         if let Some(action) = action {
             self.execute(action, ctx);
         }
@@ -1343,6 +1587,54 @@ impl eframe::App for App {
         }
     }
 }
+/// A tab shows the state of its least healthy pane.
+fn tab_link(tab: &Tab) -> SessionStatus {
+    let mut worst = SessionStatus::Live;
+    for pane in &tab.panes {
+        match pane.session.link() {
+            SessionStatus::Lost => return SessionStatus::Lost,
+            SessionStatus::Detached => worst = SessionStatus::Detached,
+            SessionStatus::Live => {}
+        }
+    }
+    worst
+}
+
+fn link_color(link: SessionStatus, p: Palette) -> egui::Color32 {
+    match link {
+        SessionStatus::Live => egui::Color32::from_rgb(78, 190, 110),
+        SessionStatus::Detached => p.muted,
+        SessionStatus::Lost => egui::Color32::from_rgb(228, 86, 86),
+    }
+}
+
+/// A full-width sidebar row whose label hugs the left edge. `add_sized` centres
+/// its widget, which is what pushed connection names into the middle.
+fn list_row(ui: &mut egui::Ui, text: &str, color: egui::Color32, height: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, false);
+        if response.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                ui.style().visuals.widgets.inactive.corner_radius,
+                visuals.bg_fill,
+            );
+        }
+        ui.painter().text(
+            egui::pos2(rect.left() + 6.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::proportional(ui.style().text_styles[&egui::TextStyle::Button].size),
+            color,
+        );
+    }
+    response
+}
+
 fn layout_rects(
     layout: &mut PaneLayout,
     rect: Rect,

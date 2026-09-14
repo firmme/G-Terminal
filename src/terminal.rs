@@ -46,6 +46,8 @@ pub struct Terminal {
     /// Pending ZMODEM download offer (`rz` was run on the server).
     pub zmodem_offer: bool,
     scanner: crate::graphics::OscScanner,
+    /// Tail of the last read, so a header split across reads is still seen.
+    zmodem_probe: Vec<u8>,
 }
 
 impl Terminal {
@@ -61,16 +63,13 @@ impl Terminal {
             graphics: std::collections::VecDeque::new(),
             zmodem_offer: false,
             scanner: crate::graphics::OscScanner::default(),
+            zmodem_probe: Vec::new(),
         }
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
-        // A bare ZMODEM header means the server started rz/sz without a pager.
-        if bytes.windows(6).any(|w| w == b"**\x18B00")
-            && !bytes.windows(2).any(|w| w == b"\x1b[")
-        {
-            self.zmodem_offer = true;
-        }
+        // A bare ZRQINIT header means the server started rz/sz without a pager.
+        self.probe_zmodem(bytes);
         for token in self.scanner.feed(bytes) {
             match token {
                 crate::graphics::Token::Text(bytes) => {
@@ -95,6 +94,30 @@ impl Terminal {
             }
         }
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Flags a ZRQINIT header (`**` ZDLE `B00…`, ZHEX encoded). The probe keeps
+    /// a short tail so a header split across two reads is still recognised, and
+    /// skips reads carrying escape sequences, which belong to screen output.
+    fn probe_zmodem(&mut self, bytes: &[u8]) {
+        const HEADER: &[u8] = b"**\x18B00";
+        const TAIL: usize = HEADER.len() - 1;
+        if bytes.windows(2).any(|w| w == b"\x1b[") {
+            self.zmodem_probe.clear();
+            return;
+        }
+        let searched = self.zmodem_probe.len() + bytes.len();
+        if searched < HEADER.len() {
+            self.zmodem_probe.extend_from_slice(bytes);
+            return;
+        }
+        let mut window = std::mem::take(&mut self.zmodem_probe);
+        window.extend_from_slice(bytes);
+        if window.windows(HEADER.len()).any(|w| w == HEADER) {
+            self.zmodem_offer = true;
+        }
+        let keep = window.len().saturating_sub(TAIL);
+        self.zmodem_probe = window[keep..].to_vec();
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -213,8 +236,23 @@ mod tests {
     }
 
     #[test]
-    fn cursor_queries_are_answered_and_titles_are_sanitized() {
-        let mut t = Terminal::new(20, 80, 100);
+    fn zmodem_headers_are_detected_even_when_split_across_reads() {
+        let mut t = Terminal::new(5, 40, 10);
+        t.process(b"$ sz backup.tar.gz\r\n**\x18B");
+        assert!(!t.zmodem_offer);
+        t.process(b"0000000000000\r\n\x11");
+        assert!(t.zmodem_offer);
+    }
+
+    #[test]
+    fn screen_output_with_escapes_is_not_mistaken_for_a_zmodem_offer() {
+        let mut t = Terminal::new(5, 40, 10);
+        t.process(b"\x1b[31mred\x1b[0m **\x18B00 more");
+        assert!(!t.zmodem_offer);
+    }
+
+    #[test]
+    fn cursor_queries_are_answered_and_titles_are_sanitized() {        let mut t = Terminal::new(20, 80, 100);
         t.process(b"\x1b[4;9H\x1b[6n\x1b[5n\x1b[c");
         assert_eq!(t.parser.callbacks().replies, b"\x1b[4;9R\x1b[0n\x1b[?1;2c");
         t.process(b"\x1b]2;project-shell\x07");
