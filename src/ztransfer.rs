@@ -1,6 +1,6 @@
 //! Explicit ZMODEM transfers over a dedicated binary SSH exec channel.
 use anyhow::{Result, bail, ensure};
-use std::{path::Path, time::Duration};
+use std::{path::{Path, PathBuf}, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use zmodem2::{Action, Event, FileInfo, Position, Receiver, Sender};
 
@@ -75,13 +75,14 @@ pub async fn send<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, path: &Path
 }
 
 pub async fn receive<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, path: &Path) -> Result<()> {
-    ensure!(!path.exists(), "目标已存在");
-    let partial = path.with_extension("zmodem.part");
-    let mut file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&partial)
-        .await?;
+    // When the target is a directory, the file name comes from the ZMODEM header.
+    let target = if path.is_dir() { None } else { Some(path.to_path_buf()) };
+    let mut target = match target {
+        Some(p) => p,
+        None => PathBuf::new(),
+    };
+    let mut file: Option<tokio::fs::File> = None;
+    let mut partial: Option<std::path::PathBuf> = None;
     let mut receiver = Receiver::new()?;
     receiver.set_manual_file_accept(true);
     let mut buffer = vec![0; 8192];
@@ -100,7 +101,10 @@ pub async fn receive<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, path: &P
             Action::WriteFile(bytes) => {
                 ensure!(accepted, "服务器未声明文件");
                 let bytes = bytes.to_vec();
-                file.write_all(&bytes).await?;
+                file.as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("文件未打开"))?
+                    .write_all(&bytes)
+                    .await?;
                 receiver.file_written(bytes.len())?;
             }
             Action::Event(Event::FileStarted(info)) => {
@@ -109,6 +113,21 @@ pub async fn receive<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, path: &P
                     !info.name.contains(&b'/') && !info.name.contains(&b'\\') && info.name != b"..",
                     "非法远程文件名"
                 );
+                if target.as_os_str().is_empty() {
+                    let name = String::from_utf8_lossy(info.name).trim().to_string();
+                    target = path.join(name);
+                    ensure!(!target.as_os_str().is_empty(), "无文件名");
+                }
+                ensure!(!target.exists(), "目标已存在");
+                let part = target.with_extension("zmodem.part");
+                file = Some(
+                    tokio::fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&part)
+                        .await?,
+                );
+                partial = Some(part);
                 accepted = true;
                 receiver.accept_file_at(0)?;
             }
@@ -121,10 +140,13 @@ pub async fn receive<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, path: &P
                     receiver.wire_written(bytes.len());
                 }
                 ensure!(completed, "ZMODEM 未完成文件");
+                let mut file =
+                    file.take().ok_or_else(|| anyhow::anyhow!("文件未打开"))?;
                 file.flush().await?;
                 file.sync_all().await?;
                 drop(file);
-                tokio::fs::hard_link(&partial, path).await?;
+                let partial = partial.take().ok_or_else(|| anyhow::anyhow!("文件未打开"))?;
+                tokio::fs::hard_link(&partial, &target).await?;
                 tokio::fs::remove_file(partial).await?;
                 return Ok(());
             }

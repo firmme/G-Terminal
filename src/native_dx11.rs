@@ -76,6 +76,7 @@ impl ApplicationHandler<Event> for Runner {
                 event_loop.create_window(
                     Window::default_attributes()
                         .with_title("G-Terminal")
+                        .with_decorations(false)
                         .with_visible(false)
                         .with_inner_size(LogicalSize::new(1280., 800.))
                         .with_min_inner_size(LogicalSize::new(760., 480.)),

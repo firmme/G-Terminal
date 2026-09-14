@@ -43,6 +43,8 @@ pub struct Terminal {
     pub parser: vt100::Parser<TerminalCallbacks>,
     pub revision: u64,
     pub graphics: std::collections::VecDeque<crate::graphics::Graphic>,
+    /// Pending ZMODEM download offer (`rz` was run on the server).
+    pub zmodem_offer: bool,
     scanner: crate::graphics::OscScanner,
 }
 
@@ -57,11 +59,18 @@ impl Terminal {
             ),
             revision: 0,
             graphics: std::collections::VecDeque::new(),
+            zmodem_offer: false,
             scanner: crate::graphics::OscScanner::default(),
         }
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
+        // A bare ZMODEM header means the server started rz/sz without a pager.
+        if bytes.windows(6).any(|w| w == b"**\x18B00")
+            && !bytes.windows(2).any(|w| w == b"\x1b[")
+        {
+            self.zmodem_offer = true;
+        }
         for token in self.scanner.feed(bytes) {
             match token {
                 crate::graphics::Token::Text(bytes) => {

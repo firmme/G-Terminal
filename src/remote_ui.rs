@@ -151,15 +151,21 @@ pub struct Files {
     local_path: String,
     selected_local: Option<PathBuf>,
     selected_remote: Option<remote::Entry>,
-    local_entries: Vec<(String, bool, u64)>,
+    local_entries: Vec<(String, bool, u64, bool)>,
     name: String,
     error: Option<String>,
     pub transfers: Vec<Transfer>,
     operation: Option<Operation>,
     sudo_destination: String,
+    split_ratio: f32,
+    show_hidden: bool,
 }
 impl Files {
-    pub fn new(connection: Arc<Connection>, ctx: &egui::Context) -> Self {
+    pub fn new(
+        connection: Arc<Connection>,
+        ctx: &egui::Context,
+        hide_dotfiles: bool,
+    ) -> Self {
         let local_path = directories::UserDirs::new()
             .map(|d| d.home_dir().display().to_string())
             .unwrap_or_else(|| ".".into());
@@ -176,6 +182,8 @@ impl Files {
             transfers: vec![],
             operation: None,
             sudo_destination: String::new(),
+            split_ratio: 0.5,
+            show_hidden: !hide_dotfiles,
         };
         this.refresh_local();
         this
@@ -187,14 +195,16 @@ impl Files {
             Ok(entries) => {
                 self.local_entries = entries
                     .filter_map(Result::ok)
-                    .filter_map(|e| {
-                        e.metadata().ok().map(|m| {
-                            (
-                                e.file_name().to_string_lossy().into_owned(),
-                                m.is_dir(),
-                                m.len(),
-                            )
-                        })
+                    .map(|e| {
+                        let metadata = e.metadata().ok();
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        let symlink = e.file_type().ok().is_some_and(|t| t.is_symlink());
+                        (
+                            name,
+                            metadata.as_ref().is_some_and(|m| m.is_dir()),
+                            metadata.map(|m| m.len()).unwrap_or(0),
+                            symlink,
+                        )
                     })
                     .collect();
                 self.local_entries.sort_by(|a, b| {
@@ -269,6 +279,26 @@ impl Files {
             wake();
         });
     }
+    pub fn start_zmodem_from_terminal(&mut self, ctx: &egui::Context) {
+        let state = Arc::new(Mutex::new(None));
+        self.operation = Some(state.clone());
+        let connection = self.connection.clone();
+        let local = PathBuf::from(&self.local_path);
+        let wake = wake(ctx);
+        remote::runtime().spawn(async move {
+            let result: anyhow::Result<String> = async {
+                let _permit = connection.transfer_gate.clone().acquire_owned().await?;
+                let channel = connection.handle.channel_open_session().await?;
+                channel.exec(true, "rz --binary --protect").await?;
+                let mut stream = channel.into_stream();
+                g_terminal::ztransfer::receive(&mut stream, &local).await?;
+                Ok("ZMODEM 接收完成".into())
+            }
+            .await;
+            *state.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+            wake();
+        });
+    }
     fn queue(&mut self, local: PathBuf, remote: String, direction: Direction, ctx: &egui::Context) {
         if self
             .transfers
@@ -286,10 +316,173 @@ impl Files {
             wake(ctx),
         ));
     }
-    pub fn show(&mut self, ctx: &egui::Context, open: &mut bool, p: Palette) {
+    fn entry_color(
+        directory: bool,
+        symlink: bool,
+        executable: bool,
+        p: Palette,
+    ) -> eframe::egui::Color32 {
+        if symlink {
+            eframe::egui::Color32::from_rgb(230, 160, 60)
+        } else if directory {
+            p.accent
+        } else if executable {
+            eframe::egui::Color32::from_rgb(90, 160, 250)
+        } else {
+            p.text
+        }
+    }
+    fn perms_string(perms: Option<u32>) -> String {
+        perms.map_or_else(String::new, |m| {
+            format!(
+                "{}{}{}{}{}{}{}{}{}{}",
+                if m & 0o400 != 0 { 'r' } else { '-' },
+                if m & 0o200 != 0 { 'w' } else { '-' },
+                if m & 0o100 != 0 { 'x' } else { '-' },
+                if m & 0o040 != 0 { 'r' } else { '-' },
+                if m & 0o020 != 0 { 'w' } else { '-' },
+                if m & 0o010 != 0 { 'x' } else { '-' },
+                if m & 0o004 != 0 { 'r' } else { '-' },
+                if m & 0o002 != 0 { 'w' } else { '-' },
+                if m & 0o001 != 0 { 'x' } else { '-' },
+                if m & 0o1000 != 0 { 't' } else { ' ' },
+            )
+        })
+    }
+    fn show_local_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        next: &mut Option<String>,
+    ) {
+        ui.horizontal(|ui| {
+            if ui.button("↑").clicked() {
+                *next = PathBuf::from(&self.local_path)
+                    .parent()
+                    .map(|p| p.display().to_string());
+            }
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.local_path)
+                    .desired_width((ui.available_width() - 45.0).max(100.0)),
+            );
+            if ui.button("刷新").clicked()
+                || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            {
+                *next = Some(self.local_path.clone());
+            }
+        });
+        egui::ScrollArea::vertical()
+            .id_salt("local-files")
+            .max_height(280.0)
+            .show(ui, |ui| {
+                for (name, dir, size, symlink) in &self.local_entries {
+                    if !self.show_hidden && name.starts_with('.') {
+                        continue;
+                    }
+                    let path = PathBuf::from(&self.local_path).join(name);
+                    let body = if *dir {
+                        name.clone()
+                    } else {
+                        format!("{name}   {}", format_size(*size))
+                    };
+                    let label = RichText::new(format!(
+                        "{} {}",
+                        if *symlink { "[→]" } else if *dir { "[+]" } else { "   " },
+                        body
+                    ))
+                    .color(Self::entry_color(*dir, *symlink, false, p));
+                    let r = ui.selectable_label(
+                        self.selected_local.as_ref() == Some(&path),
+                        label,
+                    );
+                    if r.clicked() {
+                        self.selected_local = Some(path.clone());
+                    }
+                    if r.double_clicked() && *dir {
+                        *next = Some(path.display().to_string());
+                    }
+                }
+            });
+    }
+    fn show_remote_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        next: &mut Option<String>,
+    ) {
+        ui.horizontal(|ui| {
+            if ui.button("↑").clicked() {
+                *next = Some(format!("{}/..", self.directory.lock().unwrap().path));
+            }
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.remote_path)
+                    .desired_width((ui.available_width() - 45.0).max(100.0)),
+            );
+            if ui.button("刷新").clicked()
+                || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            {
+                *next = Some(self.remote_path.clone());
+            }
+        });
+        let state = self.directory.lock().unwrap();
+        if state.loading {
+            ui.spinner();
+        }
+        if let Some(e) = &state.error {
+            ui.colored_label(egui::Color32::LIGHT_RED, e);
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("remote-files")
+            .max_height(280.0)
+            .show(ui, |ui| {
+                for entry in &state.entries {
+                    if !self.show_hidden && entry.name.starts_with('.') {
+                        continue;
+                    }
+                    let executable = entry.perms.is_some_and(|m| m & 0o111 != 0);
+                    let perms = Self::perms_string(entry.perms);
+                    let body = if entry.directory {
+                        entry.name.clone()
+                    } else {
+                        format!("{}   {}", entry.name, format_size(entry.size))
+                    };
+                    let label = RichText::new(format!(
+                        "{} {}{}",
+                        if entry.directory { "[+]" } else { "   " },
+                        body,
+                        if perms.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {perms}")
+                        }
+                    ))
+                    .color(Self::entry_color(entry.directory, false, executable, p));
+                    let r = ui.selectable_label(
+                        self.selected_remote
+                            .as_ref()
+                            .is_some_and(|e| e.name == entry.name),
+                        label,
+                    );
+                    if r.clicked() {
+                        self.selected_remote = Some(entry.clone());
+                        self.name = entry.name.clone();
+                    }
+                    if r.double_clicked() && entry.directory {
+                        *next = Some(format!(
+                            "{}/{}",
+                            state.path.trim_end_matches('/'),
+                            entry.name
+                        ));
+                    }
+                }
+            });
+    }
+    pub fn show(&mut self, ctx: &egui::Context, open: &mut bool, p: Palette, hide_dotfiles: bool) {
+        self.show_hidden = self.show_hidden || !hide_dotfiles;
         egui::Window::new(format!("文件 · {}", self.connection.profile.label()))
             .open(open)
-            .default_size([940.0, 550.0])
+            .default_size([760.0, 520.0])
+            .min_width(560.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("SFTP").color(p.accent));
@@ -297,110 +490,37 @@ impl Files {
                         "双击目录进入 · 文件以 .gterminal.part 续传 · 不自动覆盖同名目标",
                         p,
                     ));
+                    if ui
+                        .checkbox(&mut self.show_hidden, "显示隐藏文件")
+                        .changed()
+                    {
+                        self.refresh_local();
+                    }
                 });
                 let mut local_next = None;
                 let mut remote_next = None;
-                ui.columns(2, |columns| {
-                    columns[0].horizontal(|ui| {
-                        if ui.button("↑").clicked() {
-                            local_next = PathBuf::from(&self.local_path)
-                                .parent()
-                                .map(|p| p.display().to_string());
-                        }
-                        let edit = ui.add(
-                            egui::TextEdit::singleline(&mut self.local_path)
-                                .desired_width((ui.available_width() - 45.0).max(100.0)),
-                        );
-                        if ui.button("刷新").clicked()
-                            || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        {
-                            local_next = Some(self.local_path.clone());
-                        }
+                let available = ui.available_width();
+                let left_width = (available * self.split_ratio.clamp(0.25, 0.75)).round();
+                ui.horizontal(|ui| {
+                    let mut local_rect = ui.available_rect_before_wrap();
+                    local_rect.max.x = local_rect.min.x + left_width;
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(local_rect), |ui| {
+                        self.show_local_pane(ui, p, &mut local_next)
                     });
-                    egui::ScrollArea::vertical()
-                        .id_salt("local-files")
-                        .max_height(270.0)
-                        .show(&mut columns[0], |ui| {
-                            for (name, dir, size) in &self.local_entries {
-                                let path = PathBuf::from(&self.local_path).join(name);
-                                let label = format!(
-                                    "{} {}{}",
-                                    if *dir { "[+]" } else { "   " },
-                                    name,
-                                    if *dir {
-                                        String::new()
-                                    } else {
-                                        format!("   {}", format_size(*size))
-                                    }
-                                );
-                                let r = ui.selectable_label(
-                                    self.selected_local.as_ref() == Some(&path),
-                                    label,
-                                );
-                                if r.clicked() {
-                                    self.selected_local = Some(path.clone());
-                                }
-                                if r.double_clicked() && *dir {
-                                    local_next = Some(path.display().to_string());
-                                }
-                            }
-                        });
-                    columns[1].horizontal(|ui| {
-                        if ui.button("↑").clicked() {
-                            remote_next =
-                                Some(format!("{}/..", self.directory.lock().unwrap().path));
-                        }
-                        let edit = ui.add(
-                            egui::TextEdit::singleline(&mut self.remote_path)
-                                .desired_width((ui.available_width() - 45.0).max(100.0)),
-                        );
-                        if ui.button("刷新").clicked()
-                            || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        {
-                            remote_next = Some(self.remote_path.clone());
-                        }
+                    let mut divider = local_rect;
+                    divider.min.x = divider.max.x - 3.0;
+                    let drag = ui.interact(divider, ui.id().with("files-split"), egui::Sense::drag());
+                    if drag.dragged()
+                        && let Some(pos) = drag.interact_pointer_pos()
+                    {
+                        self.split_ratio =
+                            ((pos.x - local_rect.min.x) / available).clamp(0.25, 0.75);
+                    }
+                    drag.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                    let remote_rect = ui.available_rect_before_wrap();
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(remote_rect), |ui| {
+                        self.show_remote_pane(ui, p, &mut remote_next)
                     });
-                    let state = self.directory.lock().unwrap();
-                    if state.loading {
-                        columns[1].spinner();
-                    }
-                    if let Some(e) = &state.error {
-                        columns[1].colored_label(egui::Color32::LIGHT_RED, e);
-                    }
-                    egui::ScrollArea::vertical()
-                        .id_salt("remote-files")
-                        .max_height(270.0)
-                        .show(&mut columns[1], |ui| {
-                            for entry in &state.entries {
-                                let label = format!(
-                                    "{} {}{}",
-                                    if entry.directory { "[+]" } else { "   " },
-                                    entry.name,
-                                    if entry.directory {
-                                        String::new()
-                                    } else {
-                                        format!("   {}", format_size(entry.size))
-                                    }
-                                );
-                                let r = ui.selectable_label(
-                                    self.selected_remote
-                                        .as_ref()
-                                        .is_some_and(|e| e.name == entry.name),
-                                    label,
-                                );
-                                if r.clicked() {
-                                    self.selected_remote = Some(entry.clone());
-                                    self.name = entry.name.clone();
-                                }
-                                if r.double_clicked() && entry.directory {
-                                    remote_next = Some(format!(
-                                        "{}/{}",
-                                        state.path.trim_end_matches('/'),
-                                        entry.name
-                                    ));
-                                }
-                            }
-                        });
                 });
                 if let Some(path) = local_next {
                     self.local_path = path;
@@ -473,20 +593,24 @@ impl Files {
                             self.operation = Some(state.clone());
                             let wake = wake(ctx);
                             remote::runtime().spawn(async move {
-                                let result = if op == 0 {
-                                    connection.sftp.create_dir(target).await
-                                } else if let Some(source) = source {
-                                    connection.sftp.rename(source, target).await
-                                } else {
-                                    *state.lock().unwrap() = Some(Err("请先选择远程文件".into()));
-                                    wake();
-                                    return;
-                                };
-                                *state.lock().unwrap() = Some(
-                                    result
-                                        .map(|_| "操作完成，请刷新".into())
-                                        .map_err(|e| e.to_string()),
-                                );
+                                let result: anyhow::Result<()> = async {
+                                    let sftp = connection.sftp.clone().ok_or_else(|| {
+                                        anyhow::anyhow!("服务器未提供 SFTP 子系统")
+                                    })?;
+                                    if op == 0 {
+                                        sftp.create_dir(target).await?;
+                                    } else if let Some(source) = source {
+                                        sftp.rename(source, target).await?;
+                                    } else {
+                                        anyhow::bail!("请先选择远程文件");
+                                    }
+                                    Ok(())
+                                }
+                                .await;
+                                let result = result
+                                    .map(|_| "操作完成，请刷新".to_string())
+                                    .map_err(|e| e.to_string());
+                                *state.lock().unwrap() = Some(result);
                                 wake();
                             });
                         }

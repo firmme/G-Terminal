@@ -308,7 +308,7 @@ impl App {
                                 Some("文件窗口还有传输任务，请完成或暂停后切换连接".into());
                             return;
                         }
-                        self.files = Some(Files::new(c, ctx));
+                        self.files = Some(Files::new(c, ctx, self.settings.hide_dotfiles));
                     }
                     self.files_open = true;
                 } else {
@@ -393,6 +393,64 @@ impl App {
             })
         });
         action
+    }
+    fn titlebar(&mut self, ctx: &egui::Context) {
+        let p = self.palette;
+        let bar = egui::TopBottomPanel::top("titlebar")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(6, 1)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("G-Terminal")
+                            .color(p.muted)
+                            .strong(),
+                    );
+                    let mut maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    // Drag anywhere on the empty stretch to move the window.
+                    let drag = ui.allocate_ui_with_layout(
+                        egui::vec2(
+                            (ui.available_width()
+                                - 3.0 * 30.0
+                                - ui.style().spacing.item_spacing.x * 2.0)
+                                .max(10.0),
+                            ui.available_height(),
+                        ),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |_ui| {},
+                    );
+                    if drag.response.dragged_by(egui::PointerButton::Primary) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if drag.response.double_clicked() {
+                        maximized = !maximized;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
+                    }
+                    let button = |ui: &mut egui::Ui, label: &str, tip: &str| {
+                        ui.add(
+                            egui::Button::new(RichText::new(label).size(13.0).color(p.muted))
+                                .frame(false),
+                        )
+                        .on_hover_text(tip)
+                    };
+                    if button(ui, "—", "最小化").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    if button(ui, "▢", "最大化 / 还原").clicked() {
+                        maximized = !maximized;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
+                    }
+                    if button(ui, "✕", "关闭").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                })
+                .response
+            })
+            .response;
+        let _ = bar;
     }
     fn topbar(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
         let p = self.palette;
@@ -692,6 +750,12 @@ impl App {
                     .changed();
                 changed |= ui
                     .checkbox(
+                        &mut self.settings.hide_dotfiles,
+                        "文件窗口默认隐藏 . 开头文件",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
                         &mut self.settings.restore_workspace,
                         "启动时恢复标签与分屏布局",
                     )
@@ -988,7 +1052,7 @@ impl App {
             }
         }
         if let Some(files) = &mut self.files {
-            files.show(ctx, &mut self.files_open, p);
+            files.show(ctx, &mut self.files_open, p, self.settings.hide_dotfiles);
         }
     }
     fn find(&mut self, next: bool) {
@@ -1019,6 +1083,7 @@ impl App {
     pub(crate) fn render(&mut self, ctx: &egui::Context) {
         let p = self.palette;
         let mut action = self.shortcuts(ctx);
+        self.titlebar(ctx);
         self.topbar(ctx, &mut action);
         egui::TopBottomPanel::bottom("status")
             .frame(
@@ -1086,6 +1151,58 @@ impl App {
             });
         if self.settings.sidebar {
             self.sidebar(ctx, &mut action);
+        }
+        if let Some(t) = self.tabs.get(self.active)
+            && let Some(c) = t.panes[t.focused].session.remote.clone()
+        {
+            let offer = t.panes[t.focused]
+                .session
+                .terminal
+                .lock()
+                .unwrap()
+                .zmodem_offer;
+            if offer {
+                let mut accepted = false;
+                let mut declined = false;
+                egui::Window::new("ZMODEM 接收")
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(360.0)
+                    .show(ctx, |ui| {
+                        ui.label("服务器发起了 ZMODEM 传输（rz）。");
+                        ui.label(hint("文件将保存到当前文件窗口的本地目录。", p));
+                        ui.horizontal(|ui| {
+                            if ui.button("接收").clicked() {
+                                accepted = true;
+                            }
+                            if ui.button("取消").clicked() {
+                                declined = true;
+                            }
+                        });
+                    });
+                if accepted || declined {
+                    self.tabs[self.active].panes[self.tabs[self.active].focused]
+                        .session
+                        .terminal
+                        .lock()
+                        .unwrap()
+                        .zmodem_offer = false;
+                }
+                if accepted {
+                    if self.files.as_ref().is_none_or(|f| {
+                        !Arc::ptr_eq(&f.connection, &c) || f.transfers.iter().any(|t| t.state.lock().unwrap().running)
+                    }) && self.files.as_ref().is_some_and(|f| f.transfers.iter().any(|t| t.state.lock().unwrap().running))
+                    {
+                        self.error = Some("文件窗口有传输任务，请稍后重试".into());
+                    } else {
+                        self.files = Some(Files::new(c.clone(), ctx, self.settings.hide_dotfiles));
+                        self.files_open = true;
+                        if let Some(files) = &mut self.files {
+                            files.start_zmodem_from_terminal(ctx);
+                        }
+                    }
+                }
+            }
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.bg).inner_margin(0))

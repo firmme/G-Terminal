@@ -100,7 +100,7 @@ impl client::Handler for Client {
 pub struct Connection {
     pub handle: Arc<client::Handle<Client>>,
     pub profile: RemoteProfile,
-    pub sftp: Arc<russh_sftp::client::SftpSession>,
+    pub sftp: Option<Arc<russh_sftp::client::SftpSession>>,
     pub forwarding: Arc<Mutex<Vec<String>>>,
     pub transfer_gate: Arc<Semaphore>,
     jump: Option<Arc<client::Handle<Client>>>,
@@ -241,15 +241,29 @@ async fn connect_inner(
         &credentials.passphrase,
     )
     .await?;
-    let channel = handle.channel_open_session().await?;
-    channel.request_subsystem(true, "sftp").await?;
-    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
-        .await
-        .context("服务器未提供 SFTP 子系统")?;
+    // A missing or slow SFTP subsystem must not kill an authenticated session.
+    let sftp = match tokio::time::timeout(Duration::from_secs(10), async {
+        let channel = match handle.channel_open_session().await {
+            Ok(channel) => channel,
+            Err(_) => return None,
+        };
+        if channel.request_subsystem(true, "sftp").await.is_err() {
+            return None;
+        }
+        russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .ok()
+            .map(Arc::new)
+    })
+    .await
+    {
+        Ok(Some(sftp)) => Some(sftp),
+        _ => None,
+    };
     let connection = Arc::new(Connection {
         handle: Arc::new(handle),
         profile,
-        sftp: Arc::new(sftp),
+        sftp,
         forwarding: Arc::new(Mutex::new(vec![])),
         transfer_gate: Arc::new(Semaphore::new(1)),
         jump,
@@ -318,6 +332,8 @@ pub struct Entry {
     pub name: String,
     pub directory: bool,
     pub size: u64,
+    /// POSIX permission bits, e.g. 0o644; None when unavailable.
+    pub perms: Option<u32>,
 }
 #[derive(Default)]
 pub struct DirectoryState {
@@ -339,9 +355,11 @@ pub fn list_directory(
     let output = state.clone();
     runtime().spawn(async move {
         let result: Result<_> = async {
-            let canonical = connection.sftp.canonicalize(path).await?;
-            let mut entries: Vec<_> = connection
-                .sftp
+            let sftp = connection.sftp.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("服务器未提供 SFTP 子系统，无法浏览文件；ZMODEM 传输仍可用")
+            })?;
+            let canonical = sftp.canonicalize(path).await?;
+            let mut entries: Vec<_> = sftp
                 .read_dir(&canonical)
                 .await?
                 .filter(|e| e.file_name() != "." && e.file_name() != "..")
@@ -351,6 +369,7 @@ pub fn list_directory(
                         name: e.file_name(),
                         directory: metadata.is_dir(),
                         size: metadata.size.unwrap_or(0),
+                        perms: metadata.permissions,
                     }
                 })
                 .collect();
@@ -480,7 +499,9 @@ async fn transfer_file(
 ) -> Result<()> {
     use russh_sftp::protocol::OpenFlags;
     use std::io::SeekFrom;
-    let sftp = &connection.sftp;
+    let sftp = connection.sftp.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("服务器未提供 SFTP 子系统，无法传输文件；ZMODEM 传输仍可用")
+    })?;
     let mut buffer = vec![0u8; 64 * 1024];
     let mut verify = vec![0u8; 64 * 1024];
     let partial_remote = format!("{remote}.gterminal.part");

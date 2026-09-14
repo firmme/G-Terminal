@@ -29,6 +29,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("G-Terminal")
+            .with_decorations(false)
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([760.0, 480.0]),
         renderer: eframe::Renderer::Wgpu,

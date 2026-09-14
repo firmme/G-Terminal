@@ -13,6 +13,7 @@ pub struct Settings {
     pub profiles: Vec<RemoteProfile>,
     pub groups: Vec<String>,
     pub copy_on_select: bool,
+    pub hide_dotfiles: bool,
     pub restore_workspace: bool,
     pub workspace: Vec<crate::layout::SavedTab>,
 }
@@ -28,6 +29,7 @@ impl Default for Settings {
             profiles: Vec::new(),
             groups: Vec::new(),
             copy_on_select: false,
+            hide_dotfiles: true,
             restore_workspace: true,
             workspace: Vec::new(),
         }

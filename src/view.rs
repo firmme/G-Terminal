@@ -174,8 +174,28 @@ impl Pane {
             && !mouse
             && let Some(pos) = response.interact_pointer_pos()
         {
-            let (row, _) = pointer_cell(pos);
-            self.selection = Some(((row, 0), (row, cols - 1)));
+            let (row, col) = pointer_cell(pos);
+            let screen = terminal.parser.screen();
+            let width = cols.min(screen.size().1);
+            let is_word = |c: Option<&vt100::Cell>| {
+                c.is_some_and(|c| {
+                    !c.is_wide_continuation() && c.contents().chars().next().is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+                })
+            };
+            if is_word(screen.cell(row, col)) {
+                let mut start = col;
+                while start > 0 && is_word(screen.cell(row, start - 1)) {
+                    start -= 1;
+                }
+                let mut end = col;
+                while end + 1 < width && is_word(screen.cell(row, end + 1)) {
+                    end += 1;
+                }
+                self.selection = Some(((row, start), (row, end)));
+            } else {
+                // Double-click on whitespace selects the whole line.
+                self.selection = Some(((row, 0), (row, cols - 1)));
+            }
         }
         if copy_on_select
             && !mouse
