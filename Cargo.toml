@@ -1,0 +1,45 @@
+[package]
+name = "g-terminal"
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.88"
+description = "A native GPU terminal, built for Windows and designed for multiple platforms"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "=0.33.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "accesskit"] }
+wgpu = { version = "27", default-features = false, features = ["dx12", "vulkan", "metal", "wgsl"] }
+portable-pty = "=0.9.0"
+vt100 = "=0.16.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+arboard = { version = "3", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "fs", "time", "macros"] }
+russh = { version = "=0.58.0", default-features = false, features = ["ring", "rsa"] }
+russh-sftp = "=2.1.1"
+zeroize = "1"
+sha2 = "0.10"
+base64 = "0.22"
+memmap2 = "0.9"
+cosmic-text = { version = "=0.17.0", default-features = false, features = ["std", "swash"] }
+zmodem2 = "=0.7.2"
+# russh 0.58's RSA prerelease uses the pre-stable PKCS8 error API.
+pkcs8-compat = { package = "pkcs8", version = "=0.11.0-rc.11" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+
+[target.'cfg(windows)'.dependencies]
+egui-directx11 = "=0.12.0"
+egui-winit = { version = "=0.33.3", default-features = false, features = ["clipboard", "links", "accesskit"] }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
+accesskit_winit = "=0.29.2"
+windows = { version = "=0.62.2", features = ["Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_UI_WindowsAndMessaging"] }
+

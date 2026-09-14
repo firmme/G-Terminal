@@ -1,0 +1,20 @@
+name: Windows
+on: [push, pull_request]
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: ./scripts/build.ps1 -Action clippy
+      - run: ./scripts/build.ps1 -Action test
+      - run: ./scripts/package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: G-Terminal-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
