@@ -19,6 +19,38 @@ pub struct Pane {
     scroll_fraction: f32,
     last_mouse: Option<(u16, u16)>,
     graphic: Option<(u64, egui::TextureHandle)>,
+    /// Consecutive clicks on one cell, and when the last landed. egui's own count
+    /// stops at three, so a fourth click — the "select everything" gesture — has
+    /// to be counted here.
+    clicks: u8,
+    click_time: f64,
+    click_cell: (u16, u16),
+}
+
+/// What a run of consecutive clicks on the same cell asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Gesture {
+    /// One click: place the caret, i.e. drop any selection.
+    Point,
+    Word,
+    Line,
+    Screen,
+}
+
+/// The gesture a run of `clicks` clicks adds up to. Anything past four stays at
+/// "everything", so leaning on the button does not wrap round to something else.
+fn click_gesture(clicks: u8) -> Gesture {
+    match clicks {
+        0 | 1 => Gesture::Point,
+        2 => Gesture::Word,
+        3 => Gesture::Line,
+        _ => Gesture::Screen,
+    }
+}
+
+/// Whether a click continues the previous run: the same cell, soon enough after.
+fn continues_run(previous: (u16, u16), cell: (u16, u16), elapsed: f64, delay: f64) -> bool {
+    previous == cell && elapsed >= 0.0 && elapsed <= delay
 }
 
 pub struct ViewOptions<'a> {
@@ -42,6 +74,9 @@ impl Pane {
             scroll_fraction: 0.0,
             last_mouse: None,
             graphic: None,
+            clicks: 0,
+            click_time: 0.0,
+            click_cell: (0, 0),
         }
     }
 
@@ -161,8 +196,65 @@ impl Pane {
                 let cell = pointer_cell(pos);
                 self.selection = Some((cell, cell));
             }
+            // A drag is not part of a run of clicks.
+            self.clicks = 0;
         } else if response.clicked() {
-            self.selection = None;
+            if mouse {
+                // The application owns the pointer; only drop any selection.
+                self.selection = None;
+            } else if let Some(pos) = response.interact_pointer_pos() {
+                let cell = pointer_cell(pos);
+                let now = ui.input(|i| i.time);
+                // Taken from the options rather than hard-coded, so this agrees
+                // with the interval egui itself uses for double clicks.
+                let delay = ui.ctx().options(|o| o.input_options.max_double_click_delay);
+                self.clicks = if continues_run(self.click_cell, cell, now - self.click_time, delay)
+                {
+                    self.clicks.saturating_add(1)
+                } else {
+                    1
+                };
+                self.click_time = now;
+                self.click_cell = cell;
+                let (row, col) = cell;
+                match click_gesture(self.clicks) {
+                    Gesture::Point => self.selection = None,
+                    Gesture::Word => {
+                        let screen = terminal.parser.screen();
+                        let width = cols.min(screen.size().1);
+                        let is_word = |c: Option<&vt100::Cell>| {
+                            c.is_some_and(|c| {
+                                !c.is_wide_continuation()
+                                    && c.contents()
+                                        .chars()
+                                        .next()
+                                        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+                            })
+                        };
+                        if is_word(screen.cell(row, col)) {
+                            let mut start = col;
+                            while start > 0 && is_word(screen.cell(row, start - 1)) {
+                                start -= 1;
+                            }
+                            let mut end = col;
+                            while end + 1 < width && is_word(screen.cell(row, end + 1)) {
+                                end += 1;
+                            }
+                            self.selection = Some(((row, start), (row, end)));
+                        } else {
+                            // A word click on whitespace takes the whole line.
+                            self.selection = Some(((row, 0), (row, cols - 1)));
+                        }
+                    }
+                    Gesture::Line => {
+                        self.selection = Some(((row, 0), (row, cols.saturating_sub(1))));
+                    }
+                    Gesture::Screen => {
+                        self.selection =
+                            Some(((0, 0), (rows.saturating_sub(1), cols.saturating_sub(1))));
+                    }
+                }
+            }
         }
         if response.dragged()
             && !mouse
@@ -170,36 +262,9 @@ impl Pane {
         {
             self.selection = Some((start, pointer_cell(pos)));
         }
-        if response.double_clicked()
-            && !mouse
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            let (row, col) = pointer_cell(pos);
-            let screen = terminal.parser.screen();
-            let width = cols.min(screen.size().1);
-            let is_word = |c: Option<&vt100::Cell>| {
-                c.is_some_and(|c| {
-                    !c.is_wide_continuation() && c.contents().chars().next().is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
-                })
-            };
-            if is_word(screen.cell(row, col)) {
-                let mut start = col;
-                while start > 0 && is_word(screen.cell(row, start - 1)) {
-                    start -= 1;
-                }
-                let mut end = col;
-                while end + 1 < width && is_word(screen.cell(row, end + 1)) {
-                    end += 1;
-                }
-                self.selection = Some(((row, start), (row, end)));
-            } else {
-                // Double-click on whitespace selects the whole line.
-                self.selection = Some(((row, 0), (row, cols - 1)));
-            }
-        }
         if copy_on_select
             && !mouse
-            && (response.drag_stopped() || response.double_clicked())
+            && (response.drag_stopped() || (response.clicked() && self.clicks >= 2))
             && let Some((a, b)) = self.selection
         {
             let text = selection_text(terminal.parser.screen(), a, b);
@@ -712,5 +777,33 @@ mod tests {
         p.process("你好abcdef".as_bytes());
         assert_eq!(selection_text(p.screen(), (0, 0), (1, 3)), "你好abcdef");
         assert_eq!(selection_text(p.screen(), (1, 3), (0, 0)), "你好abcdef");
+    }
+
+    /// One click places the caret, two take a word, three take the line, four take
+    /// the screen — and leaning on the button stays at "everything" rather than
+    /// wrapping round to something else.
+    #[test]
+    fn click_runs_map_to_the_expected_gesture() {
+        assert_eq!(click_gesture(0), Gesture::Point);
+        assert_eq!(click_gesture(1), Gesture::Point);
+        assert_eq!(click_gesture(2), Gesture::Word);
+        assert_eq!(click_gesture(3), Gesture::Line);
+        assert_eq!(click_gesture(4), Gesture::Screen);
+        assert_eq!(click_gesture(5), Gesture::Screen);
+        assert_eq!(click_gesture(u8::MAX), Gesture::Screen);
+    }
+
+    /// A run only continues on the same cell, soon enough after the last click.
+    /// Getting this wrong would turn two separate clicks into a word selection.
+    #[test]
+    fn a_click_run_needs_the_same_cell_and_a_short_gap() {
+        let here = (4, 10);
+        assert!(continues_run(here, here, 0.05, 0.3));
+        assert!(continues_run(here, here, 0.3, 0.3), "the boundary counts");
+        assert!(!continues_run(here, here, 0.31, 0.3), "too slow");
+        assert!(!continues_run(here, (4, 11), 0.05, 0.3), "another cell");
+        assert!(!continues_run(here, (5, 10), 0.05, 0.3), "another row");
+        // A clock that went backwards must not merge two clicks either.
+        assert!(!continues_run(here, here, -1.0, 0.3));
     }
 }

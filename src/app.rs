@@ -1,9 +1,10 @@
 use crate::{
+    icons,
     remote_ui::{self, Files, Login, format_size, hint},
     theme::{Palette, load_fonts},
     view::Pane,
 };
-use eframe::egui::{self, Align, Button, Key, Layout, Rect, RichText, Sense};
+use eframe::egui::{self, Align, Key, Layout, Rect, RichText, Sense};
 use g_terminal::{
     config::{Forward, RemoteProfile, Settings},
     layout::{Axis, Layout as PaneLayout, SavedTab},
@@ -425,9 +426,15 @@ impl App {
             .as_ref()
             .is_none_or(|f| !Arc::ptr_eq(&f.connection, connection))
         {
-            self.files = Some(Files::new(connection.clone(), ctx, self.settings.hide_dotfiles));
+            self.files = Some(Files::new(
+                connection.clone(),
+                ctx,
+                self.settings.hide_dotfiles,
+            ));
         }
-        self.files_open = true;
+        // The file window is not opened. A transfer started from the terminal has
+        // nothing to do with the file browser, and the status bar already carries
+        // the progress strip for it.
         let grab = self.tabs[self.active].panes[self.tabs[self.active].focused]
             .session
             .begin_terminal_zmodem();
@@ -440,69 +447,51 @@ impl App {
             Err(e) => self.error = Some(format!("{e:#}")),
         }
     }
-    fn titlebar(&mut self, ctx: &egui::Context) {
-        let p = self.palette;
-        let bar = egui::TopBottomPanel::top("titlebar")
-            .frame(
-                egui::Frame::new()
-                    .fill(p.panel)
-                    .inner_margin(egui::Margin::symmetric(6, 1)),
-            )
-            .show(ctx, |ui| {
-                let mut maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                let mut close = false;
-                // The buttons sit at the right edge, the drag strip fills what
-                // is left over between the title and them.
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let button = |ui: &mut egui::Ui, label: &str, tip: &str| {
-                        ui.add(
-                            egui::Button::new(RichText::new(label).size(14.0).color(p.muted))
-                                .frame(false)
-                                .min_size(egui::vec2(32.0, 20.0)),
-                        )
-                        .on_hover_text(tip)
-                    };
-                    if button(ui, "✕", "关闭").clicked() {
-                        close = true;
-                    }
-                    if button(ui, "▢", "最大化 / 还原").clicked() {
-                        maximized = !maximized;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
-                    }
-                    if button(ui, "—", "最小化").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    }
-                    // Everything left of the buttons drags the frameless window.
-                    let buttons_left = ui.min_rect().left() - 4.0;
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.label(RichText::new("G-Terminal").color(p.muted).strong());
-                        let drag_min = ui.cursor().min;
-                        if drag_min.x < buttons_left {
-                            let drag_rect = Rect::from_min_max(
-                                drag_min,
-                                egui::Pos2::new(buttons_left, drag_min.y + 20.0),
-                            );
-                            let drag = ui.interact(
-                                drag_rect,
-                                ui.id().with("titlebar-drag"),
-                                Sense::click_and_drag(),
-                            );
-                            if drag.drag_started_by(egui::PointerButton::Primary) {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                            }
-                            if drag.double_clicked() {
-                                maximized = !maximized;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
-                            }
-                        }
-                    });
-                });
-                if close {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            })
-            .response;
-        let _ = bar;
+    /// Claims the window's outer few pixels for resizing.
+    ///
+    /// A frameless window gets no resize border from the OS, and winit does not add
+    /// one — so without this the window simply cannot be resized by dragging, which
+    /// is what it did before. The edges are detected here and handed to the
+    /// platform, which then runs its own resize loop.
+    fn resize_grips(&self, ctx: &egui::Context) {
+        use egui::viewport::ResizeDirection;
+        const GRIP: f32 = 5.0;
+        let screen = ctx.content_rect();
+        let Some(pointer) = ctx.input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        let direction = match (
+            pointer.x - screen.left() <= GRIP,
+            screen.right() - pointer.x <= GRIP,
+            pointer.y - screen.top() <= GRIP,
+            screen.bottom() - pointer.y <= GRIP,
+        ) {
+            (true, _, true, _) => Some(ResizeDirection::NorthWest),
+            (_, true, true, _) => Some(ResizeDirection::NorthEast),
+            (true, _, _, true) => Some(ResizeDirection::SouthWest),
+            (_, true, _, true) => Some(ResizeDirection::SouthEast),
+            (true, _, _, _) => Some(ResizeDirection::West),
+            (_, true, _, _) => Some(ResizeDirection::East),
+            (_, _, true, _) => Some(ResizeDirection::North),
+            (_, _, _, true) => Some(ResizeDirection::South),
+            _ => None,
+        };
+        let Some(direction) = direction else {
+            return;
+        };
+        // The cursor is the whole affordance: nothing is drawn, so without it the
+        // edge looks inert.
+        ctx.set_cursor_icon(match direction {
+            ResizeDirection::North | ResizeDirection::South => egui::CursorIcon::ResizeVertical,
+            ResizeDirection::East | ResizeDirection::West => egui::CursorIcon::ResizeHorizontal,
+            ResizeDirection::NorthWest | ResizeDirection::SouthEast => egui::CursorIcon::ResizeNwSe,
+            ResizeDirection::NorthEast | ResizeDirection::SouthWest => egui::CursorIcon::ResizeNeSw,
+        });
+        // Only a press that starts on the edge begins a resize; otherwise every
+        // click near a border would jump into one.
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
     }
     fn topbar(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
         let p = self.palette;
@@ -513,210 +502,366 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(4, 2)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.menu_button(RichText::new("G  菜单").color(p.accent), |ui| {
-                        for (text, a) in [
-                            (
-                                "新建终端           Ctrl+Shift+T",
-                                Action::New(SessionKind::Local(
-                                    self.settings.default_shell.clone(),
-                                )),
-                            ),
-                            ("新建 SSH 连接", Action::Remote),
-                            ("文件与传输队列", Action::Files),
-                            (
-                                "左右分屏           Ctrl+Shift+D",
-                                Action::Split(Axis::Horizontal),
-                            ),
-                            (
-                                "上下分屏           Ctrl+Shift+E",
-                                Action::Split(Axis::Vertical),
-                            ),
-                            ("关闭窗格           Ctrl+Shift+W", Action::ClosePane),
-                            ("重新连接 / 重启", Action::Restart),
-                        ] {
-                            if ui.button(text).clicked() {
-                                *action = Some(a);
+                let mut close = false;
+                let mut toggle = false;
+                // Read maximized fresh every frame: the window can also be maximized
+                // by the OS (snap, Win+Up, taskbar) without going through a button.
+                let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                // The tab row and the window buttons share one bar, so the frameless
+                // chrome costs a single row of height instead of two.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let close_button =
+                        title_button(ui, TitleButton::Close, p).on_hover_text("关闭");
+                    let toggle_button = title_button(
+                        ui,
+                        if maximized {
+                            TitleButton::Restore
+                        } else {
+                            TitleButton::Maximize
+                        },
+                        p,
+                    )
+                    .on_hover_text("最大化 / 还原");
+                    let minimize_button =
+                        title_button(ui, TitleButton::Minimize, p).on_hover_text("最小化");
+                    // Derive the edge from the buttons themselves; `min_rect()` would
+                    // also fold in unrelated widgets. The drag strip below is
+                    // registered later and would win any overlap, so this boundary
+                    // has to be exact.
+                    let buttons_left = close_button
+                        .rect
+                        .union(toggle_button.rect)
+                        .union(minimize_button.rect)
+                        .left()
+                        - 4.0;
+                    if close_button.clicked() {
+                        close = true;
+                    }
+                    if toggle_button.clicked() {
+                        toggle = true;
+                    }
+                    if minimize_button.clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.menu_button(RichText::new("G  菜单").color(p.accent), |ui| {
+                            for (icon, text, shortcut, a) in [
+                                (
+                                    icons::Icon::Terminal,
+                                    "新建终端",
+                                    Some("Ctrl+Shift+T"),
+                                    Action::New(SessionKind::Local(
+                                        self.settings.default_shell.clone(),
+                                    )),
+                                ),
+                                (icons::Icon::Host, "新建 SSH 连接", None, Action::Remote),
+                                (icons::Icon::File, "文件与传输队列", None, Action::Files),
+                                (
+                                    icons::Icon::SplitHorizontal,
+                                    "左右分屏",
+                                    Some("Ctrl+Shift+D"),
+                                    Action::Split(Axis::Horizontal),
+                                ),
+                                (
+                                    icons::Icon::SplitVertical,
+                                    "上下分屏",
+                                    Some("Ctrl+Shift+E"),
+                                    Action::Split(Axis::Vertical),
+                                ),
+                                (
+                                    icons::Icon::ClosePane,
+                                    "关闭窗格",
+                                    Some("Ctrl+Shift+W"),
+                                    Action::ClosePane,
+                                ),
+                                (
+                                    icons::Icon::Restart,
+                                    "重新连接 / 重启",
+                                    None,
+                                    Action::Restart,
+                                ),
+                            ] {
+                                if icons::icon_row(ui, icon, text, shortcut, p).clicked() {
+                                    *action = Some(a);
+                                    ui.close();
+                                }
+                            }
+                            if icons::icon_row(
+                                ui,
+                                icons::Icon::Search,
+                                "查找历史",
+                                Some("Ctrl+Shift+F"),
+                                p,
+                            )
+                            .clicked()
+                            {
+                                self.search_open = true;
+                                self.search_focus = true;
                                 ui.close();
                             }
-                        }
-                        if ui.button("查找历史           Ctrl+Shift+F").clicked() {
-                            self.search_open = true;
-                            self.search_focus = true;
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .checkbox(&mut self.settings.sidebar, "显示导航栏")
-                            .changed()
-                        {
-                            ui.close();
-                        }
-                        if ui.button("连接分组管理").clicked() {
-                            self.groups_open = true;
-                            ui.close();
-                        }
-                        if ui.button("偏好设置           Ctrl+,").clicked() {
-                            self.settings_open = true;
-                            ui.close();
-                        }
-                        if ui.button("快捷键 / 关于").clicked() {
-                            self.help_open = true;
-                            ui.close();
-                        }
-                        ui.separator();
-                        ui.label(hint(
-                            concat!(
-                                "G-Terminal ",
-                                env!("CARGO_PKG_VERSION"),
-                                " · Native. Fast. Yours."
-                            ),
+                            ui.separator();
+                            if ui
+                                .checkbox(&mut self.settings.sidebar, "显示导航栏")
+                                .changed()
+                            {
+                                ui.close();
+                            }
+                            if icons::icon_row(ui, icons::Icon::Group, "连接分组管理", None, p)
+                                .clicked()
+                            {
+                                self.groups_open = true;
+                                ui.close();
+                            }
+                            if icons::icon_row(
+                                ui,
+                                icons::Icon::Settings,
+                                "偏好设置",
+                                Some("Ctrl+,"),
+                                p,
+                            )
+                            .clicked()
+                            {
+                                self.settings_open = true;
+                                ui.close();
+                            }
+                            if icons::icon_row(ui, icons::Icon::Help, "快捷键 / 关于", None, p)
+                                .clicked()
+                            {
+                                self.help_open = true;
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.label(hint(
+                                concat!(
+                                    "G-Terminal ",
+                                    env!("CARGO_PKG_VERSION"),
+                                    " · Native. Fast. Yours."
+                                ),
+                                p,
+                            ));
+                        });
+                        if icons::icon_button(
+                            ui,
+                            if self.settings.sidebar {
+                                icons::Icon::ChevronLeft
+                            } else {
+                                icons::Icon::ChevronRight
+                            },
                             p,
-                        ));
-                    });
-                    if ui
-                        .small_button(if self.settings.sidebar { "‹" } else { "›" })
+                            icons::Size::Button,
+                        )
                         .on_hover_text("展开 / 收起导航栏")
                         .clicked()
-                    {
-                        self.settings.sidebar = !self.settings.sidebar;
-                    }
-                    ui.separator();
-                    egui::ScrollArea::horizontal()
-                        .id_salt("tab-strip")
-                        .max_width((ui.available_width() - 30.0).max(100.0))
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for (i, t) in self.tabs.iter().enumerate() {
-                                    ui.push_id(t.id, |ui| {
-                                        egui::Frame::new()
-                                            .fill(if i == self.active { p.raised } else { p.panel })
-                                            .inner_margin(egui::Margin::symmetric(6, 0))
-                                            .show(ui, |ui| {
-                                                let mut hit = None;
-                                                ui.horizontal(|ui| {
-                                                    // Connection state of the whole tab, worst pane wins.
-                                                    let (dot, _) = ui.allocate_exact_size(
-                                                        egui::vec2(7.0, 7.0),
-                                                        Sense::hover(),
-                                                    );
-                                                    ui.painter().circle_filled(
-                                                        dot.center(),
-                                                        3.5,
-                                                        link_color(tab_link(t), p),
-                                                    );
-                                                    ui.interact(
-                                                        dot,
-                                                        ui.id().with("tab-state"),
-                                                        Sense::hover(),
-                                                    )
-                                                    .on_hover_text(tab_link(t).describe());
-                                                    for (index, pane) in
-                                                        t.panes.iter().enumerate()
-                                                    {
-                                                        if index > 0 {
-                                                            ui.label(
-                                                                RichText::new("|").color(p.muted),
+                        {
+                            self.settings.sidebar = !self.settings.sidebar;
+                        }
+                        ui.separator();
+                        // Bound the strip so a stretch of empty bar always remains for
+                        // dragging the frameless window by.
+                        const DRAG_GAP: f32 = 60.0;
+                        let strip_max = (buttons_left - ui.cursor().min.x - DRAG_GAP).max(120.0);
+                        // A horizontal strip ignores the wheel, and every mouse has
+                        // one. The vertical delta is fed in as horizontal, but only
+                        // while the pointer is over the strip — otherwise the
+                        // terminal below would stop scrolling.
+                        let cursor = ui.cursor().min;
+                        let strip_rect = egui::Rect::from_min_max(
+                            cursor,
+                            egui::pos2(cursor.x + strip_max, cursor.y + 24.0),
+                        );
+                        if ui.rect_contains_pointer(strip_rect) {
+                            ui.ctx().input_mut(|input| {
+                                let wheel = input.smooth_scroll_delta.y;
+                                input.smooth_scroll_delta.x += wheel;
+                                input.smooth_scroll_delta.y = 0.0;
+                            });
+                        }
+                        // A hairline bar, shown only when the tabs actually
+                        // overflow: it reads as an indicator, not as chrome.
+                        ui.scope(|ui| {
+                            let scroll = &mut ui.style_mut().spacing.scroll;
+                            scroll.bar_width = 3.0;
+                            scroll.bar_inner_margin = 0.0;
+                            scroll.bar_outer_margin = 0.0;
+                            egui::ScrollArea::horizontal()
+                                .id_salt("tab-strip")
+                                .max_width(strip_max)
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                                )
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        for (i, t) in self.tabs.iter().enumerate() {
+                                            ui.push_id(t.id, |ui| {
+                                                egui::Frame::new()
+                                                    .fill(if i == self.active {
+                                                        p.raised
+                                                    } else {
+                                                        p.panel
+                                                    })
+                                                    .inner_margin(egui::Margin::symmetric(6, 0))
+                                                    .show(ui, |ui| {
+                                                        let mut hit = None;
+                                                        ui.horizontal(|ui| {
+                                                            // Connection state of the whole tab, worst pane wins.
+                                                            let (dot, _) = ui.allocate_exact_size(
+                                                                egui::vec2(7.0, 7.0),
+                                                                Sense::hover(),
                                                             );
-                                                        }
-                                                        let focused = index == t.focused;
-                                                        let color = if i == self.active {
-                                                            if focused { p.text } else { p.muted }
-                                                        } else {
-                                                            p.muted
-                                                        };
-                                                        let text = pane
-                                                            .session
-                                                            .kind
-                                                            .label()
-                                                            .chars()
-                                                            .take(18)
-                                                            .collect::<String>();
-                                                        let label = ui.label(
-                                                            if focused {
-                                                                RichText::new(text)
-                                                                    .color(color)
-                                                                    .strong()
-                                                            } else {
-                                                                RichText::new(text).color(color)
-                                                            },
-                                                        );
-                                                        if focused {
-                                                            ui.painter().line_segment(
-                                                                [
-                                                                    egui::pos2(
-                                                                        label.rect.left(),
-                                                                        label.rect.bottom() - 1.0,
-                                                                    ),
-                                                                    egui::pos2(
-                                                                        label.rect.right(),
-                                                                        label.rect.bottom() - 1.0,
-                                                                    ),
-                                                                ],
-                                                                egui::Stroke::new(1.5_f32, p.accent),
+                                                            ui.painter().circle_filled(
+                                                                dot.center(),
+                                                                3.5,
+                                                                link_color(tab_link(t), p),
                                                             );
-                                                        }
-                                                    }
-                                                    hit = Some(ui.min_rect());
-                                                });
-                                                let Some(rect) = hit else { return };
-                                                let r = ui
-                                                    .interact(
-                                                        rect,
-                                                        ui.id().with("tab-hit"),
-                                                        Sense::click(),
-                                                    )
-                                                    .on_hover_text(format!(
-                                                        "{} · {} 个窗格 · 中键关闭",
-                                                        t.panes[t.focused].session.kind.label(),
-                                                        t.panes.len()
-                                                    ));
-                                                if r.clicked() {
-                                                    self.active = i;
-                                                }
-                                                if r.clicked_by(egui::PointerButton::Middle) {
-                                                    *action = Some(Action::CloseTab(i));
-                                                }
-                                                r.context_menu(|ui| {
-                                                    for (text, a) in [
-                                                        (
-                                                            "左右分屏",
-                                                            Action::Split(Axis::Horizontal),
-                                                        ),
-                                                        (
-                                                            "上下分屏",
-                                                            Action::Split(Axis::Vertical),
-                                                        ),
-                                                        ("关闭标签", Action::CloseTab(i)),
-                                                    ] {
-                                                        if ui.button(text).clicked() {
+                                                            ui.interact(
+                                                                dot,
+                                                                ui.id().with("tab-state"),
+                                                                Sense::hover(),
+                                                            )
+                                                            .on_hover_text(tab_link(t).describe());
+                                                            for (index, pane) in
+                                                                t.panes.iter().enumerate()
+                                                            {
+                                                                if index > 0 {
+                                                                    ui.label(
+                                                                        RichText::new("|")
+                                                                            .color(p.muted),
+                                                                    );
+                                                                }
+                                                                let focused = index == t.focused;
+                                                                let color = if i == self.active {
+                                                                    if focused {
+                                                                        p.text
+                                                                    } else {
+                                                                        p.muted
+                                                                    }
+                                                                } else {
+                                                                    p.muted
+                                                                };
+                                                                let text = pane
+                                                                    .session
+                                                                    .kind
+                                                                    .label()
+                                                                    .chars()
+                                                                    .take(18)
+                                                                    .collect::<String>();
+                                                                ui.label(if focused {
+                                                                    RichText::new(text)
+                                                                        .color(color)
+                                                                        .strong()
+                                                                } else {
+                                                                    RichText::new(text).color(color)
+                                                                });
+                                                            }
+                                                            // Inside the label row, so it hugs the
+                                                            // text instead of floating at the tab's
+                                                            // far edge.
+                                                            let close = icons::glyph_button(
+                                                                ui,
+                                                                "×",
+                                                                p,
+                                                                "关闭标签",
+                                                            );
+                                                            if close.clicked() {
+                                                                *action = Some(Action::CloseTab(i));
+                                                            }
+                                                            // The whole tab activates on click, but the
+                                                            // hit rect has to stop where the close button
+                                                            // begins — it is registered first, so anything
+                                                            // overlapping it would win.
+                                                            let label_rect = ui.min_rect();
+                                                            hit = Some(egui::Rect::from_min_max(
+                                                                label_rect.min,
+                                                                egui::pos2(
+                                                                    close.rect.left(),
+                                                                    label_rect.max.y,
+                                                                ),
+                                                            ));
+                                                        });
+                                                        let Some(rect) = hit else { return };
+                                                        let r = ui
+                                                            .interact(
+                                                                rect,
+                                                                ui.id().with("tab-hit"),
+                                                                Sense::click(),
+                                                            )
+                                                            .on_hover_text(format!(
+                                                                "{} · {} 个窗格 · 中键关闭",
+                                                                t.panes[t.focused]
+                                                                    .session
+                                                                    .kind
+                                                                    .label(),
+                                                                t.panes.len()
+                                                            ));
+                                                        if r.clicked() {
                                                             self.active = i;
-                                                            *action = Some(a);
-                                                            ui.close();
                                                         }
-                                                    }
-                                                });
+                                                        if r.clicked_by(egui::PointerButton::Middle)
+                                                        {
+                                                            *action = Some(Action::CloseTab(i));
+                                                        }
+                                                        r.context_menu(|ui| {
+                                                            for (text, a) in [
+                                                                (
+                                                                    "左右分屏",
+                                                                    Action::Split(Axis::Horizontal),
+                                                                ),
+                                                                (
+                                                                    "上下分屏",
+                                                                    Action::Split(Axis::Vertical),
+                                                                ),
+                                                                ("关闭标签", Action::CloseTab(i)),
+                                                            ] {
+                                                                if ui.button(text).clicked() {
+                                                                    self.active = i;
+                                                                    *action = Some(a);
+                                                                    ui.close();
+                                                                }
+                                                            }
+                                                        });
+                                                    });
                                             });
-                                        if ui
-                                            .add(
-                                                Button::new(RichText::new("×").color(p.muted))
-                                                    .frame(false),
-                                            )
-                                            .clicked()
-                                        {
-                                            *action = Some(Action::CloseTab(i));
                                         }
                                     });
-                                }
-                            });
+                                });
                         });
-                    if ui.small_button("+").clicked() {
-                        *action = Some(Action::New(SessionKind::Local(
-                            self.settings.default_shell.clone(),
-                        )));
-                    }
+                        if icons::icon_button(ui, icons::Icon::Plus, p, icons::Size::Button)
+                            .on_hover_text("新建终端")
+                            .clicked()
+                        {
+                            *action = Some(Action::New(SessionKind::Local(
+                                self.settings.default_shell.clone(),
+                            )));
+                        }
+                        // Whatever the tabs left over, up to the buttons, drags the
+                        // frameless window. Spanning the full bar height keeps the
+                        // top and bottom rows of pixels draggable too.
+                        let cursor = ui.cursor().min;
+                        if cursor.x < buttons_left {
+                            let drag_rect = Rect::from_min_max(
+                                egui::Pos2::new(cursor.x, ui.max_rect().top()),
+                                egui::Pos2::new(buttons_left, ui.max_rect().bottom()),
+                            );
+                            let drag = ui.interact(
+                                drag_rect,
+                                ui.id().with("titlebar-drag"),
+                                Sense::click_and_drag(),
+                            );
+                            if drag.drag_started_by(egui::PointerButton::Primary) {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                            if drag.double_clicked() {
+                                toggle = true;
+                            }
+                        }
+                    });
                 });
+                if toggle {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                if close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
     }
     fn sidebar(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
@@ -740,19 +885,32 @@ impl App {
                             } else {
                                 vec![("shell", "Shell")]
                             } {
-                                if list_row(ui, label, p.text, 22.0).clicked() {
+                                if icons::icon_row(ui, icons::Icon::Terminal, label, None, p)
+                                    .clicked()
+                                {
                                     *action = Some(Action::New(SessionKind::Local(key.into())));
                                 }
                             }
                         });
                     ui.horizontal(|ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(15.0, 15.0), Sense::hover());
+                        icons::draw(ui.painter(), rect, icons::Icon::Host, p.muted, 1.2);
                         ui.label(hint("连接", p));
-                        if ui.small_button("+").clicked() {
-                            *action = Some(Action::Remote);
-                        }
-                        if ui.small_button("分组").clicked() {
-                            self.groups_open = true;
-                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icons::icon_button(ui, icons::Icon::Group, p, icons::Size::Row)
+                                .on_hover_text("分组管理")
+                                .clicked()
+                            {
+                                self.groups_open = true;
+                            }
+                            if icons::icon_button(ui, icons::Icon::Plus, p, icons::Size::Row)
+                                .on_hover_text("新建连接")
+                                .clicked()
+                            {
+                                *action = Some(Action::Remote);
+                            }
+                        });
                     });
                     let mut groups = self.settings.groups.clone();
                     for profile in &self.settings.profiles {
@@ -789,7 +947,13 @@ impl App {
                                 .enumerate()
                                 .filter(|(_, p)| p.group == group)
                             {
-                                let r = list_row(ui, &profile.label(), p.text, 22.0);
+                                let r = icons::icon_row(
+                                    ui,
+                                    icons::Icon::Host,
+                                    &profile.label(),
+                                    None,
+                                    p,
+                                );
                                 if r.double_clicked() {
                                     *action = Some(Action::New(SessionKind::Ssh(profile.clone())));
                                 }
@@ -905,28 +1069,25 @@ impl App {
             .default_width(480.0)
             .show(ctx, |ui| {
                 egui::Grid::new("connection-form")
-                    .spacing([14.0, 6.0])
+                    .spacing([12.0, 6.0])
+                    .min_col_width(72.0)
                     .show(ui, |ui| {
                         ui.label("主机 / IP");
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.remote.host)
-                                .hint_text(hint("192.168.1.10", p)),
+                            egui::TextEdit::singleline(&mut self.remote.host).desired_width(280.0),
                         );
+                        ui.end_row();
+                        ui.label("端口");
+                        ui.add(egui::DragValue::new(&mut self.remote.port).range(1..=65535));
                         ui.end_row();
                         ui.label("连接名称");
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.remote.name).hint_text(hint(
-                                if self.remote.host.is_empty() {
-                                    "留空使用 IP / 主机名"
-                                } else {
-                                    &self.remote.host
-                                },
-                                p,
-                            )),
+                            egui::TextEdit::singleline(&mut self.remote.name).desired_width(280.0),
                         );
                         ui.end_row();
                         ui.label("分组");
                         egui::ComboBox::from_id_salt("profile-group")
+                            .width(200.0)
                             .selected_text(if self.remote.group.is_empty() {
                                 "未分组"
                             } else {
@@ -947,20 +1108,15 @@ impl App {
                                 }
                             });
                         ui.end_row();
-                        ui.label("用户名 / 端口");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.remote.user)
-                                    .desired_width(155.0)
-                                    .hint_text(hint("系统用户名", p)),
-                            );
-                            ui.add(egui::DragValue::new(&mut self.remote.port).range(1..=65535));
-                        });
+                        ui.label("用户名");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.remote.user).desired_width(280.0),
+                        );
                         ui.end_row();
                         ui.label("私钥路径");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.remote.identity)
-                                .hint_text(hint("可选，使用完整路径", p)),
+                                .desired_width(280.0),
                         );
                         ui.end_row();
                     });
@@ -974,23 +1130,30 @@ impl App {
                         };
                     }
                     if let Some(j) = &mut self.remote.jump {
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut j.host)
-                                    .desired_width(170.0)
-                                    .hint_text(hint("跳板机 IP", p)),
-                            );
-                            ui.add(egui::DragValue::new(&mut j.port).range(1..=65535));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut j.user)
-                                    .desired_width(110.0)
-                                    .hint_text(hint("用户名", p)),
-                            );
-                        });
-                        ui.add(
-                            egui::TextEdit::singleline(&mut j.identity)
-                                .hint_text(hint("跳板机私钥，可选", p)),
-                        );
+                        egui::Grid::new("jump-form")
+                            .spacing([12.0, 6.0])
+                            .min_col_width(48.0)
+                            .show(ui, |ui| {
+                                ui.label("地址");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut j.host).desired_width(280.0),
+                                );
+                                ui.end_row();
+                                ui.label("端口");
+                                ui.add(egui::DragValue::new(&mut j.port).range(1..=65535));
+                                ui.end_row();
+                                ui.label("用户名");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut j.user).desired_width(280.0),
+                                );
+                                ui.end_row();
+                                ui.label("私钥");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut j.identity)
+                                        .desired_width(280.0),
+                                );
+                                ui.end_row();
+                            });
                     }
                 });
                 egui::CollapsingHeader::new("本地端口转发（监听 127.0.0.1）").show(ui, |ui| {
@@ -1000,9 +1163,7 @@ impl App {
                             ui.add(egui::DragValue::new(&mut f.bind_port).range(1..=65535));
                             ui.label("→");
                             ui.add(
-                                egui::TextEdit::singleline(&mut f.target_host)
-                                    .desired_width(160.0)
-                                    .hint_text(hint("目标地址", p)),
+                                egui::TextEdit::singleline(&mut f.target_host).desired_width(160.0),
                             );
                             ui.add(egui::DragValue::new(&mut f.target_port).range(1..=65535));
                             if ui.small_button("×").clicked() {
@@ -1057,10 +1218,7 @@ impl App {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_group)
-                            .hint_text(hint("新分组名称", p)),
-                    );
+                    ui.add(egui::TextEdit::singleline(&mut self.new_group).desired_width(180.0));
                     if ui.button("添加").clicked() {
                         let name = self.new_group.trim().to_string();
                         if !name.is_empty() && !self.settings.groups.contains(&name) {
@@ -1186,8 +1344,8 @@ impl App {
     }
     pub(crate) fn render(&mut self, ctx: &egui::Context) {
         let p = self.palette;
+        self.resize_grips(ctx);
         let mut action = self.shortcuts(ctx);
-        self.titlebar(ctx);
         self.topbar(ctx, &mut action);
         egui::TopBottomPanel::bottom("status")
             .frame(
@@ -1198,7 +1356,7 @@ impl App {
             .show(ctx, |ui| {
                 if let Some(error) = self.error.clone() {
                     ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                        ui.colored_label(p.danger, error);
                         if ui.small_button("×").clicked() {
                             self.error = None;
                         }
@@ -1228,7 +1386,7 @@ impl App {
                             p,
                         ));
                         if let Some(e) = &state.error {
-                            ui.colored_label(egui::Color32::LIGHT_RED, e);
+                            ui.colored_label(p.danger, e);
                         }
                         if let Some(c) = &s.remote {
                             let forwards = c.forwarding.lock().unwrap().clone();
@@ -1241,7 +1399,8 @@ impl App {
                                     ui.close();
                                 }
                             });
-                            if ui.small_button("文件").clicked() {
+                            if icons::icon_label_button(ui, icons::Icon::File, "文件", p).clicked()
+                            {
                                 action = Some(Action::Files);
                             }
                         }
@@ -1290,9 +1449,10 @@ impl App {
             self.sidebar(ctx, &mut action);
         }
         if let Some((tab_id, pane_id)) = self.split_chooser {
-            let exists = self.tabs.iter().any(|t| {
-                t.id == tab_id && t.panes.iter().any(|p| p.id == pane_id)
-            });
+            let exists = self
+                .tabs
+                .iter()
+                .any(|t| t.id == tab_id && t.panes.iter().any(|p| p.id == pane_id));
             if !exists {
                 self.split_chooser = None;
             } else {
@@ -1305,7 +1465,10 @@ impl App {
                     .resizable(false)
                     .default_width(260.0)
                     .show(ctx, |ui| {
-                        ui.label(hint("已自动开启一个相同类型的会话，可选择其他会话替换。", p));
+                        ui.label(hint(
+                            "已自动开启一个相同类型的会话，可选择其他会话替换。",
+                            p,
+                        ));
                         if cfg!(windows) {
                             for (key, label) in [
                                 ("powershell", "本地 PowerShell"),
@@ -1322,10 +1485,7 @@ impl App {
                         }
                         ui.separator();
                         for profile in &self.settings.profiles {
-                            if ui
-                                .button(format!("SSH · {}", profile.label()))
-                                .clicked()
-                            {
+                            if ui.button(format!("SSH · {}", profile.label())).clicked() {
                                 chosen = Some(SessionKind::Ssh(profile.clone()));
                             }
                         }
@@ -1370,75 +1530,40 @@ impl App {
         if let Some(t) = self.tabs.get(self.active)
             && let Some(c) = t.panes[t.focused].session.remote.clone()
         {
-            let (offer, upload) = {
-                let terminal = t.panes[t.focused].session.terminal.lock().unwrap();
-                if !terminal.zmodem_offer {
-                    (false, false)
-                } else {
-                    // lrzsz prints "rz waiting to receive." before its header
-                    // when the server runs `rz`; plain headers mean `sz`.
-                    let upload = terminal
-                        .parser
-                        .screen()
-                        .contents()
-                        .to_lowercase()
-                        .contains("waiting to receive");
-                    (true, upload)
-                }
-            };
-            let mut pick = false;
-            let mut cancel = false;
-            if offer {
-                let mut open = true;
-                egui::Window::new("ZMODEM 传输")
-                    .open(&mut open)
-                    .collapsible(false)
-                    .resizable(false)
-                    .default_width(380.0)
-                    .show(ctx, |ui| {
-                        if upload {
-                            ui.label("服务器在等待接收文件（rz）。");
-                            ui.label(hint("选择要上传的本地文件。", p));
-                            if ui.button("选择文件并上传…").clicked() {
-                                pick = true;
-                            }
-                        } else {
-                            ui.label("服务器正在发送文件（sz）。");
-                            ui.label(hint("选择保存目录后开始接收。", p));
-                            if ui.button("选择目录并接收…").clicked() {
-                                pick = true;
-                            }
-                        }
-                        if ui.button("取消").clicked() {
-                            cancel = true;
-                        }
-                    });
-                if !open {
-                    cancel = true;
-                }
-            }
-            if offer && (pick || cancel) {
+            // The ZMODEM frame type decides the direction, so the old screen-text
+            // guess ("waiting to receive") is gone — and with it the reason `rz`
+            // never raised an offer at all.
+            let offer = self.tabs[self.active].panes[self.tabs[self.active].focused]
+                .session
+                .terminal
+                .lock()
+                .unwrap()
+                .zmodem_offer;
+            if let Some(upload) = offer {
+                // The picker opens straight away. The confirmation that used to sit
+                // in front of it decided nothing: if you type `rz` or `sz` you have
+                // already said what you want, and the picker's own cancel button is
+                // the way to back out.
                 self.tabs[self.active].panes[self.tabs[self.active].focused]
                     .session
                     .terminal
                     .lock()
                     .unwrap()
-                    .zmodem_offer = false;
-            }
-            if offer && cancel {
-                // Five CAN bytes abort a waiting lrzsz transfer.
-                let _ = self.tabs[self.active].panes[self.tabs[self.active].focused]
-                    .session
-                    .write(vec![0x18; 8]);
-            }
-            if offer && pick {
+                    .zmodem_offer = None;
                 let local = if upload {
                     rfd::FileDialog::new().pick_file()
                 } else {
                     rfd::FileDialog::new().pick_folder()
                 };
-                if let Some(local) = local {
-                    self.begin_terminal_zmodem(upload, local, &c, ctx);
+                match local {
+                    Some(local) => self.begin_terminal_zmodem(upload, local, &c, ctx),
+                    // Backing out of the picker is the only way left to refuse, so
+                    // abort the lrzsz that is waiting on the other end.
+                    None => {
+                        let _ = self.tabs[self.active].panes[self.tabs[self.active].focused]
+                            .session
+                            .write(vec![0x18; 8]);
+                    }
                 }
             }
         }
@@ -1448,11 +1573,8 @@ impl App {
                 if self.search_open {
                     ui.horizontal(|ui| {
                         ui.label(hint("历史", p));
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .desired_width(220.0)
-                                .hint_text(hint("搜索保留的全部历史…", p)),
-                        );
+                        let r = ui
+                            .add(egui::TextEdit::singleline(&mut self.search).desired_width(260.0));
                         if self.search_focus {
                             r.request_focus();
                             self.search_focus = false;
@@ -1544,7 +1666,7 @@ impl App {
         self.dialogs(ctx, &mut action);
         if let Some(files) = &mut self.files {
             files.show_question(ctx, p);
-            if files.busy() {
+            if files.busy() || files.loading() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(150));
             }
         }
@@ -1600,39 +1722,35 @@ fn tab_link(tab: &Tab) -> SessionStatus {
     worst
 }
 
-fn link_color(link: SessionStatus, p: Palette) -> egui::Color32 {
-    match link {
-        SessionStatus::Live => egui::Color32::from_rgb(78, 190, 110),
-        SessionStatus::Detached => p.muted,
-        SessionStatus::Lost => egui::Color32::from_rgb(228, 86, 86),
-    }
+/// Which frame icon a titlebar button paints. `Restore` and `Maximize` are the
+/// same button in two states.
+#[derive(Clone, Copy, PartialEq)]
+enum TitleButton {
+    Close,
+    Maximize,
+    Restore,
+    Minimize,
 }
 
-/// A full-width sidebar row whose label hugs the left edge. `add_sized` centres
-/// its widget, which is what pushed connection names into the middle.
-fn list_row(ui: &mut egui::Ui, text: &str, color: egui::Color32, height: f32) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), height),
-        Sense::click(),
-    );
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact_selectable(&response, false);
-        if response.hovered() {
-            ui.painter().rect_filled(
-                rect,
-                ui.style().visuals.widgets.inactive.corner_radius,
-                visuals.bg_fill,
-            );
-        }
-        ui.painter().text(
-            egui::pos2(rect.left() + 6.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            egui::FontId::proportional(ui.style().text_styles[&egui::TextStyle::Button].size),
-            color,
-        );
+/// The window-chrome buttons. Painted through the shared icon set, for the same
+/// reason every other glyph is: no font in the loaded chain carries these
+/// codepoints, so the text versions rendered as tofu boxes.
+fn title_button(ui: &mut egui::Ui, kind: TitleButton, p: Palette) -> egui::Response {
+    let icon = match kind {
+        TitleButton::Close => icons::Icon::Close,
+        TitleButton::Maximize => icons::Icon::Maximize,
+        TitleButton::Restore => icons::Icon::Restore,
+        TitleButton::Minimize => icons::Icon::Minimize,
+    };
+    icons::window_button(ui, icon, p, kind == TitleButton::Close)
+}
+
+fn link_color(link: SessionStatus, p: Palette) -> egui::Color32 {
+    match link {
+        SessionStatus::Live => p.ok,
+        SessionStatus::Detached => p.muted,
+        SessionStatus::Lost => p.danger,
     }
-    response
 }
 
 fn layout_rects(
@@ -1840,5 +1958,143 @@ mod tests {
         frame(&mut app, &ctx, vec![key(Key::W, mods)], mods, size);
         assert_eq!(app.tabs.len(), 1);
         assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    /// Runs one frame and collects the viewport commands it produced, so window
+    /// chrome behaviour can be asserted instead of eyeballed.
+    fn commands(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        size: Vec2,
+    ) -> Vec<egui::ViewportCommand> {
+        let output = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        output
+            .viewport_output
+            .into_values()
+            .flat_map(|viewport| viewport.commands)
+            .collect()
+    }
+
+    fn press(pos: egui::Pos2, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// The merged bar has to keep dragging the frameless window by its empty area.
+    /// That is the whole reason the tab row and the window buttons can share one
+    /// panel, so it is worth asserting rather than assuming.
+    #[test]
+    fn dragging_the_empty_bar_starts_a_window_drag() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        // The drag rect must exist for a frame before egui can hit-test against it.
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        // Well clear of the menu, the tabs and the three window buttons.
+        let empty = egui::Pos2::new(640.0, 13.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![Event::PointerMoved(empty), press(empty, true)],
+            Modifiers::NONE,
+            size,
+        );
+        let mut seen = Vec::new();
+        for step in 1..=3 {
+            seen.extend(commands(
+                &mut app,
+                &ctx,
+                vec![Event::PointerMoved(
+                    empty + Vec2::new(30.0 * step as f32, 0.0),
+                )],
+                size,
+            ));
+        }
+        assert!(
+            seen.contains(&egui::ViewportCommand::StartDrag),
+            "the empty bar no longer drags the window: {seen:?}"
+        );
+    }
+
+    /// The drag strip is registered after the buttons, so it wins any overlap in
+    /// hit-testing. This pins the boundary that keeps it off their clicks.
+    #[test]
+    fn window_buttons_are_not_swallowed_by_the_drag_strip() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        // Right to left from the panel's 4pt inner margin: close, then maximize.
+        let maximize = egui::Pos2::new(size.x - 4.0 - 32.0 - 4.0 - 16.0, 13.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![Event::PointerMoved(maximize), press(maximize, true)],
+            Modifiers::NONE,
+            size,
+        );
+        let seen = commands(&mut app, &ctx, vec![press(maximize, false)], size);
+        assert!(
+            seen.iter()
+                .any(|c| matches!(c, egui::ViewportCommand::Maximized(_))),
+            "the maximize button produced {seen:?}"
+        );
+        assert!(
+            !seen.contains(&egui::ViewportCommand::StartDrag),
+            "the drag strip swallowed the button click"
+        );
+    }
+
+    /// A frameless window gets no resize border from the OS, and winit does not
+    /// add one, so the edges are claimed in-app. This pins that a press on the
+    /// border asks the platform for a resize — and that a press away from every
+    /// border does not, or ordinary clicking would start dragging the frame.
+    #[test]
+    fn pressing_a_window_edge_asks_the_platform_to_resize() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+
+        // Just inside the left edge.
+        let edge = egui::Pos2::new(2.0, 400.0);
+        let seen = commands(
+            &mut app,
+            &ctx,
+            vec![Event::PointerMoved(edge), press(edge, true)],
+            size,
+        );
+        assert!(
+            seen.iter()
+                .any(|command| matches!(command, egui::ViewportCommand::BeginResize(_))),
+            "the window edge did not start a resize: {seen:?}"
+        );
+
+        // Well clear of every edge.
+        let middle = egui::Pos2::new(640.0, 400.0);
+        let seen = commands(
+            &mut app,
+            &ctx,
+            vec![Event::PointerMoved(middle), press(middle, false)],
+            size,
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::BeginResize(_))),
+            "a click in the middle started a resize: {seen:?}"
+        );
     }
 }

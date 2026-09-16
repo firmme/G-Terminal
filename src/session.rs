@@ -473,10 +473,7 @@ impl Session {
     /// (`rz`/`sz` typed at the remote prompt). Ends when the transfer task
     /// drops the returned stream.
     pub fn begin_terminal_zmodem(&self) -> Result<BridgeStream> {
-        anyhow::ensure!(
-            self.remote.is_some(),
-            "仅内置 SSH 会话支持 ZMODEM 抓取"
-        );
+        anyhow::ensure!(self.remote.is_some(), "仅内置 SSH 会话支持 ZMODEM 抓取");
         let (to_transfer, to_transfer_rx) = tokio::sync::mpsc::unbounded_channel();
         let (from_transfer_tx, from_transfer) = tokio::sync::mpsc::unbounded_channel();
         self.input
@@ -497,12 +494,30 @@ impl Session {
         if bytes.len() > 1024 * 1024 {
             bail!("单次粘贴不能超过 1 MiB");
         }
-        if self.status.lock().unwrap().exit_code.is_some() {
-            bail!("会话已退出，请重新启动");
+        {
+            let status = self.status.lock().unwrap();
+            if status.exit_code.is_some() {
+                bail!("会话已退出，请重新启动");
+            }
+            // A session can be finished without ever producing an exit code — an
+            // SSH transport that dropped, for instance. Without this check the
+            // write reaches the channel, which is already closed, and the user is
+            // shown the channel's own error, which means nothing to them.
+            if status.eof || status.error.is_some() {
+                bail!("会话已断开，请重新连接");
+            }
         }
-        self.input
-            .try_send(Control::Write(bytes))
-            .context("终端输入队列已满或会话已关闭，请稍后重试")
+        self.input.try_send(Control::Write(bytes)).map_err(|error| {
+            match error {
+                // The reader went away between the check above and here.
+                std::sync::mpsc::TrySendError::Disconnected(_) => {
+                    anyhow::anyhow!("会话已断开，请重新连接")
+                }
+                std::sync::mpsc::TrySendError::Full(_) => {
+                    anyhow::anyhow!("终端输入过快，请稍后重试")
+                }
+            }
+        })
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {

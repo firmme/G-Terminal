@@ -9,29 +9,64 @@ pub struct Palette {
     pub text: Color32,
     pub muted: Color32,
     pub accent: Color32,
+    /// Text inputs and other sunk surfaces. Kept clearly apart from `panel` so a
+    /// field reads as a field instead of dissolving into the dialog.
+    pub field: Color32,
+    pub danger: Color32,
+    pub warn: Color32,
+    /// A live connection. Green for "running" is a status convention, separate
+    /// from the file-type colours below.
+    pub ok: Color32,
+    /// File-type colours, following the `ls` convention so the list agrees with
+    /// what the terminal shows for the same entry: blue directories, cyan
+    /// symlinks, green executables. They are the terminal's own blue, cyan and
+    /// green, so the two views share one colour language.
+    pub directory: Color32,
+    pub symlink: Color32,
+    pub executable: Color32,
 }
 
 impl Palette {
     pub fn new(light: bool) -> Self {
         if light {
             Self {
-                bg: Color32::from_rgb(246, 248, 251),
-                panel: Color32::from_rgb(235, 240, 246),
+                bg: Color32::from_rgb(247, 249, 251),
+                panel: Color32::from_rgb(238, 242, 247),
                 raised: Color32::WHITE,
-                line: Color32::from_rgb(211, 221, 231),
+                line: Color32::from_rgb(212, 221, 231),
                 text: Color32::from_rgb(32, 44, 63),
                 muted: Color32::from_rgb(93, 111, 134),
-                accent: Color32::from_rgb(0, 119, 106),
+                accent: Color32::from_rgb(13, 122, 104),
+                // On a light panel the readable equivalent of "sunk" is a white
+                // field against the grey panel, not a darker one.
+                field: Color32::WHITE,
+                danger: Color32::from_rgb(217, 48, 54),
+                warn: Color32::from_rgb(168, 106, 0),
+                ok: Color32::from_rgb(28, 132, 66),
+                // Darker than the terminal's versions, which are tuned for a dark
+                // background and would wash out here.
+                directory: Color32::from_rgb(30, 90, 190),
+                symlink: Color32::from_rgb(0, 120, 145),
+                executable: Color32::from_rgb(20, 120, 60),
             }
         } else {
             Self {
                 bg: Color32::from_rgb(13, 18, 26),
-                panel: Color32::from_rgb(19, 26, 36),
-                raised: Color32::from_rgb(28, 38, 51),
-                line: Color32::from_rgb(37, 49, 64),
-                text: Color32::from_rgb(216, 226, 238),
-                muted: Color32::from_rgb(124, 144, 167),
-                accent: Color32::from_rgb(92, 224, 184),
+                panel: Color32::from_rgb(21, 29, 40),
+                raised: Color32::from_rgb(30, 40, 54),
+                line: Color32::from_rgb(43, 58, 75),
+                text: Color32::from_rgb(218, 227, 238),
+                muted: Color32::from_rgb(138, 155, 176),
+                accent: Color32::from_rgb(79, 209, 165),
+                field: Color32::from_rgb(11, 16, 23),
+                danger: Color32::from_rgb(229, 72, 77),
+                warn: Color32::from_rgb(217, 164, 65),
+                ok: Color32::from_rgb(78, 190, 110),
+                // The terminal's blue, cyan and green (see `ansi_color`), so a file
+                // is the same colour in the list as it is in `ls` output.
+                directory: Color32::from_rgb(121, 171, 245),
+                symlink: Color32::from_rgb(103, 205, 218),
+                executable: Color32::from_rgb(117, 212, 153),
             }
         }
     }
@@ -51,10 +86,28 @@ impl Palette {
         };
         visuals.panel_fill = self.panel;
         visuals.window_fill = self.panel;
-        visuals.extreme_bg_color = self.bg;
+        visuals.extreme_bg_color = self.field;
+        visuals.text_edit_bg_color = Some(self.field);
         visuals.faint_bg_color = self.raised;
         visuals.override_text_color = None;
         visuals.weak_text_color = Some(self.muted);
+        visuals.error_fg_color = self.danger;
+        visuals.warn_fg_color = self.warn;
+        visuals.window_stroke = Stroke::new(1.0_f32, self.line);
+        // egui's default shadow (offset 10/20, blur 15, black@96) is far too heavy
+        // under a frameless window with its own title bar.
+        visuals.window_shadow = egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(120),
+        };
+        visuals.popup_shadow = egui::epaint::Shadow {
+            offset: [0, 4],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_black_alpha(96),
+        };
         for widget in [
             &mut visuals.widgets.noninteractive,
             &mut visuals.widgets.inactive,
@@ -63,21 +116,35 @@ impl Palette {
             &mut visuals.widgets.open,
         ] {
             widget.fg_stroke.color = self.text;
-            widget.corner_radius = egui::CornerRadius::same(1);
+            widget.corner_radius = egui::CornerRadius::same(4);
         }
-        visuals.window_corner_radius = egui::CornerRadius::same(2);
-        visuals.menu_corner_radius = egui::CornerRadius::same(1);
+        visuals.window_corner_radius = egui::CornerRadius::same(6);
+        visuals.menu_corner_radius = egui::CornerRadius::same(4);
         visuals.selection.bg_fill = self.accent.gamma_multiply(0.3);
         visuals.selection.stroke = Stroke::new(1.0_f32, self.accent);
         visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.line);
+        // Buttons and combo boxes paint `weak_bg_fill`; leaving it at the egui
+        // default is what made them look detached from this palette.
+        visuals.widgets.inactive.bg_fill = self.raised;
         visuals.widgets.inactive.weak_bg_fill = self.raised;
-        visuals.widgets.hovered.weak_bg_fill = self.accent.gamma_multiply(0.15);
-        visuals.widgets.active.weak_bg_fill = self.accent.gamma_multiply(0.25);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.line);
+        visuals.widgets.hovered.bg_fill = self.accent.gamma_multiply(0.18);
+        visuals.widgets.hovered.weak_bg_fill = self.accent.gamma_multiply(0.18);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, self.accent.gamma_multiply(0.6));
+        visuals.widgets.active.bg_fill = self.accent.gamma_multiply(0.28);
+        visuals.widgets.active.weak_bg_fill = self.accent.gamma_multiply(0.28);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, self.accent);
+        visuals.widgets.open.weak_bg_fill = self.accent.gamma_multiply(0.15);
         ctx.set_visuals(visuals);
         ctx.style_mut(|style| {
             style.spacing.item_spacing = egui::vec2(4.0, 3.0);
             style.spacing.button_padding = egui::vec2(6.0, 3.0);
             style.spacing.interact_size.y = 22.0;
+            // Hairline scrollbars. The default is 6pt of chrome for what is only
+            // an indicator, and the file tables and transfer queue are narrow.
+            style.spacing.scroll.bar_width = 4.0;
+            style.spacing.scroll.bar_inner_margin = 0.0;
+            style.spacing.scroll.bar_outer_margin = 0.0;
             style
                 .text_styles
                 .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
@@ -236,6 +303,114 @@ pub fn ansi_color(color: vt100::Color, default: Color32, bold: bool) -> Color32 
                 [8 + (index - 232) * 10; 3]
             };
             Color32::from_rgb(r, g, b)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The file list leans on these to say what a row is. Two of them looking
+    /// alike would be worse than no colour at all — the row would claim to be
+    /// something it is not. Directories used to be the accent green, which reads
+    /// as "executable" to anyone who has used `ls --color`.
+    #[test]
+    fn file_type_colours_are_mutually_distinguishable() {
+        for light in [false, true] {
+            let p = Palette::new(light);
+            let kinds = [
+                ("directory", p.directory),
+                ("symlink", p.symlink),
+                ("executable", p.executable),
+                ("regular", p.text),
+            ];
+            for (i, (name_a, a)) in kinds.iter().enumerate() {
+                for (name_b, b) in &kinds[i + 1..] {
+                    let gap: i32 = (0..3)
+                        .map(|channel| {
+                            (i32::from(a.to_array()[channel]) - i32::from(b.to_array()[channel]))
+                                .abs()
+                        })
+                        .sum();
+                    assert!(
+                        gap >= 60,
+                        "{name_a} and {name_b} are only {gap} apart (light = {light}): {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A directory is blue and an executable is green, matching `ls --color` and
+    /// the terminal's own palette. Getting these the other way round is exactly
+    /// the confusion this set exists to remove.
+    #[test]
+    fn directories_are_blue_and_executables_are_green() {
+        for light in [false, true] {
+            let p = Palette::new(light);
+            let blue = p.directory.to_array();
+            assert!(
+                blue[2] > blue[0] && blue[2] > blue[1],
+                "directory colour is not blue: {blue:?}"
+            );
+            let green = p.executable.to_array();
+            assert!(
+                green[1] > green[0] && green[1] > green[2],
+                "executable colour is not green: {green:?}"
+            );
+            let cyan = p.symlink.to_array();
+            assert!(
+                cyan[1] > cyan[0] && cyan[2] > cyan[0],
+                "symlink colour is not cyan: {cyan:?}"
+            );
+        }
+    }
+
+    /// The whole point of the separate `field` colour: an input has to be tellable
+    /// from the panel behind it. Fields used to fall back to `extreme_bg_color`,
+    /// which was the terminal background — a sum-of-channels gap of 24 against the
+    /// panel, which is what made them dissolve into the dialog.
+    #[test]
+    fn fields_are_distinguishable_from_the_panel() {
+        for light in [false, true] {
+            let p = Palette::new(light);
+            let gap: i32 = (0..3)
+                .map(|i| {
+                    (i32::from(p.field.to_array()[i]) - i32::from(p.panel.to_array()[i])).abs()
+                })
+                .sum();
+            assert!(
+                gap >= 32,
+                "field {:?} is too close to panel {:?} (light = {light})",
+                p.field,
+                p.panel
+            );
+        }
+    }
+
+    /// Surface layers have to be ordered, or a hover reads as a hole.
+    #[test]
+    fn surfaces_step_monotonically() {
+        for light in [false, true] {
+            let p = Palette::new(light);
+            let luma = |c: Color32| {
+                let [r, g, b, _] = c.to_array();
+                0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)
+            };
+            let (bg, panel, raised) = (luma(p.bg), luma(p.panel), luma(p.raised));
+            if light {
+                assert!(
+                    bg > panel && raised > panel,
+                    "light layers: {bg} {panel} {raised}"
+                );
+            } else {
+                assert!(panel > bg, "panel must sit above bg: {panel} vs {bg}");
+                assert!(
+                    raised > panel,
+                    "raised must sit above panel: {raised} vs {panel}"
+                );
+            }
         }
     }
 }

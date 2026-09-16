@@ -53,6 +53,13 @@ pub fn run(screenshot: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// The taskbar/Alt-Tab icon. `None` when winit rejects the bitmap: a missing icon
+/// must never be a reason the window fails to open.
+fn window_icon() -> Option<winit::window::Icon> {
+    let icon = crate::icons::default_app_icon(64);
+    winit::window::Icon::from_rgba(icon.rgba, icon.width, icon.height).ok()
+}
+
 struct Runner {
     proxy: EventLoopProxy<Event>,
     native: Option<Native>,
@@ -78,6 +85,7 @@ impl ApplicationHandler<Event> for Runner {
                         .with_title("G-Terminal")
                         .with_decorations(false)
                         .with_visible(false)
+                        .with_window_icon(window_icon())
                         .with_inner_size(LogicalSize::new(1280., 800.))
                         .with_min_inner_size(LogicalSize::new(760., 480.)),
                 )?,

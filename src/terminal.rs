@@ -43,8 +43,10 @@ pub struct Terminal {
     pub parser: vt100::Parser<TerminalCallbacks>,
     pub revision: u64,
     pub graphics: std::collections::VecDeque<crate::graphics::Graphic>,
-    /// Pending ZMODEM download offer (`rz` was run on the server).
-    pub zmodem_offer: bool,
+    /// A ZMODEM offer from the server that nobody has answered yet. `Some(true)`
+    /// means the server ran `rz` and is waiting to receive, i.e. an upload;
+    /// `Some(false)` means it ran `sz` and is about to send.
+    pub zmodem_offer: Option<bool>,
     scanner: crate::graphics::OscScanner,
     /// Tail of the last read, so a header split across reads is still seen.
     zmodem_probe: Vec<u8>,
@@ -61,7 +63,7 @@ impl Terminal {
             ),
             revision: 0,
             graphics: std::collections::VecDeque::new(),
-            zmodem_offer: false,
+            zmodem_offer: None,
             scanner: crate::graphics::OscScanner::default(),
             zmodem_probe: Vec::new(),
         }
@@ -96,25 +98,35 @@ impl Terminal {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    /// Flags a ZRQINIT header (`**` ZDLE `B00…`, ZHEX encoded). The probe keeps
-    /// a short tail so a header split across two reads is still recognised, and
-    /// skips reads carrying escape sequences, which belong to screen output.
+    /// Flags a ZMODEM hex header nobody has answered yet. The frame type says
+    /// which way the transfer goes: `B00` is ZRQINIT, sent by the side that is
+    /// about to *send* (so `sz`, a download); `B01` is ZRINIT, sent by the side
+    /// waiting to *receive* (so `rz`, an upload).
+    ///
+    /// Probing for ZRQINIT alone is why `rz` never worked: the offer was never
+    /// raised for it, so lrzsz's binary header went straight into the screen
+    /// parser. The probe keeps a short tail so a header split across two reads is
+    /// still recognised, and skips reads carrying escape sequences, which belong
+    /// to screen output.
     fn probe_zmodem(&mut self, bytes: &[u8]) {
-        const HEADER: &[u8] = b"**\x18B00";
-        const TAIL: usize = HEADER.len() - 1;
+        const ZRQINIT: &[u8] = b"**\x18B00";
+        const ZRINIT: &[u8] = b"**\x18B01";
+        const TAIL: usize = ZRQINIT.len() - 1;
         if bytes.windows(2).any(|w| w == b"\x1b[") {
             self.zmodem_probe.clear();
             return;
         }
         let searched = self.zmodem_probe.len() + bytes.len();
-        if searched < HEADER.len() {
+        if searched < ZRQINIT.len() {
             self.zmodem_probe.extend_from_slice(bytes);
             return;
         }
         let mut window = std::mem::take(&mut self.zmodem_probe);
         window.extend_from_slice(bytes);
-        if window.windows(HEADER.len()).any(|w| w == HEADER) {
-            self.zmodem_offer = true;
+        if window.windows(ZRQINIT.len()).any(|w| w == ZRQINIT) {
+            self.zmodem_offer = Some(false);
+        } else if window.windows(ZRINIT.len()).any(|w| w == ZRINIT) {
+            self.zmodem_offer = Some(true);
         }
         let keep = window.len().saturating_sub(TAIL);
         self.zmodem_probe = window[keep..].to_vec();
@@ -235,24 +247,44 @@ mod tests {
         assert_eq!(t.parser.screen().size(), (30, 100));
     }
 
+    /// `sz` announces itself with ZRQINIT (`B00`): the far side is about to send.
     #[test]
-    fn zmodem_headers_are_detected_even_when_split_across_reads() {
+    fn zmodem_download_offer_is_detected_even_when_split_across_reads() {
         let mut t = Terminal::new(5, 40, 10);
         t.process(b"$ sz backup.tar.gz\r\n**\x18B");
-        assert!(!t.zmodem_offer);
+        assert_eq!(t.zmodem_offer, None);
         t.process(b"0000000000000\r\n\x11");
-        assert!(t.zmodem_offer);
+        assert_eq!(t.zmodem_offer, Some(false));
+    }
+
+    /// `rz` announces itself with ZRINIT (`B01`): the far side is waiting to
+    /// receive, so the offer is an upload. Probing for ZRQINIT alone is why typing
+    /// `rz` used to do nothing at all — the payload here is the one a real server
+    /// sends.
+    #[test]
+    fn zmodem_upload_offer_is_detected_and_read_as_an_upload() {
+        let mut t = Terminal::new(5, 40, 10);
+        t.process(b"$ rz\r\nrz waiting to receive.**\x18B");
+        assert_eq!(t.zmodem_offer, None);
+        t.process(b"0100000023be50\r\n\x11");
+        assert_eq!(t.zmodem_offer, Some(true));
     }
 
     #[test]
     fn screen_output_with_escapes_is_not_mistaken_for_a_zmodem_offer() {
         let mut t = Terminal::new(5, 40, 10);
-        t.process(b"\x1b[31mred\x1b[0m **\x18B00 more");
-        assert!(!t.zmodem_offer);
+        for header in [
+            &b"\x1b[31mred\x1b[0m **\x18B00 more"[..],
+            b"\x1b[31mred\x1b[0m **\x18B01 more",
+        ] {
+            t.process(header);
+            assert_eq!(t.zmodem_offer, None);
+        }
     }
 
     #[test]
-    fn cursor_queries_are_answered_and_titles_are_sanitized() {        let mut t = Terminal::new(20, 80, 100);
+    fn cursor_queries_are_answered_and_titles_are_sanitized() {
+        let mut t = Terminal::new(20, 80, 100);
         t.process(b"\x1b[4;9H\x1b[6n\x1b[5n\x1b[c");
         assert_eq!(t.parser.callbacks().replies, b"\x1b[4;9R\x1b[0n\x1b[?1;2c");
         t.process(b"\x1b]2;project-shell\x07");

@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod appicon;
+mod icons;
 #[cfg(windows)]
 mod native_dx11;
 mod remote_ui;
@@ -30,6 +32,7 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("G-Terminal")
             .with_decorations(false)
+            .with_icon(icons::default_app_icon(64))
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([760.0, 480.0]),
         renderer: eframe::Renderer::Wgpu,
