@@ -4,6 +4,24 @@ Windows 优先的原生 GPU 终端，使用 Rust、egui，Windows 默认使用�
 
 当前版本 **0.3.2**。交付 Windows x64 便携版，在本机 Windows / MSVC 环境验证。macOS、Linux 的平台入口保留，尚未实机验证或发布。推荐 Windows 11；ConPTY 要求 Windows 10 1809 或更新版本。
 
+## 截图
+
+主界面：左侧为本地 Shell 与分组连接，状态栏右侧有历史查找、上下行流量箭头（有流量时红/绿点亮）和窗口缩放手柄。
+
+![主界面](docs/screenshots/main.png)
+
+G 菜单，包含服务器工具箱（初始化服务器）：
+
+![菜单](docs/screenshots/menu.png)
+
+新建连接支持串口，端口可下拉选择，也可手填或使用 `auto`：
+
+![串口连接](docs/screenshots/serial-connection.png)
+
+后台标签有新输出时标签文字带下划线，切回后自动消失：
+
+![标签页活动标记](docs/screenshots/tab-activity.png)
+
 ## 启动与构建
 
 解压发布包，运行 `g-terminal.exe`。默认打开 Windows PowerShell，工作目录为用户主目录。PowerShell 7 和 WSL 需自行安装。
