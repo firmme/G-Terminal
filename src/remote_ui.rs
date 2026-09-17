@@ -1,3 +1,4 @@
+use crate::editing;
 use crate::theme::Palette;
 use eframe::egui::{self, RichText};
 use g_terminal::{
@@ -144,39 +145,31 @@ impl Login {
                         .min_col_width(72.0)
                         .show(ui, |ui| {
                             ui.label("用户名");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.profile.user)
-                                    .desired_width(240.0),
-                            );
+                            editing::field_with(ui, &mut self.profile.user, |edit| {
+                                edit.desired_width(240.0)
+                            });
                             ui.end_row();
                             ui.label("密码");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut *self.credentials.password)
-                                    .password(true)
-                                    .desired_width(240.0),
-                            );
+                            editing::field_with(ui, &mut self.credentials.password, |edit| {
+                                edit.password(true).desired_width(240.0)
+                            });
                             ui.end_row();
                             ui.label("私钥路径");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.profile.identity)
-                                    .desired_width(240.0),
-                            );
+                            editing::field_with(ui, &mut self.profile.identity, |edit| {
+                                edit.desired_width(240.0)
+                            });
                             ui.end_row();
                             ui.label("私钥口令");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut *self.credentials.passphrase)
-                                    .password(true)
-                                    .desired_width(240.0),
-                            );
+                            editing::field_with(ui, &mut self.credentials.passphrase, |edit| {
+                                edit.password(true).desired_width(240.0)
+                            });
                             ui.end_row();
                             if self.profile.jump.is_some() {
                                 ui.label("跳板机密码");
-                                ui.add(
-                                    egui::TextEdit::singleline(
-                                        &mut *self.credentials.jump_password,
-                                    )
-                                    .password(true)
-                                    .desired_width(240.0),
+                                editing::field_with(
+                                    ui,
+                                    &mut self.credentials.jump_password,
+                                    |edit| edit.password(true).desired_width(240.0),
                                 );
                                 ui.end_row();
                             }
@@ -242,6 +235,21 @@ struct LocalEntry {
     symlink: bool,
     /// Modification time in Unix seconds; None when unavailable.
     mtime: Option<u64>,
+    /// POSIX mode from `lstat`, or None on platforms that have no such bits.
+    perms: Option<u32>,
+}
+
+/// The local file's POSIX mode. Windows has no equivalent, so the local table
+/// and the 属性 dialog leave permissions out there rather than inventing them.
+#[cfg(unix)]
+fn local_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(metadata.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn local_mode(_metadata: &std::fs::Metadata) -> Option<u32> {
+    None
 }
 
 /// The local listing, as the worker thread leaves it.
@@ -272,6 +280,7 @@ fn read_local(path: &str) -> Result<Vec<LocalEntry>, String> {
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs()),
+                perms: metadata.as_ref().and_then(local_mode),
             }
         })
         .collect();
@@ -300,19 +309,27 @@ struct Properties {
     size: Option<u64>,
     mtime: Option<String>,
     perms: Option<String>,
-    /// Present for a remote entry, where the mode and ownership can be changed.
-    /// Local files have no POSIX bits on Windows, so they get none.
+    /// Present when the mode (and, remotely, the ownership) can be changed.
+    /// Local files only get one on platforms with POSIX bits.
     editable: Option<PermissionEdit>,
 }
 
 /// A recursive walk's result, left for the UI thread to collect.
 type CountSlot = Arc<Mutex<Option<Result<usize, String>>>>;
 
+/// What a permission change applies to: a local path, or a remote entry reached
+/// over SFTP.
+#[derive(Clone)]
+enum PermTarget {
+    Local(PathBuf),
+    Remote(RemoteTarget),
+}
+
 /// The permission editor's state, kept alongside the dialog because egui rebuilds
 /// the window every frame.
 #[derive(Clone)]
 struct PermissionEdit {
-    target: RemoteTarget,
+    target: PermTarget,
     mode: u32,
     owner: String,
     group: String,
@@ -672,7 +689,7 @@ impl Files {
                     {
                         answer = Some(ztransfer::Decision::Overwrite);
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.rename).desired_width(150.0));
+                    editing::field_with(ui, &mut self.rename, |edit| edit.desired_width(150.0));
                     if ui.button("重命名").clicked() {
                         answer = Some(ztransfer::Decision::Rename(self.rename.clone()));
                     }
@@ -1161,11 +1178,9 @@ impl Files {
                 // both, the shortcuts go, so that nothing is ever pushed outside —
                 // a floor on the field's width would guarantee that it was.
                 let shortcuts = room - icons >= MIN_FIELD_WIDTH;
-                let edit =
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.local_path)
-                            .desired_width(if shortcuts { room - icons } else { room }),
-                    );
+                let edit = editing::field_with(ui, &mut self.local_path, |edit| {
+                    edit.desired_width(if shortcuts { room - icons } else { room })
+                });
                 if shortcuts {
                     if crate::icons::icon_button(
                         ui,
@@ -1221,13 +1236,19 @@ impl Files {
                 // their widths and the overflow becomes a horizontal scrollbar,
                 // rather than every column being squeezed into a truncation.
                 let width = ui.available_width().max(MIN_TABLE_WIDTH);
-                table_header(ui, p, &LOCAL_COLUMNS, &["名称", "大小", "修改时间"], width);
+                table_header(ui, p, &LOCAL_COLUMNS, &LOCAL_HEADERS, width);
                 for entry in &local.entries {
                     if !self.show_hidden && entry.name.starts_with('.') {
                         continue;
                     }
                     let path = PathBuf::from(&self.local_path).join(&entry.name);
-                    let cells = [
+                    // A set executable bit (any of the three) is what `ls`
+                    // highlights, and what makes the icon a script rather than a
+                    // document. A symlink's own mode says nothing about its
+                    // target, so links never count as executable here; Windows
+                    // reports no mode at all.
+                    let executable = !entry.symlink && entry.perms.is_some_and(|m| m & 0o111 != 0);
+                    let mut cells = vec![
                         Cell {
                             text: format!(
                                 "{}{}",
@@ -1235,11 +1256,9 @@ impl Files {
                                 entry_suffix(entry.directory, entry.symlink)
                             ),
                             right: false,
-                            color: Self::entry_color(entry.directory, entry.symlink, false, p),
+                            color: Self::entry_color(entry.directory, entry.symlink, executable, p),
                             full: None,
-                            // Windows reports no POSIX mode, so nothing here is
-                            // known to be executable.
-                            icon: Some(file_icon(&entry.name, entry.directory, false)),
+                            icon: Some(file_icon(&entry.name, entry.directory, executable)),
                             link: entry.symlink,
                         },
                         Cell {
@@ -1255,17 +1274,26 @@ impl Files {
                             icon: None,
                             link: false,
                         },
-                        Cell {
-                            text: entry.mtime.map_or_else(String::new, format_time),
-                            right: true,
-                            color: p.muted,
-                            // The column shows a shortened form; hovering recovers
-                            // the exact timestamp.
-                            full: entry.mtime.map(format_time_full),
-                            icon: None,
-                            link: false,
-                        },
                     ];
+                    #[cfg(unix)]
+                    cells.push(Cell {
+                        text: Self::perms_string(entry.perms),
+                        right: true,
+                        color: p.muted,
+                        full: None,
+                        icon: None,
+                        link: false,
+                    });
+                    cells.push(Cell {
+                        text: entry.mtime.map_or_else(String::new, format_time),
+                        right: true,
+                        color: p.muted,
+                        // The column shows a shortened form; hovering recovers
+                        // the exact timestamp.
+                        full: entry.mtime.map(format_time_full),
+                        icon: None,
+                        link: false,
+                    });
                     let selected = self.selected_local.as_ref() == Some(&path);
                     let (r, _) = table_row(ui, &cells, &LOCAL_COLUMNS, selected, width);
                     // A right-click selects the row first, the way a file manager
@@ -1358,11 +1386,9 @@ impl Files {
                     crate::icons::Size::Button.button().x * 2.0 + ui.spacing().item_spacing.x * 2.0;
                 let room = ui.available_width();
                 let shortcuts = room - icons >= MIN_FIELD_WIDTH;
-                let edit =
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.remote_path)
-                            .desired_width(if shortcuts { room - icons } else { room }),
-                    );
+                let edit = editing::field_with(ui, &mut self.remote_path, |edit| {
+                    edit.desired_width(if shortcuts { room - icons } else { room })
+                });
                 let home = self.remote_home.clone();
                 if shortcuts {
                     let home_button = crate::icons::icon_button(
@@ -1733,19 +1759,33 @@ impl Files {
         let Some(edit) = &properties.editable else {
             return;
         };
-        let (connection, path) = (self.connection.clone(), edit.target.path.clone());
         let slot: Arc<Mutex<Option<Result<usize, String>>>> = Arc::new(Mutex::new(None));
         let state = slot.clone();
         let wake = self.wake.clone();
-        remote::runtime().spawn(async move {
-            let result: anyhow::Result<usize> = async {
-                let sftp = connection.sftp("统计目录").await?;
-                Ok(remote::walk_remote(&sftp, &path).await?.len())
+        match &edit.target {
+            PermTarget::Local(path) => {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let result = walk_local(&path)
+                        .map(|paths| paths.len())
+                        .map_err(|e| format!("{e:#}"));
+                    *state.lock().unwrap() = Some(result);
+                    wake();
+                });
             }
-            .await;
-            *state.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
-            wake();
-        });
+            PermTarget::Remote(target) => {
+                let (connection, path) = (self.connection.clone(), target.path.clone());
+                remote::runtime().spawn(async move {
+                    let result: anyhow::Result<usize> = async {
+                        let sftp = connection.sftp("统计目录").await?;
+                        Ok(remote::walk_remote(&sftp, &path).await?.len())
+                    }
+                    .await;
+                    *state.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+                    wake();
+                });
+            }
+        }
         self.counting = Some(slot);
     }
 
@@ -1779,59 +1819,73 @@ impl Files {
         let Some(edit) = &properties.editable else {
             return;
         };
-        let (path, mode, recursive) = (edit.target.path.clone(), edit.mode, edit.recursive);
+        let (mode, recursive) = (edit.mode, edit.recursive);
         let (owner, group) = (edit.owner.clone(), edit.group.clone());
         let (progress, outcome) = self.simple_progress("修改权限");
-        let connection = self.connection.clone();
         let wake = self.wake.clone();
-        remote::runtime().spawn(async move {
-            let result: anyhow::Result<String> = async {
-                let uid = match owner.trim() {
-                    "" => None,
-                    name => Some(remote::resolve_uid(&connection, name).await?),
-                };
-                let gid = match group.trim() {
-                    "" => None,
-                    name => Some(remote::resolve_gid(&connection, name).await?),
-                };
-                let sftp = connection.sftp("修改权限").await?;
-                let paths = if recursive {
-                    remote::walk_remote(&sftp, &path).await?
-                } else {
-                    vec![path.clone()]
-                };
-                let total = paths.len().max(1);
-                // Hoisted out of the loop: `||` cannot be mixed into a let-chain,
-                // and nesting the two conditions only to satisfy clippy would read
-                // worse than naming the question once.
-                let owner_wanted = uid.is_some() || gid.is_some();
-                // A refusal of the ownership half is recorded, not raised: the mode
-                // change is the part most servers allow, and losing it because the
-                // user is not root would be the wrong trade.
-                let mut refused = None;
-                for (index, target) in paths.iter().enumerate() {
-                    remote::set_permissions(&sftp, target, mode).await?;
-                    if owner_wanted && let Err(e) = remote::set_owner(&sftp, target, uid, gid).await
-                    {
-                        refused.get_or_insert(format!("{e:#}"));
-                    }
-                    if let Ok(mut state) = progress.lock() {
-                        state.done = index as u64 + 1;
-                        state.total = total as u64;
-                        state.message = "修改中".into();
-                    }
+        match &edit.target {
+            PermTarget::Local(path) => {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let result = apply_local_mode(&path, mode, recursive, &progress, &wake);
+                    *outcome.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
                     wake();
-                }
-                Ok(match refused {
-                    Some(e) => format!("权限已修改，所有者未修改：{e}"),
-                    None if recursive => format!("已修改 {} 个条目", paths.len()),
-                    None => "权限已修改".into(),
-                })
+                });
             }
-            .await;
-            *outcome.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
-            wake();
-        });
+            PermTarget::Remote(target) => {
+                let path = target.path.clone();
+                let connection = self.connection.clone();
+                remote::runtime().spawn(async move {
+                    let result: anyhow::Result<String> = async {
+                        let uid = match owner.trim() {
+                            "" => None,
+                            name => Some(remote::resolve_uid(&connection, name).await?),
+                        };
+                        let gid = match group.trim() {
+                            "" => None,
+                            name => Some(remote::resolve_gid(&connection, name).await?),
+                        };
+                        let sftp = connection.sftp("修改权限").await?;
+                        let paths = if recursive {
+                            remote::walk_remote(&sftp, &path).await?
+                        } else {
+                            vec![path.clone()]
+                        };
+                        let total = paths.len().max(1);
+                        // Hoisted out of the loop: `||` cannot be mixed into a
+                        // let-chain, and nesting the two conditions only to satisfy
+                        // clippy would read worse than naming the question once.
+                        let owner_wanted = uid.is_some() || gid.is_some();
+                        // A refusal of the ownership half is recorded, not raised:
+                        // the mode change is the part most servers allow, and losing
+                        // it because the user is not root would be the wrong trade.
+                        let mut refused = None;
+                        for (index, target) in paths.iter().enumerate() {
+                            remote::set_permissions(&sftp, target, mode).await?;
+                            if owner_wanted
+                                && let Err(e) = remote::set_owner(&sftp, target, uid, gid).await
+                            {
+                                refused.get_or_insert(format!("{e:#}"));
+                            }
+                            if let Ok(mut state) = progress.lock() {
+                                state.done = index as u64 + 1;
+                                state.total = total as u64;
+                                state.message = "修改中".into();
+                            }
+                            wake();
+                        }
+                        Ok(match refused {
+                            Some(e) => format!("权限已修改，所有者未修改：{e}"),
+                            None if recursive => format!("已修改 {} 个条目", paths.len()),
+                            None => "权限已修改".into(),
+                        })
+                    }
+                    .await;
+                    *outcome.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+                    wake();
+                });
+            }
+        }
     }
 
     /// The 属性 / 确认删除 / 重命名 / 覆盖冲突 windows.
@@ -1910,7 +1964,7 @@ impl Files {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     let edit =
-                        ui.add(egui::TextEdit::singleline(&mut rename.name).desired_width(320.0));
+                        editing::field_with(ui, &mut rename.name, |edit| edit.desired_width(320.0));
                     edit.request_focus();
                     let valid = !rename.name.is_empty()
                         && !rename.name.contains(['/', '\\'])
@@ -2161,7 +2215,7 @@ impl Files {
                         }
                     }
                     ui.separator();
-                    ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(160.0));
+                    editing::field_with(ui, &mut self.name, |edit| edit.desired_width(160.0));
                     let mut op = None;
                     if ui
                         .add(egui::Button::new("建目录").min_size(egui::vec2(80.0, 0.0)))
@@ -2374,12 +2428,22 @@ struct Cell {
 /// truncation on a narrow pane even when the names would have fitted.
 struct Columns {
     size: f32,
-    /// Zero in the local table: Windows files carry no POSIX mode, and showing a
-    /// fabricated one would mislead.
+    /// Zero when the table has no permissions to show: a column of width zero is
+    /// dropped by [`column_offsets`].
     perms: f32,
     time: f32,
 }
 
+/// The local table carries permissions only where they exist. On Windows the
+/// column's width is zero, so it drops out of the layout instead of showing a
+/// fabricated mode.
+#[cfg(unix)]
+const LOCAL_COLUMNS: Columns = Columns {
+    size: 68.0,
+    perms: 88.0,
+    time: 96.0,
+};
+#[cfg(not(unix))]
 const LOCAL_COLUMNS: Columns = Columns {
     size: 68.0,
     perms: 0.0,
@@ -2390,6 +2454,11 @@ const REMOTE_COLUMNS: Columns = Columns {
     perms: 88.0,
     time: 96.0,
 };
+
+#[cfg(unix)]
+const LOCAL_HEADERS: [&str; 4] = ["名称", "大小", "权限", "修改时间"];
+#[cfg(not(unix))]
+const LOCAL_HEADERS: [&str; 3] = ["名称", "大小", "修改时间"];
 
 /// Space held between columns, belonging to neither of them.
 const COLUMN_GAP: f32 = 10.0;
@@ -2671,20 +2740,20 @@ fn permission_editor(ui: &mut egui::Ui, edit: &mut PermissionEdit, p: Palette) -
     // ways and seeing both is how you catch a mis-click.
     ui.label(hint(&format!("八进制：{:04o}", edit.mode), p));
 
-    ui.horizontal(|ui| {
-        ui.label(hint("所有者", p));
-        ui.add(
-            egui::TextEdit::singleline(&mut edit.owner)
-                .desired_width(96.0)
-                .hint_text("uid 或用户名"),
-        );
-        ui.label(hint("用户组", p));
-        ui.add(
-            egui::TextEdit::singleline(&mut edit.group)
-                .desired_width(96.0)
-                .hint_text("gid 或组名"),
-        );
-    });
+    // Ownership is an SFTP-side change: locally it would need root, and the
+    // names are resolved against the server for a remote path.
+    if !matches!(edit.target, PermTarget::Local(_)) {
+        ui.horizontal(|ui| {
+            ui.label(hint("所有者", p));
+            editing::field_with(ui, &mut edit.owner, |field| {
+                field.desired_width(96.0).hint_text("uid 或用户名")
+            });
+            ui.label(hint("用户组", p));
+            editing::field_with(ui, &mut edit.group, |field| {
+                field.desired_width(96.0).hint_text("gid 或组名")
+            });
+        });
+    }
     ui.checkbox(&mut edit.recursive, "递归应用到该目录下所有内容");
 
     match edit.counted {
@@ -2882,9 +2951,40 @@ fn open_command(path: &Path) -> Command {
     command
 }
 
+/// Opens a URL in the OS default browser.
+pub(crate) fn open_url(url: &str) -> Result<(), String> {
+    let mut command = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    } else if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else {
+        Command::new("xdg-open")
+    };
+    command
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开浏览器：{e}"))
+}
+
 /// Opens a path in a text editor rather than in its associated application.
 fn edit_with(path: &Path) -> Result<(), String> {
     let Some(program) = editor_program() else {
+        // Windows always has Notepad. macOS has no single editor path, so ask
+        // the system for its default text editor rather than for whatever the
+        // file type is associated with.
+        #[cfg(target_os = "macos")]
+        {
+            return Command::new("open")
+                .arg("-t")
+                .arg(path)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("无法启动编辑器：{e}"));
+        }
+        #[cfg(not(target_os = "macos"))]
         return reveal(path);
     };
     Command::new(&program)
@@ -2966,6 +3066,16 @@ fn rename_local(path: &Path, name: &str, error: &mut Option<String>, notice: &mu
 }
 
 fn local_properties(entry: &LocalEntry, path: &Path) -> Properties {
+    // A symlink's own mode is not changeable in a useful way — `chmod` follows
+    // the link — so it is shown but not offered for editing.
+    let editable = (entry.perms.is_some() && !entry.symlink).then(|| PermissionEdit {
+        target: PermTarget::Local(path.to_path_buf()),
+        mode: entry.perms.unwrap_or(0o644) & 0o7777,
+        owner: String::new(),
+        group: String::new(),
+        recursive: false,
+        counted: None,
+    });
     Properties {
         name: entry.name.clone(),
         path: path.display().to_string(),
@@ -2980,9 +3090,89 @@ fn local_properties(entry: &LocalEntry, path: &Path) -> Properties {
         size: (!entry.directory).then_some(entry.size),
         mtime: entry.mtime.map(format_time),
         // Windows carries no POSIX mode, so the row is left out rather than faked.
-        perms: None,
-        editable: None,
+        perms: entry.perms.map(|m| Files::perms_string(Some(m))),
+        editable,
     }
+}
+
+/// Walks a local tree without following symlinks, yielding the root and then
+/// everything under it. The counterpart to `remote::walk_remote`, so a recursive
+/// permission change behaves the same on both sides.
+fn walk_local(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = vec![root.to_path_buf()];
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|e| anyhow::anyhow!("无法读取 {}：{e}", directory.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `symlink_metadata` does not follow the link, so a symlinked
+            // directory is recorded but never descended.
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            paths.push(path.clone());
+            if metadata.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+/// Applies `mode` to a local path, over its tree when `recursive`. Symlinks are
+/// skipped so a recursive change never follows one onto its target.
+#[cfg(unix)]
+fn apply_local_mode(
+    path: &Path,
+    mode: u32,
+    recursive: bool,
+    progress: &Arc<Mutex<ztransfer::Progress>>,
+    wake: &remote::Wake,
+) -> anyhow::Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut paths = if recursive {
+        walk_local(path)?
+    } else {
+        vec![path.to_path_buf()]
+    };
+    // Deepest first: a directory whose new mode drops the execute bit can no
+    // longer be entered, so its contents have to be changed before its own mode.
+    paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    let total = paths.len().max(1);
+    for (index, target) in paths.iter().enumerate() {
+        let is_symlink = std::fs::symlink_metadata(target)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_symlink {
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| anyhow::anyhow!("无法修改 {}：{e}", target.display()))?;
+        }
+        if let Ok(mut state) = progress.lock() {
+            state.done = index as u64 + 1;
+            state.total = total as u64;
+            state.message = "修改中".into();
+        }
+        wake();
+    }
+    Ok(if recursive {
+        format!("已修改 {} 个条目", paths.len())
+    } else {
+        "权限已修改".into()
+    })
+}
+
+/// Windows has no POSIX mode to apply. The editor is never offered there, so
+/// this is only reached if that ever changes.
+#[cfg(not(unix))]
+fn apply_local_mode(
+    _path: &Path,
+    _mode: u32,
+    _recursive: bool,
+    _progress: &Arc<Mutex<ztransfer::Progress>>,
+    _wake: &remote::Wake,
+) -> anyhow::Result<String> {
+    anyhow::bail!("此平台不支持 POSIX 权限")
 }
 
 fn remote_properties(target: &RemoteTarget, perms: String) -> Properties {
@@ -3001,7 +3191,7 @@ fn remote_properties(target: &RemoteTarget, perms: String) -> Properties {
         mtime: target.entry.mtime.map(|t| format_time(u64::from(t))),
         perms: Some(perms),
         editable: Some(PermissionEdit {
-            target: target.clone(),
+            target: PermTarget::Remote(target.clone()),
             mode,
             // SFTP carries ids, not names, so these start as numbers. A name typed
             // here is resolved on the server before anything is sent.
@@ -3282,8 +3472,12 @@ mod tests {
     }
 
     #[test]
-    fn local_columns_drop_the_permissions_column() {
-        assert_eq!(column_offsets(&LOCAL_COLUMNS, 600.0).len(), 4);
+    fn local_columns_follow_the_platform_permissions() {
+        let edges = column_offsets(&LOCAL_COLUMNS, 600.0).len();
+        #[cfg(unix)]
+        assert_eq!(edges, 5, "a POSIX local table has a permissions column");
+        #[cfg(not(unix))]
+        assert_eq!(edges, 4, "Windows has no permissions column");
     }
 
     /// Adjacent columns have to be separated by more than their cells' own
@@ -3583,6 +3777,70 @@ mod tests {
         assert_eq!(settled_to_drop(&[0, 1, 2, 3, 4], 1), [0, 1, 2, 3]);
     }
 
+    /// Local POSIX modes are read from the listing, and a chmod round-trips
+    /// through the same routine the 属性 editor uses.
+    #[test]
+    #[cfg(unix)]
+    fn local_permissions_are_read_and_applied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir(usize::MAX - 2).expect("scratch directory");
+        let outside = scratch_dir(usize::MAX - 3).expect("scratch directory");
+        let file = dir.join("mode.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let entries = read_local(&dir.display().to_string()).unwrap();
+        let entry = entries.iter().find(|e| e.name == "mode.txt").unwrap();
+        assert!(entry.perms.is_some(), "a POSIX host has to report a mode");
+
+        let progress = Arc::new(Mutex::new(ztransfer::Progress::default()));
+        let wake: remote::Wake = Arc::new(|| {});
+        apply_local_mode(&file, 0o600, false, &progress, &wake).unwrap();
+        assert_eq!(mode_of(&file), 0o600, "a single-file chmod has to land");
+
+        // A recursive change reaches the tree but must not follow a symlink out
+        // of it: the link's target lives elsewhere and stays untouched.
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let nested = sub.join("nested.txt");
+        std::fs::write(&nested, b"y").unwrap();
+        let target = outside.join("target.txt");
+        std::fs::write(&target, b"z").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, sub.join("link.txt")).unwrap();
+
+        apply_local_mode(&dir, 0o750, true, &progress, &wake).unwrap();
+        assert_eq!(
+            mode_of(&nested),
+            0o750,
+            "a recursive chmod has to reach nested files"
+        );
+        assert_eq!(
+            mode_of(&target),
+            0o644,
+            "a recursive chmod followed a symlink"
+        );
+
+        // A mode that drops the execute bit has to still succeed: the walk
+        // changes the contents before the directory that holds them.
+        apply_local_mode(&dir, 0o600, true, &progress, &wake).unwrap();
+        assert_eq!(mode_of(&dir), 0o600);
+        // Put traversal back, then clear the tree.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        apply_local_mode(&dir, 0o700, true, &progress, &wake).unwrap();
+
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
     /// The local listing now runs on a worker thread, so its own rules are worth
     /// pinning: directories first, then a case-insensitive sort by name.
     #[test]
@@ -3653,13 +3911,9 @@ mod tests {
                             // Same rule as the panes: the shortcuts go before the
                             // field is allowed to overflow.
                             let shortcuts = room - icons >= MIN_FIELD_WIDTH;
-                            ui.add(
-                                egui::TextEdit::singleline(&mut path).desired_width(if shortcuts {
-                                    room - icons
-                                } else {
-                                    room
-                                }),
-                            );
+                            editing::field_with(ui, &mut path, |edit| {
+                                edit.desired_width(if shortcuts { room - icons } else { room })
+                            });
                             if shortcuts {
                                 crate::icons::icon_button(
                                     ui,

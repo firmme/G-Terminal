@@ -2,6 +2,7 @@
 
 mod app;
 mod appicon;
+mod editing;
 mod icons;
 #[cfg(windows)]
 mod native_dx11;
@@ -29,13 +30,35 @@ fn main() -> eframe::Result {
         device.memory_hints = wgpu::MemoryHints::MemoryUsage;
         device
     });
+    #[allow(unused_mut)]
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("G-Terminal")
+        .with_icon(icons::default_app_icon(64))
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([400.0, 300.0]);
+    // Windows (and Linux) draw their own window chrome on a frameless window.
+    // macOS keeps the native window so it retains the traffic lights, rounded
+    // corners, shadow and edge resizing — which winit does not expose for a
+    // borderless window — but hides the titlebar and lets the content run
+    // underneath, so it still reads as one continuous row.
+    #[cfg(target_os = "macos")]
+    {
+        viewport = viewport
+            .with_decorations(true)
+            // `title_shown` is what hides the title text; `titlebar_shown` only
+            // makes the bar transparent. Without the first, "G-Terminal" is
+            // drawn over the app's own top bar.
+            .with_title_shown(false)
+            .with_titlebar_shown(false)
+            .with_titlebar_buttons_shown(true)
+            .with_fullsize_content_view(true);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        viewport = viewport.with_decorations(false);
+    }
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("G-Terminal")
-            .with_decorations(false)
-            .with_icon(icons::default_app_icon(64))
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([400.0, 300.0]),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             desired_maximum_frame_latency: Some(1),

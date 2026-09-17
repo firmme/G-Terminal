@@ -12,8 +12,13 @@ pub struct TextRenderer {
 impl TextRenderer {
     pub fn new() -> Self {
         let mut fonts = FontSystem::new();
+        // Match the face the UI loads in `theme`: Consolas on Windows, Menlo on
+        // macOS. A generic "monospace" family is not guaranteed to resolve to a
+        // real face, and a proportional fallback would break cell alignment.
         fonts.db_mut().set_monospace_family(if cfg!(windows) {
             "Consolas"
+        } else if cfg!(target_os = "macos") {
+            "Menlo"
         } else {
             "monospace"
         });

@@ -1,19 +1,40 @@
 use crate::{
-    icons,
+    editing, icons,
     remote_ui::{self, Files, Login, format_size, hint},
     theme::{Palette, load_fonts},
     view::Pane,
 };
 use eframe::egui::{self, Align, Key, Layout, Rect, RichText, Sense};
 use g_terminal::{
-    config::{BAUD_RATES, DEFAULT_BAUD, Forward, RemoteProfile, SerialProfile, Settings},
+    config::{
+        BAUD_RATES, DEFAULT_BAUD, Forward, RemoteProfile, SEARCH_ENGINES, SerialProfile, Settings,
+        search_engine_label,
+    },
     layout::{Axis, Layout as PaneLayout, SavedTab},
     remote::Connection,
     serial,
-    session::{Session, SessionKind, SessionStatus},
+    session::{Session, SessionKind, SessionStatus, local_shells, shell_label},
     terminal::Terminal,
 };
 use std::sync::{Arc, Mutex};
+
+/// The accelerator shown in menus and the help window. egui maps
+/// `Modifiers::command` to Cmd on macOS and Ctrl elsewhere, so the label has to
+/// follow the same split.
+const ACCEL: &str = if cfg!(target_os = "macos") {
+    "Cmd"
+} else {
+    "Ctrl"
+};
+
+/// Rewrites the Windows-style shortcut text in this file for display.
+pub(crate) fn accel(shortcut: &str) -> String {
+    if ACCEL == "Ctrl" {
+        shortcut.to_string()
+    } else {
+        shortcut.replace("Ctrl", ACCEL)
+    }
+}
 
 struct Tab {
     id: u64,
@@ -776,7 +797,7 @@ impl App {
                         ..
                     } = e
                     {
-                        if modifiers.ctrl && modifiers.shift {
+                        if modifiers.command && modifiers.shift {
                             match key {
                                 Key::T => {
                                     action = Some(Action::New(SessionKind::Local(
@@ -795,13 +816,15 @@ impl App {
                             }
                             return false;
                         }
-                        if modifiers.ctrl && *key == Key::Tab {
+                        // Cmd+Tab is the system app switcher on macOS, so the
+                        // tab shortcut stays on Ctrl there and accepts either.
+                        if (modifiers.ctrl || modifiers.command) && *key == Key::Tab {
                             if !self.tabs.is_empty() {
                                 self.active = (self.active + 1) % self.tabs.len();
                             }
                             return false;
                         }
-                        if modifiers.ctrl && *key == Key::Comma {
+                        if modifiers.command && *key == Key::Comma {
                             self.settings_open = true;
                             return false;
                         }
@@ -819,7 +842,7 @@ impl App {
                             action = Some(Action::Restart);
                             return false;
                         }
-                        if modifiers.ctrl
+                        if modifiers.command
                             && matches!(key, Key::Plus | Key::Equals | Key::Minus | Key::Num0)
                         {
                             self.settings.font_size = match key {
@@ -947,7 +970,7 @@ impl App {
             .frame(
                 egui::Frame::new()
                     .fill(p.panel)
-                    .inner_margin(egui::Margin::symmetric(4, 2)),
+                    .inner_margin(topbar_margin()),
             )
             .show(ctx, |ui| {
                 let mut close = false;
@@ -955,49 +978,59 @@ impl App {
                 // Read maximized fresh every frame: the window can also be maximized
                 // by the OS (snap, Win+Up, taskbar) without going through a button.
                 let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                // The Windows and Linux windows are frameless, so they draw their
+                // own buttons and resize grips. macOS hides the native titlebar
+                // but keeps its buttons and edge resizing, so it draws neither.
+                let custom_chrome = !cfg!(target_os = "macos");
                 // The tab row and the window buttons share one bar, so the frameless
                 // chrome costs a single row of height instead of two.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let close_button =
-                        title_button(ui, TitleButton::Close, p).on_hover_text("关闭");
-                    let toggle_button = title_button(
-                        ui,
-                        if maximized {
-                            TitleButton::Restore
-                        } else {
-                            TitleButton::Maximize
-                        },
-                        p,
-                    )
-                    .on_hover_text("最大化 / 还原");
-                    let minimize_button =
-                        title_button(ui, TitleButton::Minimize, p).on_hover_text("最小化");
-                    // Derive the edge from the buttons themselves; `min_rect()` would
-                    // also fold in unrelated widgets. The drag strip below is
-                    // registered later and would win any overlap, so this boundary
-                    // has to be exact.
-                    let buttons_left = close_button
-                        .rect
-                        .union(toggle_button.rect)
-                        .union(minimize_button.rect)
-                        .left()
-                        - 4.0;
-                    if close_button.clicked() {
-                        close = true;
-                    }
-                    if toggle_button.clicked() {
-                        toggle = true;
-                    }
-                    if minimize_button.clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    }
+                    let buttons_left = if custom_chrome {
+                        let close_button =
+                            title_button(ui, TitleButton::Close, p).on_hover_text("关闭");
+                        let toggle_button = title_button(
+                            ui,
+                            if maximized {
+                                TitleButton::Restore
+                            } else {
+                                TitleButton::Maximize
+                            },
+                            p,
+                        )
+                        .on_hover_text("最大化 / 还原");
+                        let minimize_button =
+                            title_button(ui, TitleButton::Minimize, p).on_hover_text("最小化");
+                        if close_button.clicked() {
+                            close = true;
+                        }
+                        if toggle_button.clicked() {
+                            toggle = true;
+                        }
+                        if minimize_button.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                        // Derive the edge from the buttons themselves; `min_rect()` would
+                        // also fold in unrelated widgets. The drag strip below is
+                        // registered later and would win any overlap, so this boundary
+                        // has to be exact.
+                        close_button
+                            .rect
+                            .union(toggle_button.rect)
+                            .union(minimize_button.rect)
+                            .left()
+                            - 4.0
+                    } else {
+                        // macOS: no custom buttons, but the drag strip still runs
+                        // to the right edge of the bar.
+                        ui.max_rect().right()
+                    };
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.menu_button(RichText::new("G  菜单").color(p.accent), |ui| {
                             for (icon, text, shortcut, a) in [
                                 (
                                     icons::Icon::Terminal,
                                     "新建终端",
-                                    Some("Ctrl+Shift+T"),
+                                    Some(accel("Ctrl+Shift+T")),
                                     Action::New(SessionKind::Local(
                                         self.settings.default_shell.clone(),
                                     )),
@@ -1013,19 +1046,19 @@ impl App {
                                 (
                                     icons::Icon::SplitHorizontal,
                                     "左右分屏",
-                                    Some("Ctrl+Shift+D"),
+                                    Some(accel("Ctrl+Shift+D")),
                                     Action::Split(Axis::Horizontal),
                                 ),
                                 (
                                     icons::Icon::SplitVertical,
                                     "上下分屏",
-                                    Some("Ctrl+Shift+E"),
+                                    Some(accel("Ctrl+Shift+E")),
                                     Action::Split(Axis::Vertical),
                                 ),
                                 (
                                     icons::Icon::ClosePane,
                                     "关闭窗格",
-                                    Some("Ctrl+Shift+W"),
+                                    Some(accel("Ctrl+Shift+W")),
                                     Action::ClosePane,
                                 ),
                                 (
@@ -1035,7 +1068,8 @@ impl App {
                                     Action::Restart,
                                 ),
                             ] {
-                                if icons::icon_row(ui, icon, text, shortcut, p).clicked() {
+                                if icons::icon_row(ui, icon, text, shortcut.as_deref(), p).clicked()
+                                {
                                     *action = Some(a);
                                     ui.close();
                                 }
@@ -1044,7 +1078,7 @@ impl App {
                                 ui,
                                 icons::Icon::Search,
                                 "查找历史",
-                                Some("Ctrl+Shift+F"),
+                                Some(accel("Ctrl+Shift+F").as_str()),
                                 p,
                             )
                             .clicked()
@@ -1082,7 +1116,7 @@ impl App {
                                 ui,
                                 icons::Icon::Settings,
                                 "偏好设置",
-                                Some("Ctrl+,"),
+                                Some(accel("Ctrl+,").as_str()),
                                 p,
                             )
                             .clicked()
@@ -1123,7 +1157,7 @@ impl App {
                         }
                         ui.separator();
                         // Bound the strip so a stretch of empty bar always remains for
-                        // dragging the frameless window by.
+                        // dragging the window by.
                         const DRAG_GAP: f32 = 60.0;
                         let strip_max = (buttons_left - ui.cursor().min.x - DRAG_GAP).max(120.0);
                         // A horizontal strip ignores the wheel, and every mouse has
@@ -1363,24 +1397,27 @@ impl App {
                     egui::CollapsingHeader::new(RichText::new("本地 Shell").color(p.muted))
                         .default_open(true)
                         .show(ui, |ui| {
-                            for (key, label) in if cfg!(windows) {
-                                vec![
-                                    ("powershell", "PowerShell"),
-                                    ("pwsh", "PowerShell 7"),
-                                    ("cmd", "CMD"),
-                                    ("wsl", "WSL"),
-                                ]
-                            } else {
-                                vec![("shell", "Shell")]
-                            } {
+                            for shell in local_shells() {
                                 // Double-click, like every other row in the
                                 // sidebar, so a stray click cannot open a pane.
-                                let row =
-                                    icons::icon_row(ui, icons::Icon::Terminal, label, None, p);
+                                let row = icons::icon_row(
+                                    ui,
+                                    icons::Icon::Terminal,
+                                    &shell.label,
+                                    None,
+                                    p,
+                                );
                                 if row.double_clicked() {
-                                    *action = Some(Action::New(SessionKind::Local(key.into())));
+                                    *action =
+                                        Some(Action::New(SessionKind::Local(shell.value.clone())));
                                 }
-                                row.on_hover_text("双击打开");
+                                // The executable path matters on Unix, where
+                                // several shells can share a name.
+                                row.on_hover_text(if shell.value.contains('/') {
+                                    format!("双击打开 · {}", shell.value)
+                                } else {
+                                    "双击打开".to_string()
+                                });
                             }
                             ui.separator();
                             let serial =
@@ -1589,18 +1626,30 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("默认 Shell");
                     egui::ComboBox::from_id_salt("default-shell")
-                        .selected_text(&self.settings.default_shell)
+                        .selected_text(shell_label(&self.settings.default_shell))
                         .show_ui(ui, |ui| {
-                            for shell in if cfg!(windows) {
-                                vec!["powershell", "pwsh", "cmd", "wsl"]
-                            } else {
-                                vec!["shell"]
-                            } {
+                            for shell in local_shells() {
                                 changed |= ui
                                     .selectable_value(
                                         &mut self.settings.default_shell,
-                                        shell.into(),
-                                        shell,
+                                        shell.value.clone(),
+                                        &shell.label,
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("浏览器搜索");
+                    egui::ComboBox::from_id_salt("search-engine")
+                        .selected_text(search_engine_label(&self.settings.search_engine))
+                        .show_ui(ui, |ui| {
+                            for (key, label, _) in SEARCH_ENGINES {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.search_engine,
+                                        key.to_string(),
+                                        label,
                                     )
                                     .changed();
                             }
@@ -1637,10 +1686,9 @@ impl App {
                             .min_col_width(72.0)
                             .show(ui, |ui| {
                                 ui.label("主机 / IP");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.remote.host)
-                                        .desired_width(280.0),
-                                );
+                                editing::field_with(ui, &mut self.remote.host, |edit| {
+                                    edit.desired_width(280.0)
+                                });
                                 ui.end_row();
                                 ui.label("端口");
                                 ui.add(
@@ -1648,10 +1696,9 @@ impl App {
                                 );
                                 ui.end_row();
                                 ui.label("连接名称");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.remote.name)
-                                        .desired_width(280.0),
-                                );
+                                editing::field_with(ui, &mut self.remote.name, |edit| {
+                                    edit.desired_width(280.0)
+                                });
                                 ui.end_row();
                                 ui.label("分组");
                                 egui::ComboBox::from_id_salt("profile-group")
@@ -1677,16 +1724,14 @@ impl App {
                                     });
                                 ui.end_row();
                                 ui.label("用户名");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.remote.user)
-                                        .desired_width(280.0),
-                                );
+                                editing::field_with(ui, &mut self.remote.user, |edit| {
+                                    edit.desired_width(280.0)
+                                });
                                 ui.end_row();
                                 ui.label("私钥路径");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.remote.identity)
-                                        .desired_width(280.0),
-                                );
+                                editing::field_with(ui, &mut self.remote.identity, |edit| {
+                                    edit.desired_width(280.0)
+                                });
                                 ui.end_row();
                             });
                         egui::CollapsingHeader::new("ProxyJump 跳板机").show(ui, |ui| {
@@ -1704,25 +1749,22 @@ impl App {
                                     .min_col_width(48.0)
                                     .show(ui, |ui| {
                                         ui.label("地址");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut j.host)
-                                                .desired_width(280.0),
-                                        );
+                                        editing::field_with(ui, &mut j.host, |edit| {
+                                            edit.desired_width(280.0)
+                                        });
                                         ui.end_row();
                                         ui.label("端口");
                                         ui.add(egui::DragValue::new(&mut j.port).range(1..=65535));
                                         ui.end_row();
                                         ui.label("用户名");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut j.user)
-                                                .desired_width(280.0),
-                                        );
+                                        editing::field_with(ui, &mut j.user, |edit| {
+                                            edit.desired_width(280.0)
+                                        });
                                         ui.end_row();
                                         ui.label("私钥");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut j.identity)
-                                                .desired_width(280.0),
-                                        );
+                                        editing::field_with(ui, &mut j.identity, |edit| {
+                                            edit.desired_width(280.0)
+                                        });
                                         ui.end_row();
                                     });
                             }
@@ -1737,10 +1779,9 @@ impl App {
                                             egui::DragValue::new(&mut f.bind_port).range(1..=65535),
                                         );
                                         ui.label("→");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut f.target_host)
-                                                .desired_width(160.0),
-                                        );
+                                        editing::field_with(ui, &mut f.target_host, |edit| {
+                                            edit.desired_width(160.0)
+                                        });
                                         ui.add(
                                             egui::DragValue::new(&mut f.target_port)
                                                 .range(1..=65535),
@@ -1771,11 +1812,10 @@ impl App {
                             .show(ui, |ui| {
                                 ui.label("串口");
                                 ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.serial.port)
-                                            .desired_width(180.0)
-                                            .hint_text("COM3 或 auto"),
-                                    );
+                                    editing::field_with(ui, &mut self.serial.port, |edit| {
+                                        edit.desired_width(180.0)
+                                            .hint_text(format!("{} 或 auto", serial::PORT_EXAMPLE))
+                                    });
                                     egui::ComboBox::from_id_salt("serial-port-pick")
                                         .selected_text("▾")
                                         .width(150.0)
@@ -1821,10 +1861,9 @@ impl App {
                                     });
                                 ui.end_row();
                                 ui.label("连接名称");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.serial.name)
-                                        .desired_width(280.0),
-                                );
+                                editing::field_with(ui, &mut self.serial.name, |edit| {
+                                    edit.desired_width(280.0)
+                                });
                                 ui.end_row();
                                 ui.label("分组");
                                 egui::ComboBox::from_id_salt("serial-group")
@@ -1910,7 +1949,7 @@ impl App {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.new_group).desired_width(180.0));
+                    editing::field_with(ui, &mut self.new_group, |edit| edit.desired_width(180.0));
                     if ui.button("添加").clicked() {
                         let name = self.new_group.trim().to_string();
                         if !name.is_empty() && !self.settings.groups.contains(&name) {
@@ -2084,17 +2123,24 @@ impl App {
                     ))
                     .color(p.accent),
                 );
+                // Ctrl+C stays the terminal interrupt on every platform; only
+                // the clipboard accelerators follow the Cmd / Ctrl split.
+                let copy_paste = if ACCEL == "Cmd" {
+                    "Cmd+C / Cmd+V".to_string()
+                } else {
+                    accel("Ctrl+Shift+C / V")
+                };
                 for (key, description) in [
-                    ("Ctrl+Shift+T / W", "新建标签 / 关闭窗格"),
-                    ("Ctrl+Shift+D / E", "左右 / 上下分屏"),
-                    ("Ctrl+Tab / Alt+Right", "切换标签 / 窗格"),
-                    ("Ctrl+Shift+C / V", "复制 / 粘贴"),
-                    ("Ctrl+C", "终端中断"),
-                    ("Alt+C / Alt+R", "断开 / 重连当前会话"),
-                    ("Ctrl+Shift+F", "全部保留历史查找"),
-                    ("Ctrl+Shift+B / Ctrl+,", "导航栏 / 设置"),
-                    ("中键 / Shift+鼠标", "粘贴 / 强制选择"),
-                    ("Ctrl+Plus / Minus / 0", "字号放大 / 缩小 / 重置"),
+                    (accel("Ctrl+Shift+T / W"), "新建标签 / 关闭窗格"),
+                    (accel("Ctrl+Shift+D / E"), "左右 / 上下分屏"),
+                    ("Ctrl+Tab / Alt+Right".to_string(), "切换标签 / 窗格"),
+                    (copy_paste, "复制 / 粘贴"),
+                    ("Ctrl+C".to_string(), "终端中断"),
+                    ("Alt+C / Alt+R".to_string(), "断开 / 重连当前会话"),
+                    (accel("Ctrl+Shift+F"), "全部保留历史查找"),
+                    (accel("Ctrl+Shift+B / Ctrl+,"), "导航栏 / 设置"),
+                    ("中键 / Shift+鼠标".to_string(), "粘贴 / 强制选择"),
+                    (accel("Ctrl+Plus / Minus / 0"), "字号放大 / 缩小 / 重置"),
                 ] {
                     ui.horizontal(|ui| {
                         ui.monospace(key);
@@ -2170,7 +2216,11 @@ impl App {
     }
     pub(crate) fn render(&mut self, ctx: &egui::Context) {
         let p = self.palette;
-        self.resize_grips(ctx);
+        // macOS keeps its native resize border; the other platforms are
+        // frameless and have to detect the edges themselves.
+        if !cfg!(target_os = "macos") {
+            self.resize_grips(ctx);
+        }
         // The counters become rates here, once per frame. Both the spinner and
         // a settling rate need more frames than an idle app would ask for.
         let rates_animating = self.sample_rates();
@@ -2228,7 +2278,13 @@ impl App {
                                 "{}×{} · {} · {}/{}",
                                 s.size.1,
                                 s.size.0,
-                                if s.remote.is_some() { "SSH" } else { "ConPTY" },
+                                if s.remote.is_some() {
+                                    "SSH"
+                                } else if cfg!(windows) {
+                                    "ConPTY"
+                                } else {
+                                    "PTY"
+                                },
                                 t.focused + 1,
                                 t.panes.len()
                             ),
@@ -2263,18 +2319,21 @@ impl App {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         // A frameless window has no OS grip, so the corner is
-                        // drawn and made draggable here.
-                        let grip = resize_grip(ui, p);
-                        if grip.hovered() || grip.dragged() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-                        }
-                        if grip.drag_started()
-                            || (grip.hovered() && ui.input(|i| i.pointer.primary_pressed()))
-                        {
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::BeginResize(
-                                    egui::viewport::ResizeDirection::SouthEast,
-                                ));
+                        // drawn and made draggable here. macOS resizes through
+                        // its native border instead.
+                        if !cfg!(target_os = "macos") {
+                            let grip = resize_grip(ui, p);
+                            if grip.hovered() || grip.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                            }
+                            if grip.drag_started()
+                                || (grip.hovered() && ui.input(|i| i.pointer.primary_pressed()))
+                            {
+                                ui.ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                                        egui::viewport::ResizeDirection::SouthEast,
+                                    ));
+                            }
                         }
                         if connecting {
                             connecting_spinner(ui, p);
@@ -2301,7 +2360,7 @@ impl App {
                         }))
                         .on_hover_text(&rates);
                         if icons::icon_button(ui, icons::Icon::Search, p, icons::Size::Row)
-                            .on_hover_text("查找历史输出 (Ctrl+Shift+F)")
+                            .on_hover_text(format!("查找历史输出 ({})", accel("Ctrl+Shift+F")))
                             .clicked()
                         {
                             self.search_open = true;
@@ -2368,19 +2427,10 @@ impl App {
                             "已自动开启一个相同类型的会话，可选择其他会话替换。",
                             p,
                         ));
-                        if cfg!(windows) {
-                            for (key, label) in [
-                                ("powershell", "本地 PowerShell"),
-                                ("pwsh", "本地 PowerShell 7"),
-                                ("cmd", "本地 CMD"),
-                                ("wsl", "本地 WSL"),
-                            ] {
-                                if ui.button(label).clicked() {
-                                    chosen = Some(SessionKind::Local(key.into()));
-                                }
+                        for shell in local_shells() {
+                            if ui.button(format!("本地 {}", shell.label)).clicked() {
+                                chosen = Some(SessionKind::Local(shell.value.clone()));
                             }
-                        } else if ui.button("本地 Shell").clicked() {
-                            chosen = Some(SessionKind::Local("shell".into()));
                         }
                         ui.separator();
                         for profile in &self.settings.profiles {
@@ -2487,8 +2537,9 @@ impl App {
                 if self.search_open {
                     ui.horizontal(|ui| {
                         ui.label(hint("历史", p));
-                        let r = ui
-                            .add(egui::TextEdit::singleline(&mut self.search).desired_width(260.0));
+                        let r = editing::field_with(ui, &mut self.search, |edit| {
+                            edit.desired_width(260.0)
+                        });
                         if self.search_focus {
                             r.request_focus();
                             self.search_focus = false;
@@ -2556,6 +2607,7 @@ impl App {
                                         palette: p,
                                         query: if self.search_open { &self.search } else { "" },
                                         copy_on_select: self.settings.copy_on_select,
+                                        search_engine: &self.settings.search_engine,
                                     },
                                 );
                                 if clicked {
@@ -2573,7 +2625,10 @@ impl App {
                     t.focused = focus;
                 } else {
                     ui.centered_and_justified(|ui| {
-                        if ui.button("+ 新建终端   Ctrl+Shift+T").clicked() {
+                        if ui
+                            .button(format!("+ 新建终端   {}", accel("Ctrl+Shift+T")))
+                            .clicked()
+                        {
                             action = Some(Action::New(SessionKind::Local(
                                 self.settings.default_shell.clone(),
                             )));
@@ -2665,6 +2720,22 @@ enum TitleButton {
     Maximize,
     Restore,
     Minimize,
+}
+
+/// The topbar's inner margin. macOS runs the content under a hidden native
+/// titlebar, so the left side has to clear the traffic lights; every other
+/// platform owns the whole row.
+fn topbar_margin() -> egui::Margin {
+    if cfg!(target_os = "macos") {
+        egui::Margin {
+            left: 78,
+            right: 4,
+            top: 2,
+            bottom: 2,
+        }
+    } else {
+        egui::Margin::symmetric(4, 2)
+    }
 }
 
 /// The window-chrome buttons. Painted through the shared icon set, for the same

@@ -4,6 +4,7 @@ use eframe::egui::{
     Vec2,
 };
 use g_terminal::{
+    config::{search_engine_label, search_url},
     input::{encode_key, encode_mouse, encode_paste},
     session::Session,
 };
@@ -79,6 +80,8 @@ pub struct ViewOptions<'a> {
     pub palette: Palette,
     pub query: &'a str,
     pub copy_on_select: bool,
+    /// Which search engine the selection lookup opens.
+    pub search_engine: &'a str,
 }
 
 impl Pane {
@@ -108,6 +111,7 @@ impl Pane {
             palette,
             query,
             copy_on_select,
+            search_engine,
         } = options;
         let mut error = None;
         let font = FontId::monospace(size);
@@ -365,8 +369,13 @@ impl Pane {
             for event in ui.input(|i| i.events.clone()) {
                 match event {
                     Event::Copy => {
-                        // winit converts both Ctrl+C and Ctrl+Shift+C to Copy.
-                        if ui.input(|i| i.modifiers.shift) {
+                        // On Windows both Ctrl+C and Ctrl+Shift+C arrive as Copy,
+                        // and the unshifted one is the terminal interrupt. On
+                        // macOS only Cmd+C arrives here — Ctrl+C stays an
+                        // ordinary key event and is sent as the interrupt — so
+                        // Copy always means copy.
+                        let copy = cfg!(target_os = "macos") || ui.input(|i| i.modifiers.shift);
+                        if copy {
                             if let Some((a, b)) = self.selection {
                                 copied = Some(selection_text(terminal.parser.screen(), a, b));
                             }
@@ -374,7 +383,13 @@ impl Pane {
                             outgoing.push(vec![3]);
                         }
                     }
-                    Event::Cut => outgoing.push(vec![24]),
+                    // On Windows Ctrl+X reaches the shell as the control byte.
+                    // On macOS this is Cmd+X, which must not turn into Ctrl+X.
+                    Event::Cut => {
+                        if !cfg!(target_os = "macos") {
+                            outgoing.push(vec![24]);
+                        }
+                    }
                     Event::Paste(text) => {
                         notice = Some(moved_message("粘贴", &text));
                         outgoing.push(encode_paste(
@@ -665,7 +680,13 @@ impl Pane {
         let selection = self.selection;
         if !mouse {
             response.context_menu(|ui| {
-                if ui.button("复制选中内容   Ctrl+Shift+C").clicked() {
+                if ui
+                    .button(format!(
+                        "复制选中内容   {}",
+                        crate::app::accel("Ctrl+Shift+C")
+                    ))
+                    .clicked()
+                {
                     if let Some((a, b)) = selection {
                         let text = {
                             let terminal = self.session.terminal.lock().unwrap();
@@ -681,7 +702,10 @@ impl Pane {
                     ui.ctx().copy_text(visible_text);
                     ui.close();
                 }
-                if ui.button("粘贴   Ctrl+Shift+V").clicked() {
+                if ui
+                    .button(format!("粘贴   {}", crate::app::accel("Ctrl+Shift+V")))
+                    .clicked()
+                {
                     match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
                         Ok(text) => {
                             notice = Some(moved_message("粘贴", &text));
@@ -696,6 +720,40 @@ impl Pane {
                             outgoing.push(encode_paste(&text, bracketed));
                         }
                         Err(e) => error = Some(e.to_string()),
+                    }
+                    ui.close();
+                }
+                // A lookup of the selection, in the configured engine. It is the
+                // one action here that leaves the app, so it lives on its own.
+                if ui
+                    .add_enabled(
+                        selection.is_some(),
+                        egui::Button::new(format!(
+                            "浏览器搜索选中内容（{}）",
+                            search_engine_label(search_engine)
+                        )),
+                    )
+                    .clicked()
+                {
+                    if let Some((a, b)) = selection {
+                        let text = {
+                            let terminal = self.session.terminal.lock().unwrap();
+                            selection_text(terminal.parser.screen(), a, b)
+                        };
+                        let query = text.trim();
+                        if query.is_empty() {
+                            error = Some("没有选中可搜索的内容".into());
+                        } else {
+                            match crate::remote_ui::open_url(&search_url(search_engine, query)) {
+                                Ok(()) => {
+                                    notice = Some(format!(
+                                        "已用 {} 搜索",
+                                        search_engine_label(search_engine)
+                                    ));
+                                }
+                                Err(e) => error = Some(e),
+                            }
+                        }
                     }
                     ui.close();
                 }
@@ -831,6 +889,7 @@ mod tests {
             palette: Palette::new(false),
             query: "",
             copy_on_select: true,
+            search_engine: "google",
         }
     }
     #[test]

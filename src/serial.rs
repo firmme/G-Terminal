@@ -10,6 +10,12 @@
 //! Bluetooth SPP ports are real serial ports, but they are usually the wrong
 //! choice when a cable is plugged in, so they sort last and `auto` only falls
 //! back to them when every physical port is taken.
+//!
+//! Port names differ by platform and so does their order. Windows numbers COM
+//! ports; POSIX systems name devices, where a natural order is needed so
+//! `usbmodem2` precedes `usbmodem10`. On macOS each device appears twice, as
+//! `/dev/cu.*` (call-out) and `/dev/tty.*` (dial-in); only the call-out is used
+//! for an outgoing connection, so the dial-in twin is dropped from the list.
 
 use anyhow::{Context, Result, bail};
 use serial2::SerialPort;
@@ -22,6 +28,16 @@ use std::{
     },
     thread,
     time::Duration,
+};
+
+/// An example device name for the current platform, shown in validation errors
+/// and the connection editor's placeholder.
+pub const PORT_EXAMPLE: &str = if cfg!(windows) {
+    "COM3"
+} else if cfg!(target_os = "macos") {
+    "/dev/cu.usbserial-0001"
+} else {
+    "/dev/ttyUSB0"
 };
 
 /// A blocking read waits this long for a byte before reporting a timeout. The
@@ -89,12 +105,47 @@ pub fn sort_ports(ports: &mut [SerialPortInfo]) {
     ports.sort_by(|a, b| {
         a.bluetooth
             .cmp(&b.bluetooth)
-            .then_with(|| rank(&a.name).cmp(&rank(&b.name)))
+            .then_with(|| compare_names(&a.name, &b.name))
     });
 }
 
+/// Whether a name belongs to a Bluetooth serial port. Windows reads this from
+/// the driver key, but POSIX only has the name: `Bluetooth-*` on macOS and
+/// `rfcomm*` on Linux.
+#[cfg(not(windows))]
+fn is_bluetooth(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("bluetooth") || name.contains("rfcomm")
+}
+
+/// macOS exposes every device twice, as `/dev/cu.X` (call-out) and `/dev/tty.X`
+/// (dial-in). Only `cu` is usable for an outgoing connection, so a `tty` entry
+/// is dropped when its `cu` twin exists. A `tty` with no `cu` counterpart is
+/// kept rather than hidden.
+#[cfg(target_os = "macos")]
+fn drop_shadowed_dialin(ports: &mut Vec<SerialPortInfo>) {
+    let callouts: HashSet<String> = ports
+        .iter()
+        .filter(|port| port.name.starts_with("/dev/cu."))
+        .map(|port| port.name.clone())
+        .collect();
+    ports.retain(|port| match port.name.strip_prefix("/dev/tty.") {
+        Some(suffix) => !callouts.contains(&format!("/dev/cu.{suffix}")),
+        None => true,
+    });
+}
+
+/// Port naming differs by platform, so the order does too.
+fn compare_names(a: &str, b: &str) -> std::cmp::Ordering {
+    if cfg!(windows) {
+        rank_com(a).cmp(&rank_com(b))
+    } else {
+        rank_posix(a).cmp(&rank_posix(b))
+    }
+}
+
 /// `COM10` sorts after `COM9`, which a plain string sort gets wrong.
-fn rank(name: &str) -> (u8, u32, String) {
+fn rank_com(name: &str) -> (u8, u32, String) {
     match name
         .trim()
         .to_ascii_uppercase()
@@ -104,6 +155,51 @@ fn rank(name: &str) -> (u8, u32, String) {
         Some(n) => (0, n, String::new()),
         None => (1, 0, name.trim().to_ascii_uppercase()),
     }
+}
+
+/// POSIX paths. `/dev/cu.*` (call-out) sorts before `/dev/tty.*` (dial-in,
+/// which waits for carrier); within a group the order is natural.
+fn rank_posix(name: &str) -> (u8, String) {
+    let name = name.trim();
+    let group = if name.starts_with("/dev/cu.") {
+        0
+    } else if name.starts_with("/dev/tty.") {
+        1
+    } else {
+        2
+    };
+    (group, natural_key(name))
+}
+
+/// Zero-pads every run of digits so a plain string compare orders them
+/// numerically. POSIX device names embed counter numbers, where a lexicographic
+/// compare would put `usbmodem10` before `usbmodem2`.
+fn natural_key(name: &str) -> String {
+    let mut key = String::with_capacity(name.len() + 16);
+    let mut digits = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            flush_digits(&mut key, &mut digits);
+            key.push(ch);
+        }
+    }
+    flush_digits(&mut key, &mut digits);
+    key
+}
+
+/// Writes a digit run into `key` padded to a fixed width, so `2` sorts before
+/// `10` under a lexicographic compare.
+fn flush_digits(key: &mut String, digits: &mut String) {
+    if digits.is_empty() {
+        return;
+    }
+    for _ in digits.len()..10 {
+        key.push('0');
+    }
+    key.push_str(digits);
+    digits.clear();
 }
 
 /// Enumerated ports, ready for display. Failures yield an empty list rather
@@ -130,7 +226,7 @@ pub fn resolve(requested: &str) -> Result<String> {
     let requested = requested.trim();
     if !requested.eq_ignore_ascii_case("auto") {
         if requested.is_empty() {
-            bail!("请输入串口设备名，例如 COM3 或 auto");
+            bail!("请输入串口设备名，例如 {PORT_EXAMPLE} 或 auto");
         }
         return Ok(requested.to_string());
     }
@@ -220,14 +316,18 @@ mod platform {
     use super::SerialPortInfo;
 
     pub fn enumerate() -> Vec<SerialPortInfo> {
-        serial2::SerialPort::available_ports()
+        let mut ports: Vec<SerialPortInfo> = serial2::SerialPort::available_ports()
             .unwrap_or_default()
             .into_iter()
-            .map(|path| SerialPortInfo {
-                name: path.to_string_lossy().into_owned(),
-                bluetooth: false,
+            .map(|path| {
+                let name = path.to_string_lossy().into_owned();
+                let bluetooth = super::is_bluetooth(&name);
+                SerialPortInfo { name, bluetooth }
             })
-            .collect()
+            .collect();
+        #[cfg(target_os = "macos")]
+        super::drop_shadowed_dialin(&mut ports);
+        ports
     }
 }
 
@@ -253,6 +353,50 @@ mod tests {
         sort_ports(&mut ports);
         let names: Vec<_> = ports.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["COM2", "COM9", "COM10", "COM4"]);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn posix_ports_sort_callouts_first_and_numbers_naturally() {
+        let mut ports = vec![
+            info("/dev/tty.usbserial-10", false),
+            info("/dev/cu.usbmodem10", false),
+            info("/dev/cu.usbmodem2", false),
+            info("/dev/tty.Bluetooth-Incoming-Port", true),
+        ];
+        sort_ports(&mut ports);
+        let names: Vec<_> = ports.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "/dev/cu.usbmodem2",
+                "/dev/cu.usbmodem10",
+                "/dev/tty.usbserial-10",
+                "/dev/tty.Bluetooth-Incoming-Port",
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn posix_bluetooth_ports_are_recognised_by_name() {
+        assert!(is_bluetooth("/dev/cu.Bluetooth-Incoming-Port"));
+        assert!(is_bluetooth("/dev/cu.Bluetooth-Modem"));
+        assert!(is_bluetooth("/dev/rfcomm0"));
+        assert!(!is_bluetooth("/dev/cu.usbserial-0001"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_drops_dialin_when_the_callout_exists() {
+        let mut ports = vec![
+            info("/dev/cu.usbserial-0001", false),
+            info("/dev/tty.usbserial-0001", false),
+            info("/dev/tty.only-dialin", false),
+        ];
+        drop_shadowed_dialin(&mut ports);
+        let names: Vec<_> = ports.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["/dev/cu.usbserial-0001", "/dev/tty.only-dialin"]);
     }
 
     #[test]

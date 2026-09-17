@@ -45,13 +45,7 @@ pub enum SessionKind {
 impl SessionKind {
     pub fn label(&self) -> String {
         match self {
-            Self::Local(shell) => match shell.as_str() {
-                "powershell" => "PowerShell".into(),
-                "pwsh" => "PowerShell 7".into(),
-                "cmd" => "Command Prompt".into(),
-                "wsl" => "WSL".into(),
-                _ => "Shell".into(),
-            },
+            Self::Local(shell) => shell_label(shell),
             Self::Serial(p) => p.label(),
             Self::Ssh(p) => p.label(),
             Self::Sftp(p) => format!("SFTP · {}", p.label()),
@@ -82,8 +76,13 @@ impl SessionKind {
                 }
                 #[cfg(not(windows))]
                 {
-                    let _ = shell;
-                    CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
+                    // `shell` is an executable path from `local_shells`. The
+                    // legacy empty/`shell` value still means "follow $SHELL".
+                    let program = match shell.trim() {
+                        "" | "shell" => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+                        path => path.to_string(),
+                    };
+                    CommandBuilder::new(program)
                 }
             }
             Self::Ssh(profile) | Self::Sftp(profile) => {
@@ -119,6 +118,115 @@ impl SessionKind {
         }
         Ok(cmd)
     }
+}
+
+/// A local shell the UI can offer: the value stored in the session and config,
+/// and the name shown for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalShell {
+    pub value: String,
+    pub label: String,
+}
+
+/// The name to show for a shell value. Windows values are short keys
+/// (`powershell`, `cmd`, …); Unix values are executable paths, shown by their
+/// file name. An empty value or `shell` means "follow `$SHELL`".
+pub fn shell_label(value: &str) -> String {
+    match value {
+        "powershell" => "PowerShell".into(),
+        "pwsh" => "PowerShell 7".into(),
+        "cmd" => "Command Prompt".into(),
+        "wsl" => "WSL".into(),
+        "" | "shell" => "Shell".into(),
+        path => std::path::Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.to_string()),
+    }
+}
+
+/// The local shells offered in the UI, in display order. Probed once: reading
+/// `/etc/shells` and stat-ing candidates on every frame would be wasteful.
+pub fn local_shells() -> &'static [LocalShell] {
+    static SHELLS: std::sync::OnceLock<Vec<LocalShell>> = std::sync::OnceLock::new();
+    SHELLS.get_or_init(enumerate_local_shells)
+}
+
+/// Windows ships a fixed set of shells; the keys match `SessionKind::command`.
+#[cfg(windows)]
+fn enumerate_local_shells() -> Vec<LocalShell> {
+    [
+        ("powershell", "PowerShell"),
+        ("pwsh", "PowerShell 7"),
+        ("cmd", "CMD"),
+        ("wsl", "WSL"),
+    ]
+    .into_iter()
+    .map(|(value, label)| LocalShell {
+        value: value.into(),
+        label: label.into(),
+    })
+    .collect()
+}
+
+/// On Unix the shells are whatever the machine actually has. `/etc/shells` is
+/// the system's own list of valid login shells; `$SHELL` and a few common
+/// package-manager locations are added in case they are not listed there.
+#[cfg(not(windows))]
+fn enumerate_local_shells() -> Vec<LocalShell> {
+    fn push(paths: &mut Vec<String>, path: &str) {
+        let path = path.trim();
+        if path.is_empty() || paths.iter().any(|existing| existing.as_str() == path) {
+            return;
+        }
+        if std::path::Path::new(path).is_file() {
+            paths.push(path.to_string());
+        }
+    }
+
+    let mut paths = Vec::new();
+    if let Ok(shell) = std::env::var("SHELL") {
+        push(&mut paths, &shell);
+    }
+    if let Ok(contents) = std::fs::read_to_string("/etc/shells") {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            push(&mut paths, line);
+        }
+    }
+    for candidate in [
+        "/bin/sh",
+        "/bin/bash",
+        "/bin/zsh",
+        "/usr/bin/fish",
+        "/usr/local/bin/fish",
+        "/opt/homebrew/bin/fish",
+        "/opt/homebrew/bin/bash",
+        "/opt/homebrew/bin/zsh",
+        "/usr/local/bin/bash",
+        "/usr/local/bin/zsh",
+        "/opt/homebrew/bin/pwsh",
+        "/usr/local/bin/pwsh",
+    ] {
+        push(&mut paths, candidate);
+    }
+
+    // Two paths can share a name (`/bin/bash` and `/opt/homebrew/bin/bash`).
+    // Keep the first, so the list stays unambiguous; the earlier sources
+    // (`$SHELL`, `/etc/shells`) win.
+    let mut shells: Vec<LocalShell> = Vec::new();
+    for path in paths {
+        let label = shell_label(&path);
+        if shells.iter().any(|shell| shell.label == label) {
+            continue;
+        }
+        shells.push(LocalShell { value: path, label });
+    }
+    shells
 }
 
 enum Control {
@@ -587,9 +695,12 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         };
-        let pair = native_pty_system()
-            .openpty(size)
-            .context("无法创建系统 PTY（Windows 需要 10 1809 或更新版本）")?;
+        let pty_hint = if cfg!(windows) {
+            "无法创建系统 PTY（Windows 需要 10 1809 或更新版本）"
+        } else {
+            "无法创建系统 PTY"
+        };
+        let pair = native_pty_system().openpty(size).context(pty_hint)?;
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
         let mut child = pair.slave.spawn_command(kind.command()?).with_context(|| {
@@ -958,6 +1069,74 @@ mod tests {
         assert_eq!(session.size, (40, 120));
         session.resize(40, 120);
         assert_eq!(session.size, (40, 120));
+    }
+
+    #[test]
+    fn shell_labels_are_readable_for_keys_and_paths() {
+        assert_eq!(shell_label("powershell"), "PowerShell");
+        assert_eq!(shell_label("cmd"), "Command Prompt");
+        assert_eq!(shell_label(""), "Shell");
+        assert_eq!(shell_label("shell"), "Shell");
+        assert_eq!(shell_label("/bin/zsh"), "zsh");
+        assert_eq!(shell_label("/opt/homebrew/bin/fish"), "fish");
+    }
+
+    /// Choosing a shell has to start that shell, not silently fall back to
+    /// `$SHELL` as the pre-enumeration code did.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_chosen_shell_path_is_the_program_that_starts() {
+        let command = SessionKind::Local("/bin/bash".into()).command().unwrap();
+        assert_eq!(
+            command.get_argv()[0],
+            std::ffi::OsString::from("/bin/bash"),
+            "the chosen shell must be argv[0]"
+        );
+    }
+
+    /// The legacy `shell` value and an empty one still mean "follow $SHELL".
+    #[test]
+    #[cfg(not(windows))]
+    fn the_legacy_shell_value_follows_the_environment() {
+        let expected =
+            std::ffi::OsString::from(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
+        for value in ["shell", ""] {
+            let command = SessionKind::Local(value.into()).command().unwrap();
+            assert_eq!(command.get_argv()[0], expected, "value {value:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn local_shells_are_absolute_unique_and_present_on_disk() {
+        let shells = local_shells();
+        assert!(
+            !shells.is_empty(),
+            "a Unix host must offer at least one shell"
+        );
+        for shell in shells {
+            assert!(
+                shell.value.starts_with('/'),
+                "{} is not absolute",
+                shell.value
+            );
+            assert!(
+                std::path::Path::new(&shell.value).is_file(),
+                "{} does not exist",
+                shell.value
+            );
+            assert!(!shell.label.is_empty());
+        }
+        // Names are unique, so the UI never shows two identical rows.
+        for (index, shell) in shells.iter().enumerate() {
+            assert!(
+                !shells[..index]
+                    .iter()
+                    .any(|other| other.label == shell.label),
+                "duplicate label {}",
+                shell.label
+            );
+        }
     }
 
     #[test]

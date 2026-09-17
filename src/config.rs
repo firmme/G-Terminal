@@ -10,6 +10,8 @@ pub struct Settings {
     pub light_theme: bool,
     pub sidebar: bool,
     pub default_shell: String,
+    /// Which web search engine the terminal's selection lookup opens.
+    pub search_engine: String,
     pub profiles: Vec<RemoteProfile>,
     pub serial_profiles: Vec<SerialProfile>,
     pub groups: Vec<String>,
@@ -27,6 +29,7 @@ impl Default for Settings {
             light_theme: false,
             sidebar: true,
             default_shell: if cfg!(windows) { "powershell" } else { "shell" }.into(),
+            search_engine: DEFAULT_SEARCH_ENGINE.into(),
             profiles: Vec::new(),
             serial_profiles: Vec::new(),
             groups: Vec::new(),
@@ -36,6 +39,59 @@ impl Default for Settings {
             workspace: Vec::new(),
         }
     }
+}
+
+/// The engine used when settings carry none.
+pub const DEFAULT_SEARCH_ENGINE: &str = "google";
+
+/// Web search engines offered for the terminal's selection lookup. The first
+/// field is the key stored in settings; the third is the URL template, with
+/// `{}` standing for the percent-encoded query.
+pub const SEARCH_ENGINES: [(&str, &str, &str); 4] = [
+    ("google", "Google", "https://www.google.com/search?q={}"),
+    ("bing", "Bing", "https://www.bing.com/search?q={}"),
+    ("duckduckgo", "DuckDuckGo", "https://duckduckgo.com/?q={}"),
+    ("baidu", "百度", "https://www.baidu.com/s?wd={}"),
+];
+
+/// The display name for a stored engine key.
+pub fn search_engine_label(engine: &str) -> &str {
+    SEARCH_ENGINES
+        .iter()
+        .find(|(key, _, _)| *key == engine)
+        .map(|(_, label, _)| *label)
+        .unwrap_or(engine)
+}
+
+/// The search URL for `query` on `engine`. An unknown key falls back to the
+/// default engine, so a hand-edited config cannot produce a broken lookup.
+pub fn search_url(engine: &str, query: &str) -> String {
+    let template = SEARCH_ENGINES
+        .iter()
+        .find(|(key, _, _)| *key == engine)
+        .or_else(|| {
+            SEARCH_ENGINES
+                .iter()
+                .find(|(key, _, _)| *key == DEFAULT_SEARCH_ENGINE)
+        })
+        .map(|(_, _, template)| *template)
+        .unwrap_or("https://www.google.com/search?q={}");
+    template.replace("{}", &percent_encode(query))
+}
+
+/// Percent-encodes a query for a URL: RFC 3986 unreserved characters stay, and
+/// everything else — including the UTF-8 bytes of CJK — is escaped.
+fn percent_encode(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for byte in query.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -170,7 +226,10 @@ impl SerialProfile {
     pub fn validate(&self) -> Result<()> {
         let port = self.port.trim();
         if port.is_empty() {
-            bail!("请输入串口设备名，例如 COM3 或 auto");
+            bail!(
+                "请输入串口设备名，例如 {} 或 auto",
+                crate::serial::PORT_EXAMPLE
+            );
         }
         if port
             .chars()
@@ -228,6 +287,9 @@ impl Settings {
         }
         if let Some(v) = read_field(&value, "default_shell") {
             settings.default_shell = v;
+        }
+        if let Some(v) = read_field(&value, "search_engine") {
+            settings.search_engine = v;
         }
         if let Some(v) = read_field(&value, "profiles") {
             settings.profiles = v;
@@ -320,6 +382,28 @@ mod tests {
         assert!(!s.copy_on_select);
         assert!(s.restore_workspace);
         assert!(s.serial_profiles.is_empty());
+        // A config that predates the field still gets the default engine.
+        assert_eq!(s.search_engine, DEFAULT_SEARCH_ENGINE);
+    }
+
+    #[test]
+    fn search_urls_follow_the_engine_and_escape_the_query() {
+        assert_eq!(
+            search_url("google", "hello world"),
+            "https://www.google.com/search?q=hello%20world"
+        );
+        assert_eq!(
+            search_url("bing", "a&b"),
+            "https://www.bing.com/search?q=a%26b"
+        );
+        assert_eq!(
+            search_url("baidu", "中国"),
+            "https://www.baidu.com/s?wd=%E4%B8%AD%E5%9B%BD"
+        );
+        // An unknown key still produces a working default lookup.
+        assert_eq!(search_url("nope", "x"), "https://www.google.com/search?q=x");
+        assert_eq!(search_engine_label("baidu"), "百度");
+        assert_eq!(search_engine_label("nope"), "nope");
     }
 
     /// A tab layout this build cannot rebuild used to fail the whole parse,

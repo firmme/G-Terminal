@@ -6,7 +6,7 @@
 //! `sh` — so the quoting in a prompt or a public key cannot leak into the
 //! wrapper that carries it.
 
-use crate::{remote_ui::hint, theme::Palette};
+use crate::{editing, remote_ui::hint, theme::Palette};
 use eframe::egui::{self, RichText};
 use g_terminal::config::RemoteProfile;
 use std::path::{Path, PathBuf};
@@ -217,10 +217,9 @@ impl Toolbox {
                 });
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.timezone_on, "设置时区");
-                    ui.add_enabled(
-                        self.timezone_on,
-                        egui::TextEdit::singleline(&mut self.timezone).desired_width(160.0),
-                    );
+                    editing::field_enabled_with(ui, self.timezone_on, &mut self.timezone, |edit| {
+                        edit.desired_width(160.0)
+                    });
                 });
                 ui.checkbox(&mut self.ipv6, "关闭 IPv6");
                 ui.separator();

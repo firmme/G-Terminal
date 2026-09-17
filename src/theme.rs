@@ -199,6 +199,17 @@ impl FontFile {
     }
 }
 
+/// The first of `paths` that exists on disk, or the first entry when none do.
+/// The caller only opens what this returns, and a path that is absent is
+/// skipped, so an empty result would silently drop the CJK fallback.
+fn first_existing(paths: &[&'static str]) -> &'static str {
+    paths
+        .iter()
+        .copied()
+        .find(|path| std::path::Path::new(path).is_file())
+        .unwrap_or(paths[0])
+}
+
 pub fn load_fonts(ctx: &egui::Context) {
     // File-backed pages are faulted in on demand, rather than reading the whole
     // ~19 MiB CJK collection into a private heap allocation at startup.
@@ -212,9 +223,22 @@ pub fn load_fonts(ctx: &egui::Context) {
                 ("cjk", "C:/Windows/Fonts/msyh.ttc", false),
             ]
         } else if cfg!(target_os = "macos") {
+            // macOS moved PingFang into the on-demand asset store, so the
+            // historical /System/Library/Fonts path is empty on current
+            // releases. A missing CJK face leaves every Chinese label as tofu,
+            // so the known locations are probed instead of assumed.
             vec![
                 ("mono", "/System/Library/Fonts/Menlo.ttc", true),
-                ("cjk", "/System/Library/Fonts/PingFang.ttc", false),
+                (
+                    "cjk",
+                    first_existing(&[
+                        "/System/Library/Fonts/PingFang.ttc",
+                        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                        "/System/Library/Fonts/STHeiti Medium.ttc",
+                        "/System/Library/Fonts/Supplemental/Songti.ttc",
+                    ]),
+                    false,
+                ),
             ]
         } else {
             vec![
