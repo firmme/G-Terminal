@@ -2934,8 +2934,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::from_settings(&ctx, Settings::default(), None, None);
         let size = Vec2::new(1280.0, 800.0);
+        // `command` is what the accelerators are written against: it is Ctrl
+        // on Windows and Cmd on macOS, and egui-winit sets both for Ctrl.
         let mods = Modifiers {
             ctrl: true,
+            command: true,
             shift: true,
             ..Default::default()
         };
