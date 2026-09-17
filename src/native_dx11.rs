@@ -87,7 +87,7 @@ impl ApplicationHandler<Event> for Runner {
                         .with_visible(false)
                         .with_window_icon(window_icon())
                         .with_inner_size(LogicalSize::new(1280., 800.))
-                        .with_min_inner_size(LogicalSize::new(760., 480.)),
+                        .with_min_inner_size(LogicalSize::new(400., 300.)),
                 )?,
             );
             Native::new(

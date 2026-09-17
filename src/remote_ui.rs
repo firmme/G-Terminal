@@ -3,6 +3,7 @@ use eframe::egui::{self, RichText};
 use g_terminal::{
     config::RemoteProfile,
     remote::{self, ConnectJob, Connection, Credentials, Direction, Transfer},
+    terminal::Terminal,
     ztransfer,
 };
 use std::{
@@ -32,9 +33,14 @@ pub struct Login {
     /// "needs a password" rather than as an error — needing one is the normal
     /// case, not a fault.
     quiet: bool,
+    /// The pane console this connection's failures are mirrored into, so a
+    /// message that outlives the dialog still says which session it belongs to.
+    console: Option<Arc<Mutex<Terminal>>>,
+    /// The last failure already mirrored there.
+    noted: Option<String>,
 }
 impl Login {
-    pub fn new(profile: RemoteProfile) -> Self {
+    pub fn new(profile: RemoteProfile, console: Option<Arc<Mutex<Terminal>>>) -> Self {
         Self {
             profile,
             credentials: Credentials::default(),
@@ -42,6 +48,8 @@ impl Login {
             error: None,
             auto: true,
             quiet: false,
+            console,
+            noted: None,
         }
     }
     pub fn show(
@@ -82,6 +90,19 @@ impl Login {
                     }
                     if let Some(error) = &state.error {
                         self.error = Some(error.clone());
+                        // Mirror a real failure into the pane. The passwordless
+                        // first attempt failing just means credentials are
+                        // needed, which is not an error worth writing down, and
+                        // `noted` keeps one failure from being written twice.
+                        if !self.quiet && self.noted.as_deref() != Some(error.as_str()) {
+                            self.noted = Some(error.clone());
+                            if let Some(console) = &self.console {
+                                console
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .note_error(&format!("[错误] connect failed: {error}"));
+                            }
+                        }
                     }
                     if let Some(trust) = &mut state.trust {
                         ui.colored_label(p.accent, "首次连接：确认服务器公钥指纹");

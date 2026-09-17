@@ -33,7 +33,7 @@ fn real_powershell_roundtrip_resize_unicode_and_exit() {
     wait_until(&session, Duration::from_secs(15), |s| {
         s.contents().contains("PS ")
     });
-    session.resize(35, 110).unwrap();
+    session.resize(35, 110);
     wait_until(&session, Duration::from_secs(5), |s| s.size() == (35, 110));
     session.write("Write-Output ('ROUND' + 'TRIP_OK'); Write-Output ([char]0x4F60 + [string][char]0x597D)\r".as_bytes().to_vec()).unwrap();
     wait_until(&session, Duration::from_secs(10), |s| {

@@ -653,7 +653,7 @@ fn native_ssh_sftp_resume_proxyjump_and_forwarding() {
                 .await
                 .is_err()
             );
-            let session = crate::session::Session::from_remote(connection.clone(), 100, wake);
+            let session = crate::session::Session::from_remote(connection.clone(), 100, wake, None);
             session.write(b"SSH-INPUT".to_vec()).unwrap();
             let start = std::time::Instant::now();
             loop {

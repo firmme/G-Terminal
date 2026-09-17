@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "g-terminal"
-version = "0.2.2"
+version = "0.3.2"
 dependencies = [
  "accesskit_winit",
  "anyhow",
@@ -1872,12 +1872,14 @@ dependencies = [
  "russh-sftp",
  "serde",
  "serde_json",
+ "serial2",
  "sha2 0.10.9",
  "tokio",
  "vt100",
  "wgpu",
  "windows 0.62.2",
  "winit",
+ "winreg",
  "zeroize",
  "zmodem2",
 ]

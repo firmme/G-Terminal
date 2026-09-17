@@ -25,6 +25,25 @@ pub struct Pane {
     clicks: u8,
     click_time: f64,
     click_cell: (u16, u16),
+    /// What the last copy or paste moved, handed to the app for the status bar.
+    pub notice: Option<String>,
+}
+
+/// The message a copy or paste leaves behind.
+fn moved_message(verb: &str, text: &str) -> String {
+    format!("已{verb} {} 个字符", text.chars().count())
+}
+
+/// The bytes a wheel notch sends to a full-screen program. A program that has
+/// switched the cursor keys to application mode — `less` does, through terminfo's
+/// `smkx` — expects `SS3 A/B`; sending `CSI A/B` there scrolls nothing at all.
+fn alternate_scroll_key(lines: i32, application_cursor: bool) -> &'static [u8] {
+    match (lines > 0, application_cursor) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    }
 }
 
 /// What a run of consecutive clicks on the same cell asks for.
@@ -77,16 +96,8 @@ impl Pane {
             clicks: 0,
             click_time: 0.0,
             click_cell: (0, 0),
+            notice: None,
         }
-    }
-
-    pub fn selected_text(&self) -> String {
-        let terminal = self.session.terminal.lock().unwrap();
-        let screen = terminal.parser.screen();
-        let Some((start, end)) = self.selection else {
-            return String::new();
-        };
-        selection_text(screen, start, end)
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, options: ViewOptions<'_>) -> (bool, Option<String>) {
@@ -125,9 +136,7 @@ impl Pane {
         let content = rect.shrink(4.0);
         let rows = (content.height() / cell.y).floor().clamp(1.0, 500.0) as u16;
         let cols = (content.width() / cell.x).floor().clamp(1.0, 1000.0) as u16;
-        if let Err(e) = self.session.resize(rows, cols) {
-            error = Some(e.to_string());
-        }
+        self.session.resize(rows, cols);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0, palette.bg);
         painter.rect_stroke(
@@ -155,6 +164,7 @@ impl Pane {
         };
         let mut outgoing = Vec::<Vec<u8>>::new();
         let mut copied = None;
+        let mut notice = None;
         let mut terminal = self.session.terminal.lock().unwrap();
         let mouse_mode = terminal.parser.screen().mouse_protocol_mode();
         let mouse_encoding = terminal.parser.screen().mouse_protocol_encoding();
@@ -182,6 +192,16 @@ impl Pane {
                                 mouse_encoding,
                             ));
                         }
+                    }
+                } else if terminal.parser.screen().alternate_screen() {
+                    // A full-screen program owns the screen and usually has no
+                    // scrollback to move, so the wheel is handed to it as arrow
+                    // keys — xterm's "alternate scroll", which is what makes
+                    // `less` and friends follow the wheel.
+                    let key =
+                        alternate_scroll_key(lines, terminal.parser.screen().application_cursor());
+                    for _ in 0..lines.unsigned_abs().min(32) {
+                        outgoing.push(key.to_vec());
                     }
                 } else {
                     terminal.scroll(lines);
@@ -274,10 +294,13 @@ impl Pane {
         }
         if response.clicked_by(egui::PointerButton::Middle) {
             match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-                Ok(text) => outgoing.push(encode_paste(
-                    &text,
-                    terminal.parser.screen().bracketed_paste(),
-                )),
+                Ok(text) => {
+                    notice = Some(moved_message("粘贴", &text));
+                    outgoing.push(encode_paste(
+                        &text,
+                        terminal.parser.screen().bracketed_paste(),
+                    ));
+                }
                 Err(e) => error = Some(e.to_string()),
             }
         }
@@ -352,10 +375,13 @@ impl Pane {
                         }
                     }
                     Event::Cut => outgoing.push(vec![24]),
-                    Event::Paste(text) => outgoing.push(encode_paste(
-                        &text,
-                        terminal.parser.screen().bracketed_paste(),
-                    )),
+                    Event::Paste(text) => {
+                        notice = Some(moved_message("粘贴", &text));
+                        outgoing.push(encode_paste(
+                            &text,
+                            terminal.parser.screen().bracketed_paste(),
+                        ));
+                    }
                     Event::Text(text) if !self.composing => {
                         let alt = ui.input(|i| i.modifiers.alt && !i.modifiers.ctrl);
                         let mut bytes = text.into_bytes();
@@ -389,10 +415,13 @@ impl Pane {
                             }
                         } else if modifiers.ctrl && modifiers.shift && key == Key::V {
                             match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-                                Ok(text) => outgoing.push(encode_paste(
-                                    &text,
-                                    terminal.parser.screen().bracketed_paste(),
-                                )),
+                                Ok(text) => {
+                                    notice = Some(moved_message("粘贴", &text));
+                                    outgoing.push(encode_paste(
+                                        &text,
+                                        terminal.parser.screen().bracketed_paste(),
+                                    ));
+                                }
                                 Err(e) => error = Some(format!("无法读取剪贴板：{e}")),
                             }
                         } else if modifiers.shift && matches!(key, Key::PageUp | Key::PageDown) {
@@ -630,21 +659,32 @@ impl Pane {
         });
         drop(terminal);
         if let Some(text) = copied {
+            notice = Some(moved_message("复制", &text));
             ui.ctx().copy_text(text);
         }
+        let selection = self.selection;
         if !mouse {
             response.context_menu(|ui| {
                 if ui.button("复制选中内容   Ctrl+Shift+C").clicked() {
-                    ui.ctx().copy_text(self.selected_text());
+                    if let Some((a, b)) = selection {
+                        let text = {
+                            let terminal = self.session.terminal.lock().unwrap();
+                            selection_text(terminal.parser.screen(), a, b)
+                        };
+                        notice = Some(moved_message("复制", &text));
+                        ui.ctx().copy_text(text);
+                    }
                     ui.close();
                 }
                 if ui.button("复制可见屏幕").clicked() {
+                    notice = Some(moved_message("复制", &visible_text));
                     ui.ctx().copy_text(visible_text);
                     ui.close();
                 }
                 if ui.button("粘贴   Ctrl+Shift+V").clicked() {
                     match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
                         Ok(text) => {
+                            notice = Some(moved_message("粘贴", &text));
                             let bracketed = self
                                 .session
                                 .terminal
@@ -663,16 +703,28 @@ impl Pane {
                     self.session.terminal.lock().unwrap().bottom();
                     ui.close();
                 }
+                ui.separator();
+                // Ways to tidy up: 清屏 keeps the scrollback, 清空 throws the
+                // whole transcript away, and images are dropped on their own.
+                if ui.button("清屏").clicked() {
+                    self.session.terminal.lock().unwrap().clear_screen();
+                    ui.close();
+                }
+                if ui.button("清空所有控制台输出").clicked() {
+                    self.session.terminal.lock().unwrap().clear_all();
+                    ui.close();
+                }
+                if ui.button("清除内联图片").clicked() {
+                    self.session.terminal.lock().unwrap().graphics.clear();
+                    self.graphic = None;
+                    ui.close();
+                }
             });
         }
+        self.notice = notice;
         for bytes in outgoing {
             if let Err(e) = self.session.write(bytes) {
                 error = Some(e.to_string());
-            }
-            if ui.button("清除内联图片").clicked() {
-                self.session.terminal.lock().unwrap().graphics.clear();
-                self.graphic = None;
-                ui.close();
             }
         }
         (
@@ -711,6 +763,16 @@ fn selection_text(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `less` turns on application cursor keys, and then only the SS3 spelling
+    /// of the arrows moves it — the CSI one scrolls nothing.
+    #[test]
+    fn alternate_scroll_respects_the_application_cursor_mode() {
+        assert_eq!(alternate_scroll_key(1, false), b"\x1b[A");
+        assert_eq!(alternate_scroll_key(-1, false), b"\x1b[B");
+        assert_eq!(alternate_scroll_key(1, true), b"\x1bOA");
+        assert_eq!(alternate_scroll_key(-1, true), b"\x1bOB");
+    }
 
     #[test]
     fn drag_selection_can_copy_automatically_without_touching_system_clipboard() {

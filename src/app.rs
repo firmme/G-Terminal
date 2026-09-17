@@ -6,18 +6,40 @@ use crate::{
 };
 use eframe::egui::{self, Align, Key, Layout, Rect, RichText, Sense};
 use g_terminal::{
-    config::{Forward, RemoteProfile, Settings},
+    config::{BAUD_RATES, DEFAULT_BAUD, Forward, RemoteProfile, SerialProfile, Settings},
     layout::{Axis, Layout as PaneLayout, SavedTab},
     remote::Connection,
+    serial,
     session::{Session, SessionKind, SessionStatus},
+    terminal::Terminal,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 struct Tab {
     id: u64,
     panes: Vec<Pane>,
     focused: usize,
     layout: PaneLayout,
+    /// Bytes received by this tab's panes the last time it was on screen. A
+    /// background tab whose panes have read more since is showing new output,
+    /// which the strip underlines until it is looked at again.
+    seen_output: u64,
+}
+
+/// Bytes received by every pane of a tab, which only ever grows while a session
+/// is live.
+fn tab_output(tab: &Tab) -> u64 {
+    use std::sync::atomic::Ordering;
+    tab.panes
+        .iter()
+        .map(|pane| pane.session.traffic.down.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Whether a tab holds output the user has not looked at yet. The active tab is
+/// being looked at by definition, so it is never marked.
+fn tab_updated(tab: &Tab, active: bool) -> bool {
+    !active && tab_output(tab) > tab.seen_output
 }
 #[derive(Clone)]
 enum Action {
@@ -26,10 +48,129 @@ enum Action {
     CloseTab(usize),
     ClosePane,
     Restart,
+    Disconnect,
     Remote,
     Edit(usize),
     Remove(usize),
+    SerialPicker,
+    EditSerial(usize),
+    RemoveSerial(usize),
+    Toolbox,
     Files,
+}
+
+/// Which protocol the connection form is editing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileKind {
+    Ssh,
+    Serial,
+}
+
+/// State of the one-off serial picker opened from 本地 Shell.
+struct SerialPicker {
+    ports: Vec<serial::SerialPortInfo>,
+    port: String,
+    baud: u32,
+}
+
+impl SerialPicker {
+    fn new() -> Self {
+        let ports = serial::available_ports();
+        let port = ports
+            .first()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "auto".into());
+        Self {
+            ports,
+            port,
+            baud: DEFAULT_BAUD,
+        }
+    }
+
+    /// Re-reads the device list, keeping the current choice when it is still
+    /// attached.
+    fn refresh(&mut self) {
+        self.ports = serial::available_ports();
+        if self.ports.is_empty() {
+            self.port = "auto".into();
+        } else if !self.ports.iter().any(|p| p.name == self.port) {
+            self.port = self.ports[0].name.clone();
+        }
+    }
+}
+
+/// How long a status-bar message stays on screen.
+const TOAST_LIFETIME: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Turns a pane's byte counters into a smoothed per-second rate. The counters
+/// are cumulative, so a rate is the difference since the last sample.
+#[derive(Default)]
+struct RateMeter {
+    pane: Option<u64>,
+    at: Option<std::time::Instant>,
+    up: u64,
+    down: u64,
+    up_per_sec: f64,
+    down_per_sec: f64,
+}
+
+/// Traffic this quiet counts as idle, so the arrows settle back to grey.
+const TRAFFIC_IDLE: f64 = 1.0;
+
+impl RateMeter {
+    /// Samples a pane, returning whether the rates are still worth animating.
+    ///
+    /// Every frame samples, rather than waiting for a fixed interval: a short
+    /// burst has to light the arrows on the frames it causes, and those are the
+    /// only frames guaranteed to happen.
+    fn sample(&mut self, pane: u64, up: u64, down: u64) -> bool {
+        let now = std::time::Instant::now();
+        if self.pane == Some(pane) {
+            let seconds = self
+                .at
+                .map(|at| now.duration_since(at).as_secs_f64())
+                .unwrap_or(0.0)
+                .max(0.001);
+            let up_rate = up.saturating_sub(self.up) as f64 / seconds;
+            let down_rate = down.saturating_sub(self.down) as f64 / seconds;
+            // Averaging over the last few samples keeps the arrows from
+            // flickering while still falling back to idle when traffic stops.
+            self.up_per_sec = self.up_per_sec * 0.5 + up_rate * 0.5;
+            self.down_per_sec = self.down_per_sec * 0.5 + down_rate * 0.5;
+        } else {
+            self.pane = Some(pane);
+            self.up_per_sec = 0.0;
+            self.down_per_sec = 0.0;
+        }
+        self.at = Some(now);
+        self.up = up;
+        self.down = down;
+        self.up_per_sec > TRAFFIC_IDLE || self.down_per_sec > TRAFFIC_IDLE
+    }
+
+    fn clear(&mut self) {
+        let pane = self.pane;
+        *self = Self {
+            pane,
+            ..Self::default()
+        };
+    }
+}
+
+/// Bytes per second as an adaptive bit rate, which is how a link is described.
+fn format_bitrate(bytes_per_sec: f64) -> String {
+    const UNITS: [&str; 4] = ["bps", "Kbps", "Mbps", "Gbps"];
+    let mut value = (bytes_per_sec * 8.0).max(0.0);
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 pub struct App {
     settings: Settings,
@@ -42,13 +183,26 @@ pub struct App {
     help_open: bool,
     groups_open: bool,
     remote: RemoteProfile,
+    serial: SerialProfile,
+    /// Ports detected when the connection form or the picker was opened.
+    serial_ports: Vec<serial::SerialPortInfo>,
+    /// Set while the 本地 Shell serial picker is open.
+    serial_picker: Option<SerialPicker>,
+    /// Set while the server toolbox is open.
+    toolbox: Option<crate::toolbox::Toolbox>,
+    /// Which tab of the 连接配置 window is in front.
+    profile_kind: ProfileKind,
     editing_profile: Option<usize>,
+    editing_serial: Option<usize>,
     new_group: String,
     search_open: bool,
     search: String,
     search_focus: bool,
     search_hits: Vec<(usize, u16)>,
     search_index: usize,
+    /// A short message shown in the status bar, e.g. how much was copied.
+    toast: Option<(String, std::time::Instant)>,
+    rates: RateMeter,
     error: Option<String>,
     login: Option<Login>,
     login_target: Option<(u64, u64)>,
@@ -90,13 +244,21 @@ impl App {
             help_open: false,
             groups_open: false,
             remote: RemoteProfile::default(),
+            serial: SerialProfile::default(),
+            serial_ports: Vec::new(),
+            serial_picker: None,
+            toolbox: None,
+            profile_kind: ProfileKind::Ssh,
             editing_profile: None,
+            editing_serial: None,
             new_group: String::new(),
             search_open: false,
             search: String::new(),
             search_focus: false,
             search_hits: vec![],
             search_index: 0,
+            toast: None,
+            rates: RateMeter::default(),
             error,
             login: None,
             login_target: None,
@@ -119,22 +281,194 @@ impl App {
         app
     }
     fn spawn(&mut self, kind: SessionKind, ctx: &egui::Context) -> Option<Pane> {
-        match Session::spawn(kind, self.settings.scrollback, remote_ui::wake(ctx)) {
+        self.respawn(kind, None, ctx)
+    }
+    /// The pane with this id, if it still exists.
+    fn locate(&self, tab_id: u64, pane_id: u64) -> Option<(usize, usize)> {
+        let tab = self.tabs.iter().position(|t| t.id == tab_id)?;
+        let pane = self.tabs[tab].panes.iter().position(|p| p.id == pane_id)?;
+        Some((tab, pane))
+    }
+    fn terminal_of(&self, tab_id: u64, pane_id: u64) -> Option<Arc<Mutex<Terminal>>> {
+        let (tab, pane) = self.locate(tab_id, pane_id)?;
+        Some(self.tabs[tab].panes[pane].session.terminal.clone())
+    }
+    /// The profile and `user@host:port` of the focused pane, when it is a live
+    /// SSH session — which is the only thing the server toolbox can act on.
+    fn focused_ssh(&self) -> Option<(RemoteProfile, String)> {
+        let tab = self.tabs.get(self.active)?;
+        let session = &tab.panes.get(tab.focused)?.session;
+        if session.remote.is_none() || session.link() != SessionStatus::Live {
+            return None;
+        }
+        match &session.kind {
+            SessionKind::Ssh(profile) => Some((
+                profile.clone(),
+                format!("{}:{}", profile.destination(), profile.port),
+            )),
+            _ => None,
+        }
+    }
+    /// Puts a tab on screen before its connection is attempted, so the
+    /// connection's own notices and failures have a console that clearly
+    /// belongs to this session.
+    fn open_connecting_tab(&mut self, kind: SessionKind) -> (u64, u64) {
+        self.next_id += 1;
+        let pane = Pane::new(
+            self.next_id,
+            Session::connecting(kind, self.settings.scrollback),
+        );
+        let ids = (pane.id, pane.id);
+        self.tabs.push(Tab {
+            id: pane.id,
+            panes: vec![pane],
+            focused: 0,
+            layout: PaneLayout::Leaf(0),
+            seen_output: 0,
+        });
+        self.active = self.tabs.len() - 1;
+        ids
+    }
+    /// States what is about to be connected to, after blank lines that keep it
+    /// apart from the previous run of output. A screen with nothing on it is
+    /// left alone, so a brand new pane does not start with empty lines.
+    fn announce(&self, tab_id: u64, pane_id: u64, target: Option<&str>) {
+        let Some(terminal) = self.terminal_of(tab_id, pane_id) else {
+            return;
+        };
+        let mut terminal = terminal.lock().unwrap_or_else(|e| e.into_inner());
+        if !terminal.parser.screen().contents().trim().is_empty() {
+            terminal.separator();
+        }
+        if let Some(target) = target {
+            terminal.note(&format!("connect to {target}"));
+        }
+    }
+    /// Shows a short message in the status bar.
+    fn notify(&mut self, text: impl Into<String>) {
+        self.toast = Some((text.into(), std::time::Instant::now()));
+    }
+    /// Whether any pane on screen is still waiting for its connection.
+    fn connecting(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| t.panes.iter().any(|p| p.session.pending()))
+    }
+    /// Feeds the focused pane's byte counters into the rate meter, returning
+    /// whether the numbers still need frames to settle.
+    fn sample_rates(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(pane) = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(t.focused))
+        else {
+            self.rates.clear();
+            return false;
+        };
+        if pane.session.pending() {
+            self.rates.clear();
+            return false;
+        }
+        let up = pane.session.traffic.up.load(Ordering::Relaxed);
+        let down = pane.session.traffic.down.load(Ordering::Relaxed);
+        self.rates.sample(pane.id, up, down)
+    }
+    fn note(&self, tab_id: u64, pane_id: u64, line: &str) {
+        if let Some(terminal) = self.terminal_of(tab_id, pane_id) {
+            terminal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .note(line);
+        }
+    }
+    /// Starts a session, optionally inheriting the screen of the one it
+    /// replaces so a reconnect keeps the previous output.
+    fn respawn(
+        &mut self,
+        kind: SessionKind,
+        previous: Option<Arc<Mutex<Terminal>>>,
+        ctx: &egui::Context,
+    ) -> Option<Pane> {
+        match Session::spawn_reusing(
+            kind,
+            self.settings.scrollback,
+            remote_ui::wake(ctx),
+            previous.clone(),
+        ) {
             Ok(s) => {
                 self.next_id += 1;
                 Some(Pane::new(self.next_id, s))
             }
             Err(e) => {
-                self.error = Some(format!("{e:#}"));
+                let message = format!("{e:#}");
+                match &previous {
+                    // The failure belongs to the console of the pane it is
+                    // about, not to a status line shared by every session.
+                    Some(terminal) => terminal
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .note_error(&format!("[错误] connect failed: {message}")),
+                    None => self.error = Some(message),
+                }
                 None
             }
         }
     }
+    /// Connects into a pane that already exists, writing the outcome into that
+    /// pane's own console.
+    fn connect_pane(&mut self, tab_id: u64, pane_id: u64, kind: SessionKind, ctx: &egui::Context) {
+        let previous = self.terminal_of(tab_id, pane_id);
+        let target = connect_target(&kind);
+        self.announce(tab_id, pane_id, target.as_deref());
+        match self.respawn(kind.clone(), previous, ctx) {
+            Some(pane) => {
+                if let Some((tab, index)) = self.locate(tab_id, pane_id) {
+                    self.tabs[tab].panes[index] = pane;
+                    self.tabs[tab].focused = index;
+                    // A shell starts a program rather than connecting, so there
+                    // is nothing to call connected.
+                    if target.is_some() {
+                        self.tabs[tab].panes[index].session.note("connected");
+                    }
+                    self.active = tab;
+                }
+            }
+            None => {
+                // The failure is already in the console; leave a pane that
+                // offers a retry instead of a dead one.
+                if let Some((tab, index)) = self.locate(tab_id, pane_id) {
+                    let terminal = self.tabs[tab].panes[index].session.terminal.clone();
+                    self.tabs[tab].panes[index] = Pane::new(
+                        pane_id,
+                        Session::disconnected_reusing(
+                            kind,
+                            self.settings.scrollback,
+                            Some(terminal),
+                        ),
+                    );
+                    self.tabs[tab].focused = index;
+                    self.active = tab;
+                }
+            }
+        }
+    }
     fn add_connection(&mut self, connection: Arc<Connection>, ctx: &egui::Context) {
+        // A reconnect reuses the pane's screen, so the output seen before the
+        // drop stays in the scrollback. `login_target` names the pane the new
+        // session is about to replace.
+        let previous = self
+            .login_target
+            .and_then(|(tab_id, pane_id)| self.terminal_of(tab_id, pane_id));
         self.next_id += 1;
         let pane = Pane::new(
             self.next_id,
-            Session::from_remote(connection, self.settings.scrollback, remote_ui::wake(ctx)),
+            Session::from_remote(
+                connection,
+                self.settings.scrollback,
+                remote_ui::wake(ctx),
+                previous,
+            ),
         );
         if let Some((tab_id, pane_id)) = self.login_target.take()
             && let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id)
@@ -142,6 +476,7 @@ impl App {
         {
             t.panes[index] = pane;
             t.focused = index;
+            t.panes[index].session.note("connected");
             return;
         }
         self.tabs.push(Tab {
@@ -149,6 +484,7 @@ impl App {
             panes: vec![pane],
             focused: 0,
             layout: PaneLayout::Leaf(0),
+            seen_output: 0,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -165,8 +501,16 @@ impl App {
     }
     fn persist(&mut self) {
         self.snapshot();
-        if let Err(e) = self.settings.save() {
-            self.error = Some(format!("{e:#}"));
+        // A test must never write the real settings file. An app test that adds
+        // or removes a connection calls this, and without the guard it replaced
+        // the user's saved profiles with the test's own defaults — which is
+        // exactly how connections were lost. The guard is what keeps that from
+        // happening again, so it stays even though tests do not check the file.
+        #[cfg(not(test))]
+        {
+            if let Err(e) = self.settings.save() {
+                self.error = Some(format!("{e:#}"));
+            }
         }
     }
     fn restore(&mut self, ctx: &egui::Context) {
@@ -199,25 +543,29 @@ impl App {
                     focused: saved.focused.min(panes.len() - 1),
                     panes,
                     layout: saved.layout,
+                    seen_output: 0,
                 });
             }
         }
     }
     fn execute(&mut self, action: Action, ctx: &egui::Context) {
         match action {
-            Action::New(SessionKind::Ssh(p)) | Action::New(SessionKind::Sftp(p)) => {
-                self.login_target = None;
-                self.login = Some(Login::new(p))
-            }
             Action::New(kind) => {
-                if let Some(pane) = self.spawn(kind, ctx) {
-                    self.tabs.push(Tab {
-                        id: pane.id,
-                        panes: vec![pane],
-                        focused: 0,
-                        layout: PaneLayout::Leaf(0),
-                    });
-                    self.active = self.tabs.len() - 1;
+                // The tab exists before the connection does, so the connection's
+                // notices and failures land in its own console.
+                let (tab_id, pane_id) = self.open_connecting_tab(kind.clone());
+                match kind {
+                    SessionKind::Ssh(p) | SessionKind::Sftp(p) => {
+                        self.login_target = Some((tab_id, pane_id));
+                        self.announce(
+                            tab_id,
+                            pane_id,
+                            Some(&format!("{}:{}", p.destination(), p.port)),
+                        );
+                        let console = self.terminal_of(tab_id, pane_id);
+                        self.login = Some(Login::new(p, console));
+                    }
+                    kind => self.connect_pane(tab_id, pane_id, kind, ctx),
                 }
             }
             Action::Split(axis) => {
@@ -234,7 +582,12 @@ impl App {
                         self.next_id += 1;
                         Some(Pane::new(
                             self.next_id,
-                            Session::from_remote(c, self.settings.scrollback, remote_ui::wake(ctx)),
+                            Session::from_remote(
+                                c,
+                                self.settings.scrollback,
+                                remote_ui::wake(ctx),
+                                None,
+                            ),
                         ))
                     } else {
                         self.spawn(SessionKind::Local(self.settings.default_shell.clone()), ctx)
@@ -272,30 +625,103 @@ impl App {
             }
             Action::Restart => {
                 if let Some(t) = self.tabs.get(self.active) {
+                    let tab_id = t.id;
                     let kind = t.panes[t.focused].session.kind.clone();
+                    let pane_id = t.panes[t.focused].id;
+                    // The screen outlives the session so the replacement can
+                    // carry the scrollback over; the Arc keeps it alive while
+                    // the old session is dropped.
+                    let previous = Some(t.panes[t.focused].session.terminal.clone());
                     if let SessionKind::Ssh(p) | SessionKind::Sftp(p) = kind {
-                        self.login_target = Some((t.id, t.panes[t.focused].id));
-                        self.login = Some(Login::new(p));
-                    } else if let Some(p) = self.spawn(kind, ctx) {
-                        let t = &mut self.tabs[self.active];
-                        t.panes[t.focused] = p;
+                        self.login_target = Some((tab_id, pane_id));
+                        self.announce(
+                            tab_id,
+                            pane_id,
+                            Some(&format!("{}:{}", p.destination(), p.port)),
+                        );
+                        let console = self.terminal_of(tab_id, pane_id);
+                        self.login = Some(Login::new(p, console));
+                    } else {
+                        // Drop the old session before starting the replacement:
+                        // a serial device is exclusive, and a shell is killed
+                        // so its leftover output cannot land in the screen that
+                        // is about to be reused.
+                        let index = self.tabs[self.active].focused;
+                        self.tabs[self.active].panes[index] = Pane::new(
+                            pane_id,
+                            Session::disconnected_reusing(
+                                kind.clone(),
+                                self.settings.scrollback,
+                                previous,
+                            ),
+                        );
+                        self.connect_pane(tab_id, pane_id, kind, ctx);
+                    }
+                }
+            }
+            Action::Disconnect => {
+                if let Some(tab) = self.tabs.get(self.active) {
+                    let pane = &tab.panes[tab.focused];
+                    let pending = pane.session.pending();
+                    let kind = pane.session.kind.clone();
+                    let pane_id = pane.id;
+                    let terminal = pane.session.terminal.clone();
+                    // A pane that has not connected yet is already "disconnected";
+                    // a live one is dropped while its screen is kept, so the
+                    // output stays readable and Alt+R can bring it back.
+                    if !pending {
+                        let index = self.tabs[self.active].focused;
+                        self.tabs[self.active].panes[index]
+                            .session
+                            .note("已断开（Alt+R 重连）");
+                        self.tabs[self.active].panes[index] = Pane::new(
+                            pane_id,
+                            Session::disconnected_reusing(
+                                kind,
+                                self.settings.scrollback,
+                                Some(terminal),
+                            ),
+                        );
                     }
                 }
             }
             Action::Remote => {
                 self.remote = RemoteProfile::default();
+                self.serial = SerialProfile::default();
+                self.serial_ports = serial::available_ports();
+                self.profile_kind = ProfileKind::Ssh;
                 self.editing_profile = None;
+                self.editing_serial = None;
                 self.remote_open = true;
             }
             Action::Edit(i) => {
                 self.remote = self.settings.profiles[i].clone();
+                self.profile_kind = ProfileKind::Ssh;
                 self.editing_profile = Some(i);
+                self.editing_serial = None;
+                self.remote_open = true;
+            }
+            Action::EditSerial(i) => {
+                self.serial = self.settings.serial_profiles[i].clone();
+                self.serial_ports = serial::available_ports();
+                self.profile_kind = ProfileKind::Serial;
+                self.editing_serial = Some(i);
+                self.editing_profile = None;
                 self.remote_open = true;
             }
             Action::Remove(i) => {
                 self.settings.profiles.remove(i);
                 self.persist();
             }
+            Action::RemoveSerial(i) => {
+                self.settings.serial_profiles.remove(i);
+                self.persist();
+            }
+            Action::SerialPicker => self.serial_picker = Some(SerialPicker::new()),
+            Action::Toolbox => match self.focused_ssh() {
+                Some((profile, _)) => self.toolbox = Some(crate::toolbox::Toolbox::new(&profile)),
+                None => self.error = Some("服务器工具箱仅用于已连接的 SSH 会话".into()),
+            },
             Action::Files => {
                 if let Some(c) = self
                     .tabs
@@ -336,67 +762,89 @@ impl App {
         }
         let mut action = None;
         ctx.input_mut(|i| {
+            // A handled shortcut also produces a text event — egui-winit only
+            // filters those out for Ctrl, not for Alt, so Alt+R arrives as a key
+            // *and* as `Text("r")`. Left alone, that text would be typed into the
+            // terminal (and, on an ended session, reported as a write error).
+            let mut handled = false;
             i.events.retain(|e| {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = e
-                {
-                    if modifiers.ctrl && modifiers.shift {
-                        match key {
-                            Key::T => {
-                                action = Some(Action::New(SessionKind::Local(
-                                    self.settings.default_shell.clone(),
-                                )))
-                            }
-                            Key::W => action = Some(Action::ClosePane),
-                            Key::D => action = Some(Action::Split(Axis::Horizontal)),
-                            Key::E => action = Some(Action::Split(Axis::Vertical)),
-                            Key::F => {
-                                self.search_open = !self.search_open;
-                                self.search_focus = self.search_open;
-                            }
-                            Key::B => self.settings.sidebar = !self.settings.sidebar,
-                            _ => return true,
-                        }
-                        return false;
-                    }
-                    if modifiers.ctrl && *key == Key::Tab {
-                        if !self.tabs.is_empty() {
-                            self.active = (self.active + 1) % self.tabs.len();
-                        }
-                        return false;
-                    }
-                    if modifiers.ctrl && *key == Key::Comma {
-                        self.settings_open = true;
-                        return false;
-                    }
-                    if modifiers.alt && *key == Key::ArrowRight {
-                        if let Some(t) = self.tabs.get_mut(self.active) {
-                            t.focused = (t.focused + 1) % t.panes.len();
-                        }
-                        return false;
-                    }
-                    if modifiers.ctrl
-                        && matches!(key, Key::Plus | Key::Equals | Key::Minus | Key::Num0)
+                let keep = (|| {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = e
                     {
-                        self.settings.font_size = match key {
-                            Key::Minus => self.settings.font_size - 1.0,
-                            Key::Num0 => 15.0,
-                            _ => self.settings.font_size + 1.0,
+                        if modifiers.ctrl && modifiers.shift {
+                            match key {
+                                Key::T => {
+                                    action = Some(Action::New(SessionKind::Local(
+                                        self.settings.default_shell.clone(),
+                                    )))
+                                }
+                                Key::W => action = Some(Action::ClosePane),
+                                Key::D => action = Some(Action::Split(Axis::Horizontal)),
+                                Key::E => action = Some(Action::Split(Axis::Vertical)),
+                                Key::F => {
+                                    self.search_open = !self.search_open;
+                                    self.search_focus = self.search_open;
+                                }
+                                Key::B => self.settings.sidebar = !self.settings.sidebar,
+                                _ => return true,
+                            }
+                            return false;
                         }
-                        .clamp(10.0, 28.0);
-                        return false;
+                        if modifiers.ctrl && *key == Key::Tab {
+                            if !self.tabs.is_empty() {
+                                self.active = (self.active + 1) % self.tabs.len();
+                            }
+                            return false;
+                        }
+                        if modifiers.ctrl && *key == Key::Comma {
+                            self.settings_open = true;
+                            return false;
+                        }
+                        if modifiers.alt && *key == Key::ArrowRight {
+                            if let Some(t) = self.tabs.get_mut(self.active) {
+                                t.focused = (t.focused + 1) % t.panes.len();
+                            }
+                            return false;
+                        }
+                        if modifiers.alt && *key == Key::C {
+                            action = Some(Action::Disconnect);
+                            return false;
+                        }
+                        if modifiers.alt && *key == Key::R {
+                            action = Some(Action::Restart);
+                            return false;
+                        }
+                        if modifiers.ctrl
+                            && matches!(key, Key::Plus | Key::Equals | Key::Minus | Key::Num0)
+                        {
+                            self.settings.font_size = match key {
+                                Key::Minus => self.settings.font_size - 1.0,
+                                Key::Num0 => 15.0,
+                                _ => self.settings.font_size + 1.0,
+                            }
+                            .clamp(10.0, 28.0);
+                            return false;
+                        }
+                        if *key == Key::Escape && self.search_open {
+                            self.search_open = false;
+                            return false;
+                        }
                     }
-                    if *key == Key::Escape && self.search_open {
-                        self.search_open = false;
-                        return false;
-                    }
+                    true
+                })();
+                if !keep {
+                    handled = true;
                 }
-                true
-            })
+                keep
+            });
+            if handled {
+                i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+            }
         });
         action
     }
@@ -555,6 +1003,12 @@ impl App {
                                     )),
                                 ),
                                 (icons::Icon::Host, "新建 SSH 连接", None, Action::Remote),
+                                (
+                                    icons::Icon::Terminal,
+                                    "连接串口",
+                                    None,
+                                    Action::SerialPicker,
+                                ),
                                 (icons::Icon::File, "文件与传输队列", None, Action::Files),
                                 (
                                     icons::Icon::SplitHorizontal,
@@ -610,6 +1064,18 @@ impl App {
                                 .clicked()
                             {
                                 self.groups_open = true;
+                                ui.close();
+                            }
+                            if icons::icon_row(
+                                ui,
+                                icons::Icon::Settings,
+                                "服务器工具箱（初始化服务器）",
+                                None,
+                                p,
+                            )
+                            .clicked()
+                            {
+                                *action = Some(Action::Toolbox);
                                 ui.close();
                             }
                             if icons::icon_row(
@@ -692,10 +1158,28 @@ impl App {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         for (i, t) in self.tabs.iter().enumerate() {
+                                            // A background tab that has received
+                                            // more than it had when it was last
+                                            // looked at is underlined.
+                                            let updated = tab_updated(t, i == self.active);
                                             ui.push_id(t.id, |ui| {
+                                                // The hover state comes from the
+                                                // previous frame's response, which
+                                                // is what lets the background be
+                                                // painted before the labels; the
+                                                // tab is interactive, so moving
+                                                // onto it already schedules the
+                                                // repaint that shows the highlight.
+                                                let hit_id = ui.id().with("tab-hit");
+                                                let hovered = ui
+                                                    .ctx()
+                                                    .read_response(hit_id)
+                                                    .is_some_and(|r| r.hovered());
                                                 egui::Frame::new()
                                                     .fill(if i == self.active {
                                                         p.raised
+                                                    } else if hovered {
+                                                        p.accent.gamma_multiply(0.18)
                                                     } else {
                                                         p.panel
                                                     })
@@ -745,12 +1229,20 @@ impl App {
                                                                     .chars()
                                                                     .take(18)
                                                                     .collect::<String>();
-                                                                ui.label(if focused {
-                                                                    RichText::new(text)
-                                                                        .color(color)
-                                                                        .strong()
+                                                                let label = RichText::new(text)
+                                                                    .color(color);
+                                                                let label = if focused {
+                                                                    label.strong()
                                                                 } else {
-                                                                    RichText::new(text).color(color)
+                                                                    label
+                                                                };
+                                                                // Underlined while the
+                                                                // tab holds output the
+                                                                // user has not seen.
+                                                                ui.label(if updated {
+                                                                    label.underline()
+                                                                } else {
+                                                                    label
                                                                 });
                                                             }
                                                             // Inside the label row, so it hugs the
@@ -780,11 +1272,7 @@ impl App {
                                                         });
                                                         let Some(rect) = hit else { return };
                                                         let r = ui
-                                                            .interact(
-                                                                rect,
-                                                                ui.id().with("tab-hit"),
-                                                                Sense::click(),
-                                                            )
+                                                            .interact(rect, hit_id, Sense::click())
                                                             .on_hover_text(format!(
                                                                 "{} · {} 个窗格 · 中键关闭",
                                                                 t.panes[t.focused]
@@ -885,12 +1373,22 @@ impl App {
                             } else {
                                 vec![("shell", "Shell")]
                             } {
-                                if icons::icon_row(ui, icons::Icon::Terminal, label, None, p)
-                                    .clicked()
-                                {
+                                // Double-click, like every other row in the
+                                // sidebar, so a stray click cannot open a pane.
+                                let row =
+                                    icons::icon_row(ui, icons::Icon::Terminal, label, None, p);
+                                if row.double_clicked() {
                                     *action = Some(Action::New(SessionKind::Local(key.into())));
                                 }
+                                row.on_hover_text("双击打开");
                             }
+                            ui.separator();
+                            let serial =
+                                icons::icon_row(ui, icons::Icon::Host, "连接串口…", None, p);
+                            if serial.double_clicked() {
+                                *action = Some(Action::SerialPicker);
+                            }
+                            serial.on_hover_text("双击打开串口选择");
                         });
                     ui.horizontal(|ui| {
                         let (rect, _) =
@@ -913,20 +1411,34 @@ impl App {
                         });
                     });
                     let mut groups = self.settings.groups.clone();
-                    for profile in &self.settings.profiles {
-                        if !profile.group.is_empty() && !groups.contains(&profile.group) {
-                            groups.push(profile.group.clone());
+                    for group in self
+                        .settings
+                        .profiles
+                        .iter()
+                        .map(|p| &p.group)
+                        .chain(self.settings.serial_profiles.iter().map(|p| &p.group))
+                    {
+                        if !group.is_empty() && !groups.contains(group) {
+                            groups.push(group.clone());
                         }
                     }
                     groups.insert(0, String::new());
+                    let any_profiles = !self.settings.profiles.is_empty()
+                        || !self.settings.serial_profiles.is_empty();
                     for group in groups {
                         let count = self
                             .settings
                             .profiles
                             .iter()
                             .filter(|p| p.group == group)
-                            .count();
-                        if group.is_empty() && count == 0 && !self.settings.profiles.is_empty() {
+                            .count()
+                            + self
+                                .settings
+                                .serial_profiles
+                                .iter()
+                                .filter(|p| p.group == group)
+                                .count();
+                        if group.is_empty() && count == 0 && any_profiles {
                             continue;
                         }
                         egui::CollapsingHeader::new(format!(
@@ -970,6 +1482,49 @@ impl App {
                                         ),
                                         ("编辑 / 跳板机 / 转发", Action::Edit(index)),
                                         ("删除连接", Action::Remove(index)),
+                                    ] {
+                                        if ui.button(text).clicked() {
+                                            *action = Some(a);
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            }
+                            for (index, profile) in self
+                                .settings
+                                .serial_profiles
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, p)| p.group == group)
+                            {
+                                let r = icons::icon_row(
+                                    ui,
+                                    icons::Icon::Terminal,
+                                    &profile.label(),
+                                    None,
+                                    p,
+                                );
+                                if r.double_clicked() {
+                                    *action =
+                                        Some(Action::New(SessionKind::Serial(profile.clone())));
+                                }
+                                r.on_hover_text(format!(
+                                    "串口 {} · {} bps · 双击连接 / 右键管理",
+                                    if profile.auto() {
+                                        "auto".to_string()
+                                    } else {
+                                        profile.port.clone()
+                                    },
+                                    profile.baud
+                                ))
+                                .context_menu(|ui| {
+                                    for (text, a) in [
+                                        (
+                                            "连接串口",
+                                            Action::New(SessionKind::Serial(profile.clone())),
+                                        ),
+                                        ("编辑串口连接", Action::EditSerial(index)),
+                                        ("删除连接", Action::RemoveSerial(index)),
                                     ] {
                                         if ui.button(text).clicked() {
                                             *action = Some(a);
@@ -1063,126 +1618,244 @@ impl App {
         let mut open = self.remote_open;
         let mut save = false;
         let mut connect = false;
+        let mut refresh_ports = false;
         egui::Window::new("连接配置")
             .open(&mut open)
             .collapsible(false)
             .default_width(480.0)
             .show(ctx, |ui| {
-                egui::Grid::new("connection-form")
-                    .spacing([12.0, 6.0])
-                    .min_col_width(72.0)
-                    .show(ui, |ui| {
-                        ui.label("主机 / IP");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.remote.host).desired_width(280.0),
-                        );
-                        ui.end_row();
-                        ui.label("端口");
-                        ui.add(egui::DragValue::new(&mut self.remote.port).range(1..=65535));
-                        ui.end_row();
-                        ui.label("连接名称");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.remote.name).desired_width(280.0),
-                        );
-                        ui.end_row();
-                        ui.label("分组");
-                        egui::ComboBox::from_id_salt("profile-group")
-                            .width(200.0)
-                            .selected_text(if self.remote.group.is_empty() {
-                                "未分组"
-                            } else {
-                                &self.remote.group
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.remote.group,
-                                    String::new(),
-                                    "未分组",
-                                );
-                                for group in &self.settings.groups {
-                                    ui.selectable_value(
-                                        &mut self.remote.group,
-                                        group.clone(),
-                                        group,
-                                    );
-                                }
-                            });
-                        ui.end_row();
-                        ui.label("用户名");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.remote.user).desired_width(280.0),
-                        );
-                        ui.end_row();
-                        ui.label("私钥路径");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.remote.identity)
-                                .desired_width(280.0),
-                        );
-                        ui.end_row();
-                    });
-                egui::CollapsingHeader::new("ProxyJump 跳板机").show(ui, |ui| {
-                    let mut enabled = self.remote.jump.is_some();
-                    if ui.checkbox(&mut enabled, "启用一级跳板机").changed() {
-                        self.remote.jump = if enabled {
-                            Some(Box::new(RemoteProfile::default()))
-                        } else {
-                            None
-                        };
-                    }
-                    if let Some(j) = &mut self.remote.jump {
-                        egui::Grid::new("jump-form")
+                ui.horizontal(|ui| {
+                    ui.label("类型");
+                    ui.selectable_value(&mut self.profile_kind, ProfileKind::Ssh, "SSH");
+                    ui.selectable_value(&mut self.profile_kind, ProfileKind::Serial, "串口");
+                });
+                ui.separator();
+                match self.profile_kind {
+                    ProfileKind::Ssh => {
+                        egui::Grid::new("connection-form")
                             .spacing([12.0, 6.0])
-                            .min_col_width(48.0)
+                            .min_col_width(72.0)
                             .show(ui, |ui| {
-                                ui.label("地址");
+                                ui.label("主机 / IP");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut j.host).desired_width(280.0),
+                                    egui::TextEdit::singleline(&mut self.remote.host)
+                                        .desired_width(280.0),
                                 );
                                 ui.end_row();
                                 ui.label("端口");
-                                ui.add(egui::DragValue::new(&mut j.port).range(1..=65535));
+                                ui.add(
+                                    egui::DragValue::new(&mut self.remote.port).range(1..=65535),
+                                );
+                                ui.end_row();
+                                ui.label("连接名称");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.remote.name)
+                                        .desired_width(280.0),
+                                );
+                                ui.end_row();
+                                ui.label("分组");
+                                egui::ComboBox::from_id_salt("profile-group")
+                                    .width(200.0)
+                                    .selected_text(if self.remote.group.is_empty() {
+                                        "未分组"
+                                    } else {
+                                        &self.remote.group
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.remote.group,
+                                            String::new(),
+                                            "未分组",
+                                        );
+                                        for group in &self.settings.groups {
+                                            ui.selectable_value(
+                                                &mut self.remote.group,
+                                                group.clone(),
+                                                group,
+                                            );
+                                        }
+                                    });
                                 ui.end_row();
                                 ui.label("用户名");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut j.user).desired_width(280.0),
+                                    egui::TextEdit::singleline(&mut self.remote.user)
+                                        .desired_width(280.0),
                                 );
                                 ui.end_row();
-                                ui.label("私钥");
+                                ui.label("私钥路径");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut j.identity)
+                                    egui::TextEdit::singleline(&mut self.remote.identity)
                                         .desired_width(280.0),
                                 );
                                 ui.end_row();
                             });
-                    }
-                });
-                egui::CollapsingHeader::new("本地端口转发（监听 127.0.0.1）").show(ui, |ui| {
-                    let mut remove = None;
-                    for (i, f) in self.remote.forwards.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut f.bind_port).range(1..=65535));
-                            ui.label("→");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut f.target_host).desired_width(160.0),
-                            );
-                            ui.add(egui::DragValue::new(&mut f.target_port).range(1..=65535));
-                            if ui.small_button("×").clicked() {
-                                remove = Some(i);
+                        egui::CollapsingHeader::new("ProxyJump 跳板机").show(ui, |ui| {
+                            let mut enabled = self.remote.jump.is_some();
+                            if ui.checkbox(&mut enabled, "启用一级跳板机").changed() {
+                                self.remote.jump = if enabled {
+                                    Some(Box::new(RemoteProfile::default()))
+                                } else {
+                                    None
+                                };
+                            }
+                            if let Some(j) = &mut self.remote.jump {
+                                egui::Grid::new("jump-form")
+                                    .spacing([12.0, 6.0])
+                                    .min_col_width(48.0)
+                                    .show(ui, |ui| {
+                                        ui.label("地址");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut j.host)
+                                                .desired_width(280.0),
+                                        );
+                                        ui.end_row();
+                                        ui.label("端口");
+                                        ui.add(egui::DragValue::new(&mut j.port).range(1..=65535));
+                                        ui.end_row();
+                                        ui.label("用户名");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut j.user)
+                                                .desired_width(280.0),
+                                        );
+                                        ui.end_row();
+                                        ui.label("私钥");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut j.identity)
+                                                .desired_width(280.0),
+                                        );
+                                        ui.end_row();
+                                    });
                             }
                         });
+                        egui::CollapsingHeader::new("本地端口转发（监听 127.0.0.1）").show(
+                            ui,
+                            |ui| {
+                                let mut remove = None;
+                                for (i, f) in self.remote.forwards.iter_mut().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::DragValue::new(&mut f.bind_port).range(1..=65535),
+                                        );
+                                        ui.label("→");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut f.target_host)
+                                                .desired_width(160.0),
+                                        );
+                                        ui.add(
+                                            egui::DragValue::new(&mut f.target_port)
+                                                .range(1..=65535),
+                                        );
+                                        if ui.small_button("×").clicked() {
+                                            remove = Some(i);
+                                        }
+                                    });
+                                }
+                                if let Some(i) = remove {
+                                    self.remote.forwards.remove(i);
+                                }
+                                if ui.small_button("+ 转发规则").clicked() {
+                                    self.remote.forwards.push(Forward {
+                                        bind_port: 8080,
+                                        target_host: "127.0.0.1".into(),
+                                        target_port: 80,
+                                    });
+                                }
+                            },
+                        );
+                        ui.label(hint("认证在连接时进行，密码不写入配置。", p));
                     }
-                    if let Some(i) = remove {
-                        self.remote.forwards.remove(i);
+                    ProfileKind::Serial => {
+                        egui::Grid::new("serial-form")
+                            .spacing([12.0, 6.0])
+                            .min_col_width(72.0)
+                            .show(ui, |ui| {
+                                ui.label("串口");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.serial.port)
+                                            .desired_width(180.0)
+                                            .hint_text("COM3 或 auto"),
+                                    );
+                                    egui::ComboBox::from_id_salt("serial-port-pick")
+                                        .selected_text("▾")
+                                        .width(150.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.serial.port,
+                                                "auto".to_string(),
+                                                "auto（自动）",
+                                            );
+                                            for port in &self.serial_ports {
+                                                let label = if port.bluetooth {
+                                                    format!("{}（蓝牙）", port.name)
+                                                } else {
+                                                    port.name.clone()
+                                                };
+                                                ui.selectable_value(
+                                                    &mut self.serial.port,
+                                                    port.name.clone(),
+                                                    label,
+                                                );
+                                            }
+                                            if self.serial_ports.is_empty() {
+                                                ui.label(hint("未检测到串口", p));
+                                            }
+                                        });
+                                    if ui.small_button("刷新").clicked() {
+                                        refresh_ports = true;
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label("波特率");
+                                egui::ComboBox::from_id_salt("serial-baud")
+                                    .width(120.0)
+                                    .selected_text(self.serial.baud.to_string())
+                                    .show_ui(ui, |ui| {
+                                        for baud in BAUD_RATES {
+                                            ui.selectable_value(
+                                                &mut self.serial.baud,
+                                                baud,
+                                                baud.to_string(),
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+                                ui.label("连接名称");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.serial.name)
+                                        .desired_width(280.0),
+                                );
+                                ui.end_row();
+                                ui.label("分组");
+                                egui::ComboBox::from_id_salt("serial-group")
+                                    .width(200.0)
+                                    .selected_text(if self.serial.group.is_empty() {
+                                        "未分组"
+                                    } else {
+                                        &self.serial.group
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.serial.group,
+                                            String::new(),
+                                            "未分组",
+                                        );
+                                        for group in &self.settings.groups {
+                                            ui.selectable_value(
+                                                &mut self.serial.group,
+                                                group.clone(),
+                                                group,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+                            });
+                        ui.label(hint(
+                            "串口填 auto 时，连接优先选普通串口，并跳过本程序已占用的串口。",
+                            p,
+                        ));
                     }
-                    if ui.small_button("+ 转发规则").clicked() {
-                        self.remote.forwards.push(Forward {
-                            bind_port: 8080,
-                            target_host: "127.0.0.1".into(),
-                            target_port: 80,
-                        });
-                    }
-                });
-                ui.label(hint("认证在连接时进行，密码不写入配置。", p));
+                }
                 ui.horizontal(|ui| {
                     if ui.button("保存").clicked() {
                         save = true;
@@ -1194,18 +1867,37 @@ impl App {
                 });
             });
         self.remote_open = open;
+        if refresh_ports {
+            self.serial_ports = serial::available_ports();
+        }
         if save {
-            match self.remote.validate() {
-                Ok(()) => {
+            let saved = match self.profile_kind {
+                ProfileKind::Ssh => self.remote.validate().map(|()| {
                     if let Some(i) = self.editing_profile {
                         self.settings.profiles[i] = self.remote.clone();
                     } else {
                         self.settings.profiles.push(self.remote.clone());
                     }
+                }),
+                ProfileKind::Serial => self.serial.validate().map(|()| {
+                    if let Some(i) = self.editing_serial {
+                        self.settings.serial_profiles[i] = self.serial.clone();
+                    } else {
+                        self.settings.serial_profiles.push(self.serial.clone());
+                    }
+                }),
+            };
+            match saved {
+                Ok(()) => {
                     self.remote_open = false;
                     self.persist();
                     if connect {
-                        *action = Some(Action::New(SessionKind::Ssh(self.remote.clone())));
+                        *action = Some(match self.profile_kind {
+                            ProfileKind::Ssh => Action::New(SessionKind::Ssh(self.remote.clone())),
+                            ProfileKind::Serial => {
+                                Action::New(SessionKind::Serial(self.serial.clone()))
+                            }
+                        });
                     }
                 }
                 Err(e) => self.error = Some(e.to_string()),
@@ -1247,11 +1939,21 @@ impl App {
                             p.group = new.clone();
                         }
                     }
+                    for p in &mut self.settings.serial_profiles {
+                        if p.group == old {
+                            p.group = new.clone();
+                        }
+                    }
                     modified = true;
                 }
                 if let Some(i) = remove {
                     let group = self.settings.groups.remove(i);
                     for p in &mut self.settings.profiles {
+                        if p.group == group {
+                            p.group.clear();
+                        }
+                    }
+                    for p in &mut self.settings.serial_profiles {
                         if p.group == group {
                             p.group.clear();
                         }
@@ -1263,6 +1965,112 @@ impl App {
         self.groups_open = open;
         if modified {
             self.persist();
+        }
+        if let Some(mut toolbox) = self.toolbox.take() {
+            // The script is typed into the focused session, so the target is
+            // resolved once, right before it runs.
+            let target = self.focused_ssh().map(|(_, target)| target);
+            let mut open = true;
+            let script = match &target {
+                Some(target) => toolbox.show(ctx, &mut open, p, target),
+                None => {
+                    self.error = Some("会话已断开，服务器工具箱不可用".into());
+                    None
+                }
+            };
+            if let Some(script) = script {
+                open = false;
+                let count = script.chars().count();
+                let sent = self
+                    .tabs
+                    .get_mut(self.active)
+                    .and_then(|t| t.panes.get_mut(t.focused))
+                    .map(|pane| pane.session.write(script.into_bytes()));
+                match sent {
+                    Some(Ok(())) => self.notify(format!("已发送服务器初始化脚本（{count} 字符）")),
+                    Some(Err(e)) => self.error = Some(format!("{e:#}")),
+                    None => {}
+                }
+            }
+            if open && target.is_some() {
+                self.toolbox = Some(toolbox);
+            }
+        }
+        if self.serial_picker.is_some() {
+            let mut open = true;
+            let mut connect = false;
+            let mut cancel = false;
+            let mut refresh = false;
+            if let Some(picker) = &mut self.serial_picker {
+                egui::Window::new("连接串口")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(340.0)
+                    .show(ctx, |ui| {
+                        if picker.ports.is_empty() {
+                            ui.label(hint("未检测到串口设备。可在连接配置里填 auto。", p));
+                        } else {
+                            ui.label(hint("普通串口在前，蓝牙串口在后。", p));
+                            egui::ScrollArea::vertical()
+                                .max_height(220.0)
+                                .show(ui, |ui| {
+                                    for port in &picker.ports {
+                                        let label = if port.bluetooth {
+                                            format!("{}（蓝牙）", port.name)
+                                        } else {
+                                            port.name.clone()
+                                        };
+                                        ui.radio_value(&mut picker.port, port.name.clone(), label);
+                                    }
+                                });
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("波特率");
+                            egui::ComboBox::from_id_salt("picker-baud")
+                                .width(120.0)
+                                .selected_text(picker.baud.to_string())
+                                .show_ui(ui, |ui| {
+                                    for baud in BAUD_RATES {
+                                        ui.selectable_value(
+                                            &mut picker.baud,
+                                            baud,
+                                            baud.to_string(),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("连接").clicked() {
+                                connect = true;
+                            }
+                            if ui.button("刷新").clicked() {
+                                refresh = true;
+                            }
+                            if ui.button("取消").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if refresh {
+                    picker.refresh();
+                }
+            }
+            if cancel {
+                open = false;
+            }
+            if connect && let Some(picker) = &self.serial_picker {
+                *action = Some(Action::New(SessionKind::Serial(SerialProfile {
+                    name: picker.port.clone(),
+                    port: picker.port.clone(),
+                    baud: picker.baud,
+                    group: String::new(),
+                })));
+                open = false;
+            }
+            if !open {
+                self.serial_picker = None;
+            }
         }
         egui::Window::new("关于 / 快捷键")
             .open(&mut self.help_open)
@@ -1282,6 +2090,7 @@ impl App {
                     ("Ctrl+Tab / Alt+Right", "切换标签 / 窗格"),
                     ("Ctrl+Shift+C / V", "复制 / 粘贴"),
                     ("Ctrl+C", "终端中断"),
+                    ("Alt+C / Alt+R", "断开 / 重连当前会话"),
                     ("Ctrl+Shift+F", "全部保留历史查找"),
                     ("Ctrl+Shift+B / Ctrl+,", "导航栏 / 设置"),
                     ("中键 / Shift+鼠标", "粘贴 / 强制选择"),
@@ -1306,6 +2115,23 @@ impl App {
                 self.add_connection(c, ctx);
             } else if !open {
                 self.login = None;
+                // Backing out leaves the pre-created pane, marked so it still
+                // offers a retry.
+                if let Some((tab_id, pane_id)) = self.login_target.take() {
+                    self.note(tab_id, pane_id, "connect cancelled");
+                    if let Some((tab, index)) = self.locate(tab_id, pane_id) {
+                        let kind = self.tabs[tab].panes[index].session.kind.clone();
+                        let terminal = self.tabs[tab].panes[index].session.terminal.clone();
+                        self.tabs[tab].panes[index] = Pane::new(
+                            pane_id,
+                            Session::disconnected_reusing(
+                                kind,
+                                self.settings.scrollback,
+                                Some(terminal),
+                            ),
+                        );
+                    }
+                }
             }
         }
         if let Some(files) = &mut self.files {
@@ -1345,8 +2171,31 @@ impl App {
     pub(crate) fn render(&mut self, ctx: &egui::Context) {
         let p = self.palette;
         self.resize_grips(ctx);
+        // The counters become rates here, once per frame. Both the spinner and
+        // a settling rate need more frames than an idle app would ask for.
+        let rates_animating = self.sample_rates();
+        let connecting = self.connecting();
+        if connecting {
+            ctx.request_repaint_after(std::time::Duration::from_millis(40));
+        } else if rates_animating {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        if let Some((_, at)) = &self.toast {
+            if at.elapsed() >= TOAST_LIFETIME {
+                self.toast = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+        let down_rate = self.rates.down_per_sec;
+        let up_rate = self.rates.up_per_sec;
         let mut action = self.shortcuts(ctx);
         self.topbar(ctx, &mut action);
+        // Looking at a tab clears its new-output mark, which is why this lands
+        // after the strip has been drawn.
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.seen_output = tab_output(tab);
+        }
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
@@ -1407,7 +2256,57 @@ impl App {
                     } else {
                         ui.label(hint("就绪", p));
                     }
+                    if let Some((text, at)) = &self.toast
+                        && at.elapsed() < TOAST_LIFETIME
+                    {
+                        ui.colored_label(p.accent, text);
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // A frameless window has no OS grip, so the corner is
+                        // drawn and made draggable here.
+                        let grip = resize_grip(ui, p);
+                        if grip.hovered() || grip.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                        }
+                        if grip.drag_started()
+                            || (grip.hovered() && ui.input(|i| i.pointer.primary_pressed()))
+                        {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                                    egui::viewport::ResizeDirection::SouthEast,
+                                ));
+                        }
+                        if connecting {
+                            connecting_spinner(ui, p);
+                        }
+                        // Two arrows rather than a number: they are always
+                        // there, so the corner does not jump around, and the
+                        // colour says whether anything is moving. Down is green
+                        // and up is red; the exact figures are on hover.
+                        let rates = format!(
+                            "下行 {}\n上行 {}",
+                            format_bitrate(down_rate),
+                            format_bitrate(up_rate)
+                        );
+                        ui.label(RichText::new("↓").color(if down_rate > TRAFFIC_IDLE {
+                            p.ok
+                        } else {
+                            p.muted
+                        }))
+                        .on_hover_text(&rates);
+                        ui.label(RichText::new("↑").color(if up_rate > TRAFFIC_IDLE {
+                            p.danger
+                        } else {
+                            p.muted
+                        }))
+                        .on_hover_text(&rates);
+                        if icons::icon_button(ui, icons::Icon::Search, p, icons::Size::Row)
+                            .on_hover_text("查找历史输出 (Ctrl+Shift+F)")
+                            .clicked()
+                        {
+                            self.search_open = true;
+                            self.search_focus = true;
+                        }
                         ui.label(hint("UTF-8", p));
                     });
                 });
@@ -1489,6 +2388,11 @@ impl App {
                                 chosen = Some(SessionKind::Ssh(profile.clone()));
                             }
                         }
+                        for profile in &self.settings.serial_profiles {
+                            if ui.button(format!("串口 · {}", profile.label())).clicked() {
+                                chosen = Some(SessionKind::Serial(profile.clone()));
+                            }
+                        }
                         if ui.button("保持当前会话").clicked() {
                             keep = true;
                         }
@@ -1513,10 +2417,17 @@ impl App {
                         match kind {
                             SessionKind::Ssh(profile) => {
                                 self.login_target = Some((tab_id, pane_id));
-                                self.login = Some(remote_ui::Login::new(profile));
+                                self.announce(
+                                    tab_id,
+                                    pane_id,
+                                    Some(&format!("{}:{}", profile.destination(), profile.port)),
+                                );
+                                let console = self.terminal_of(tab_id, pane_id);
+                                self.login = Some(remote_ui::Login::new(profile, console));
                             }
                             kind => {
-                                if let Some(pane) = self.spawn(kind, ctx) {
+                                let previous = self.tabs[ti].panes[pi].session.terminal.clone();
+                                if let Some(pane) = self.respawn(kind, Some(previous), ctx) {
                                     self.tabs[ti].panes[pi] = pane;
                                     self.tabs[ti].focused = pi;
                                 }
@@ -1567,6 +2478,9 @@ impl App {
                 }
             }
         }
+        // Collected inside the pane loop because the pane borrows the tab list,
+        // and applied after it because the toast lives on the app.
+        let mut notice = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.bg).inner_margin(0))
             .show(ctx, |ui| {
@@ -1612,6 +2526,7 @@ impl App {
                     && !self.search_open
                     && self.login.is_none()
                     && !self.files_open
+                    && self.toolbox.is_none()
                     && !egui::Popup::is_any_open(ctx);
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     let mut rects = vec![];
@@ -1649,6 +2564,9 @@ impl App {
                                 if error.is_some() {
                                     self.error = error;
                                 }
+                                if let Some(text) = pane.notice.take() {
+                                    notice = Some(text);
+                                }
                             },
                         );
                     }
@@ -1663,6 +2581,9 @@ impl App {
                     });
                 }
             });
+        if let Some(text) = notice {
+            self.notify(text);
+        }
         self.dialogs(ctx, &mut action);
         if let Some(files) = &mut self.files {
             files.show_question(ctx, p);
@@ -1709,6 +2630,20 @@ impl eframe::App for App {
         }
     }
 }
+/// What a connection points at, for its console notice. A local shell starts a
+/// program rather than connecting to anything, so it has no target.
+fn connect_target(kind: &SessionKind) -> Option<String> {
+    match kind {
+        SessionKind::Serial(profile) => {
+            Some(format!("{} @ {} bps", profile.port.trim(), profile.baud))
+        }
+        SessionKind::Ssh(profile) | SessionKind::Sftp(profile) => {
+            Some(format!("{}:{}", profile.destination(), profile.port))
+        }
+        SessionKind::Local(_) => None,
+    }
+}
+
 /// A tab shows the state of its least healthy pane.
 fn tab_link(tab: &Tab) -> SessionStatus {
     let mut worst = SessionStatus::Live;
@@ -1751,6 +2686,61 @@ fn link_color(link: SessionStatus, p: Palette) -> egui::Color32 {
         SessionStatus::Detached => p.muted,
         SessionStatus::Lost => p.danger,
     }
+}
+
+/// Eight small squares in a 3x3 ring, chasing each other round while a
+/// connection is being made.
+fn connecting_spinner(ui: &mut egui::Ui, p: Palette) {
+    const RING: [(f32, f32); 8] = [
+        (0.0, -1.0),
+        (1.0, -1.0),
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (-1.0, 1.0),
+        (-1.0, 0.0),
+        (-1.0, -1.0),
+    ];
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+    let tau = std::f32::consts::TAU;
+    let head = (ui.input(|i| i.time) as f32 * tau * 0.8).rem_euclid(tau);
+    let painter = ui.painter();
+    for (index, (x, y)) in RING.iter().enumerate() {
+        let angle = index as f32 / RING.len() as f32 * tau;
+        // How far behind the head this square is, 0 at the head.
+        let behind = (head - angle).rem_euclid(tau) / tau;
+        let lit = (1.0 - behind).powi(2);
+        painter.rect_filled(
+            egui::Rect::from_center_size(
+                rect.center() + egui::vec2(x * 4.5, y * 4.5),
+                egui::vec2(3.0, 3.0),
+            ),
+            0,
+            p.accent.gamma_multiply(0.12 + 0.88 * lit),
+        );
+    }
+}
+
+/// The corner grip a frameless window would otherwise have to answer for with a
+/// few invisible pixels. Three diagonal ticks, brighter under the pointer.
+fn resize_grip(ui: &mut egui::Ui, p: Palette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::drag());
+    let color = if response.hovered() || response.dragged() {
+        p.accent
+    } else {
+        p.muted
+    };
+    for step in 0..3 {
+        let offset = 3.0 + step as f32 * 4.5;
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.right() - offset, rect.bottom() - 1.0),
+                egui::pos2(rect.right() - 1.0, rect.bottom() - offset),
+            ],
+            egui::Stroke::new(1.0_f32, color),
+        );
+    }
+    response
 }
 
 fn layout_rects(
@@ -1957,6 +2947,373 @@ mod tests {
         assert_eq!(app.tabs[1].panes.len(), 1);
         frame(&mut app, &ctx, vec![key(Key::W, mods)], mods, size);
         assert_eq!(app.tabs.len(), 1);
+        assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    /// The wheel scrolls the pane's own history, and a restart keeps that
+    /// history by reusing the same screen. What the reused screen *contains* is
+    /// `terminal`'s business and is covered there; here the point is the wiring,
+    /// which is why the assertion is on the screen's identity rather than on
+    /// output that a dying shell could still race with.
+    #[test]
+    fn wheel_scrolls_history_and_restart_keeps_it() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        {
+            let mut terminal = app.tabs[0].panes[0].session.terminal.lock().unwrap();
+            for i in 0..80 {
+                terminal.process(format!("history {i}\r\n").as_bytes());
+            }
+        }
+        let center = egui::Pos2::new(700.0, 400.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![Event::PointerMoved(center)],
+            Modifiers::NONE,
+            size,
+        );
+        for _ in 0..20 {
+            frame(
+                &mut app,
+                &ctx,
+                vec![Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: Vec2::new(0.0, 1.0),
+                    modifiers: Modifiers::NONE,
+                }],
+                Modifiers::NONE,
+                size,
+            );
+        }
+        let scrolled = app.tabs[0].panes[0]
+            .session
+            .terminal
+            .lock()
+            .unwrap()
+            .parser
+            .screen()
+            .scrollback();
+        assert!(scrolled > 0, "the wheel did not move the history");
+
+        let before = app.tabs[0].panes[0].session.terminal.clone();
+        app.execute(Action::Restart, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let after = app.tabs[0].panes[0].session.terminal.clone();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the restart did not carry the screen over"
+        );
+    }
+
+    /// The spinner has to actually paint: a bare panel so the only shapes are
+    /// the eight squares of the ring.
+    #[test]
+    fn the_spinner_paints_its_whole_ring() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| connecting_spinner(ui, Palette::new(false)));
+        });
+        assert!(
+            output.shapes.len() >= 8,
+            "the spinner painted {} shapes",
+            output.shapes.len()
+        );
+    }
+
+    /// The spinner is driven by panes that have no connection yet, and it has
+    /// to stop once the attempt settles either way.
+    #[test]
+    fn the_spinner_runs_only_while_a_connection_is_pending() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        assert!(!app.connecting());
+        let serial = SessionKind::Serial(SerialProfile {
+            port: "COM199".into(),
+            ..Default::default()
+        });
+        let (tab_id, pane_id) = app.open_connecting_tab(serial.clone());
+        assert!(app.connecting(), "a pending pane must spin");
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        app.connect_pane(tab_id, pane_id, serial, &ctx);
+        assert!(!app.connecting(), "a settled attempt must stop the spinner");
+    }
+
+    /// The arrows light on a burst and settle back to idle once it stops.
+    #[test]
+    fn the_rate_meter_lights_up_then_settles() {
+        let mut meter = RateMeter::default();
+        assert!(
+            !meter.sample(1, 0, 0),
+            "the first sample is only a baseline"
+        );
+        assert!(meter.sample(1, 4096, 0), "a write must light the up arrow");
+        let mut settled = None;
+        for frame in 0..64 {
+            if !meter.sample(1, 4096, 0) {
+                settled = Some(frame);
+                break;
+            }
+        }
+        assert!(settled.is_some(), "the rate never decayed to idle");
+        assert!(meter.up_per_sec <= TRAFFIC_IDLE);
+        assert_eq!(meter.down_per_sec, 0.0);
+    }
+
+    /// A background tab that receives output is underlined, and looking at it
+    /// clears the mark.
+    #[test]
+    fn a_background_tab_is_marked_until_it_is_looked_at() {
+        use std::sync::atomic::Ordering;
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        app.open_connecting_tab(SessionKind::Serial(SerialProfile {
+            port: "COM199".into(),
+            ..Default::default()
+        }));
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active, 1, "the new tab is the active one");
+        assert!(!tab_updated(&app.tabs[1], true), "the active tab is clean");
+
+        // The first tab reads something while it is off screen.
+        app.tabs[0].panes[0]
+            .session
+            .traffic
+            .down
+            .fetch_add(64, Ordering::Relaxed);
+        assert!(tab_updated(&app.tabs[0], false), "new output must mark it");
+
+        app.active = 0;
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        assert!(
+            !tab_updated(&app.tabs[0], true),
+            "looking at the tab must clear the mark"
+        );
+        assert_eq!(app.tabs[0].seen_output, tab_output(&app.tabs[0]));
+    }
+
+    /// The toolbox types Linux commands, so it must not open on a local shell.
+    #[test]
+    fn the_toolbox_refuses_a_session_that_is_not_ssh() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        app.execute(Action::Toolbox, &ctx);
+        assert!(app.toolbox.is_none());
+        assert_eq!(
+            app.error.as_deref(),
+            Some("服务器工具箱仅用于已连接的 SSH 会话")
+        );
+    }
+
+    #[test]
+    fn bitrates_use_decimal_units() {
+        assert_eq!(format_bitrate(0.0), "0 bps");
+        assert_eq!(format_bitrate(1.0), "8 bps");
+        assert_eq!(format_bitrate(125.0), "1.0 Kbps");
+        assert_eq!(format_bitrate(1_000_000.0), "8.0 Mbps");
+    }
+
+    /// Alt+C drops the session but keeps the pane and its screen, so Alt+R has
+    /// something to bring back.
+    #[test]
+    fn the_disconnect_shortcut_keeps_the_pane_and_reconnects() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        let before = app.tabs[0].panes[0].session.terminal.clone();
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        frame(&mut app, &ctx, vec![key(Key::C, alt)], alt, size);
+        assert_eq!(app.tabs.len(), 1, "断开 must not close the pane");
+        let session = &app.tabs[0].panes[0].session;
+        assert_eq!(session.link(), SessionStatus::Detached);
+        assert!(
+            Arc::ptr_eq(&before, &session.terminal),
+            "断开 must keep the screen"
+        );
+        assert!(
+            session
+                .terminal
+                .lock()
+                .unwrap()
+                .parser
+                .screen()
+                .contents()
+                .contains("已断开")
+        );
+
+        frame(&mut app, &ctx, vec![key(Key::R, alt)], alt, size);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.tabs[0].panes[0].session.link(), SessionStatus::Live);
+    }
+
+    /// Alt+R arrives as a key event *and* as text. The key is the shortcut; the
+    /// text must not be typed into the session — on an ended session that was
+    /// reported as a spurious write error right after reconnecting.
+    #[test]
+    fn a_shortcut_does_not_leak_its_text_into_the_session() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        app.execute(Action::Disconnect, &ctx);
+        assert_eq!(app.tabs[0].panes[0].session.link(), SessionStatus::Detached);
+
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        frame(
+            &mut app,
+            &ctx,
+            vec![key(Key::R, alt), Event::Text("r".into())],
+            alt,
+            size,
+        );
+        assert!(
+            app.error.is_none(),
+            "the shortcut's text reached the ended session: {:?}",
+            app.error
+        );
+        assert_eq!(
+            app.tabs[0].panes[0].session.link(),
+            SessionStatus::Live,
+            "Alt+R must still reconnect"
+        );
+    }
+
+    #[test]
+    fn a_toast_stays_for_its_lifetime_then_goes() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        app.notify("已复制 3 个字符");
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        assert!(app.toast.is_some(), "an unexpired toast must stay");
+        app.toast = Some((
+            "old".into(),
+            std::time::Instant::now() - TOAST_LIFETIME - std::time::Duration::from_secs(1),
+        ));
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        assert!(app.toast.is_none(), "an expired toast must be dropped");
+    }
+
+    /// A connection gets its tab before it is attempted, and a failure lands in
+    /// that tab's own console instead of a status line shared by every session.
+    /// COM199 is used because it cannot exist, so no device is touched.
+    #[test]
+    fn a_failed_connection_reports_in_its_own_console() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        let before = app.tabs.len();
+        app.execute(
+            Action::New(SessionKind::Serial(SerialProfile {
+                port: "COM199".into(),
+                ..Default::default()
+            })),
+            &ctx,
+        );
+        assert_eq!(
+            app.tabs.len(),
+            before + 1,
+            "the tab must exist before the connect attempt"
+        );
+        let terminal = app.tabs.last().unwrap().panes[0].session.terminal.clone();
+        let text = terminal.lock().unwrap().parser.screen().contents();
+        assert!(text.contains("connect to COM199"), "{text}");
+        assert!(text.contains("connect failed"), "{text}");
+        assert!(
+            app.error.is_none(),
+            "a connection failure belongs to its own console: {:?}",
+            app.error
+        );
+    }
+
+    /// The console offers its clear actions on right-click, and the menu has to
+    /// survive more than the frame that opened it.
+    #[test]
+    fn right_click_opens_the_console_menu_and_it_stays_open() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        let pos = egui::Pos2::new(700.0, 400.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![Event::PointerMoved(pos)],
+            Modifiers::NONE,
+            size,
+        );
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                &ctx,
+                vec![Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                }],
+                Modifiers::NONE,
+                size,
+            );
+        }
+        assert!(egui::Popup::is_any_open(&ctx), "the menu did not open");
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        assert!(
+            egui::Popup::is_any_open(&ctx),
+            "the menu closed on the next frame"
+        );
+    }
+
+    /// The serial picker and the serial tab of the connection form only ever
+    /// list devices; opening a port happens on connect. A port that is not
+    /// attached is used here precisely so the test cannot touch real hardware.
+    #[test]
+    fn serial_picker_and_form_open_without_touching_a_device() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+
+        app.execute(Action::SerialPicker, &ctx);
+        assert!(app.serial_picker.is_some());
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+
+        app.execute(Action::Remote, &ctx);
+        app.profile_kind = ProfileKind::Serial;
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        assert!(app.remote_open);
+
+        app.settings.serial_profiles.push(SerialProfile {
+            port: "COM199".into(),
+            ..Default::default()
+        });
+        app.execute(Action::EditSerial(0), &ctx);
+        assert_eq!(app.profile_kind, ProfileKind::Serial);
+        assert_eq!(app.serial.port, "COM199");
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+
+        app.execute(Action::RemoveSerial(0), &ctx);
+        assert!(app.settings.serial_profiles.is_empty());
         assert!(app.error.is_none(), "{:?}", app.error);
     }
 

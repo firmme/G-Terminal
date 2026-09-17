@@ -50,6 +50,8 @@ pub struct Terminal {
     scanner: crate::graphics::OscScanner,
     /// Tail of the last read, so a header split across reads is still seen.
     zmodem_probe: Vec<u8>,
+    /// Scrollback capacity, kept so the screen can be rebuilt in place.
+    scrollback: usize,
 }
 
 impl Terminal {
@@ -66,6 +68,7 @@ impl Terminal {
             zmodem_offer: None,
             scanner: crate::graphics::OscScanner::default(),
             zmodem_probe: Vec::new(),
+            scrollback,
         }
     }
 
@@ -134,6 +137,67 @@ impl Terminal {
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Prepares a screen that outlived its session for the next one. The
+    /// scrollback is kept, so output from before a reconnect stays readable
+    /// above the new output; only the transient state (alternate screen, pen,
+    /// view offset) is reset. Nothing is printed here: the caller announces
+    /// what it is about to do with [`Self::separator`]/[`Self::note`].
+    pub fn recycle(&mut self, rows: u16, cols: u16) {
+        if self.parser.screen().alternate_screen() {
+            self.parser.process(b"\x1b[?1049l");
+        }
+        self.parser.process(b"\x1b[0m\x1b[?25h");
+        self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
+        self.parser.screen_mut().set_scrollback(0);
+        self.zmodem_offer = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Blank lines that keep a new run of diagnostics apart from older output.
+    pub fn separator(&mut self) {
+        self.parser.process(b"\r\n\r\n");
+        self.parser.screen_mut().set_scrollback(0);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Writes one informational line, e.g. a connect notice, and returns the
+    /// view to the bottom so it is actually seen.
+    pub fn note(&mut self, line: &str) {
+        self.parser
+            .process(format!("\r\n\x1b[0m{line}\x1b[0m\r\n").as_bytes());
+        self.parser.screen_mut().set_scrollback(0);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Like [`Self::note`], but coloured so a failure reads as one.
+    pub fn note_error(&mut self, line: &str) {
+        self.parser
+            .process(format!("\r\n\x1b[31m{line}\x1b[0m\r\n").as_bytes());
+        self.parser.screen_mut().set_scrollback(0);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Blanks the visible screen but keeps the scrollback.
+    pub fn clear_screen(&mut self) {
+        self.parser.process(b"\x1b[H\x1b[2J");
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Drops everything this screen has ever shown, scrollback included.
+    pub fn clear_all(&mut self) {
+        let (rows, cols) = self.parser.screen().size();
+        self.parser = vt100::Parser::new_with_callbacks(
+            rows.max(1),
+            cols.max(1),
+            self.scrollback,
+            TerminalCallbacks::default(),
+        );
+        self.graphics.clear();
+        self.zmodem_probe.clear();
+        self.zmodem_offer = None;
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -245,6 +309,55 @@ mod tests {
         assert_eq!(t.parser.screen().scrollback(), 0);
         t.resize(30, 100);
         assert_eq!(t.parser.screen().size(), (30, 100));
+    }
+
+    #[test]
+    fn recycle_keeps_scrollback_and_leaves_the_alternate_screen() {
+        let mut t = Terminal::new(3, 20, 100);
+        for i in 0..10 {
+            t.process(format!("old {i}\r\n").as_bytes());
+        }
+        t.process(b"\x1b[?1049h\x1b[Halternate");
+        assert!(t.parser.screen().alternate_screen());
+        t.recycle(3, 20);
+        assert!(!t.parser.screen().alternate_screen());
+        assert_eq!(t.parser.screen().scrollback(), 0);
+        // Separating the runs is the caller's business; recycle is silent.
+        assert!(!t.parser.screen().contents().contains("alternate"));
+        assert!(!t.find_all("old 1").is_empty());
+    }
+
+    #[test]
+    fn clear_screen_keeps_history_while_clear_all_drops_it() {
+        let mut t = Terminal::new(3, 20, 100);
+        for i in 0..10 {
+            t.process(format!("line {i}\r\n").as_bytes());
+        }
+        t.clear_screen();
+        assert_eq!(t.parser.screen().scrollback(), 0);
+        assert!(!t.find_all("line 5").is_empty(), "清屏 should keep history");
+        t.clear_all();
+        assert!(t.find_all("line 5").is_empty(), "清空 should drop history");
+        assert!(!t.parser.screen().contents().contains("line"));
+    }
+
+    #[test]
+    fn notes_are_written_to_the_screen_and_return_the_view_to_the_bottom() {
+        let mut t = Terminal::new(3, 20, 100);
+        for i in 0..10 {
+            t.process(format!("line {i}\r\n").as_bytes());
+        }
+        t.scroll(5);
+        t.note("connect to COM3");
+        assert_eq!(t.parser.screen().scrollback(), 0);
+        assert!(t.parser.screen().contents().contains("connect to COM3"));
+        t.note_error("connect failed: busy");
+        assert!(
+            t.parser
+                .screen()
+                .contents()
+                .contains("connect failed: busy")
+        );
     }
 
     /// `sz` announces itself with ZRQINIT (`B00`): the far side is about to send.

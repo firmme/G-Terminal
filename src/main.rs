@@ -8,6 +8,7 @@ mod native_dx11;
 mod remote_ui;
 mod shaping;
 mod theme;
+mod toolbox;
 mod view;
 
 fn main() -> eframe::Result {
@@ -34,7 +35,7 @@ fn main() -> eframe::Result {
             .with_decorations(false)
             .with_icon(icons::default_app_icon(64))
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([760.0, 480.0]),
+            .with_min_inner_size([400.0, 300.0]),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             desired_maximum_frame_latency: Some(1),
