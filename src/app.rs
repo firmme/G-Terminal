@@ -1762,9 +1762,20 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                 }
                 if close {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_exit(ctx);
                 }
             });
+    }
+
+    /// The one way out: close now, or ask first while sessions are still live
+    /// and the setting wants it. Every exit path — the titlebar button, the
+    /// platform's close request, the dialog's own button — comes through here.
+    fn request_exit(&mut self, ctx: &egui::Context) {
+        if self.exit_confirmed || !self.settings.confirm_on_exit || !self.has_live_sessions() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            self.confirm_exit = true;
+        }
     }
     fn sidebar(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
         let p = self.palette;
@@ -2403,7 +2414,10 @@ impl App {
                 ui.label(hint("回车保存，Ctrl+回车保存并连接。", p));
                 // A popup consumes Enter itself (picking from a combo), so this
                 // only fires while the form has the keyboard.
-                if !egui::Popup::is_any_open(ui.ctx()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+                if !egui::Popup::is_any_open(ui.ctx())
+                    && !editing::ime_composing(ui.ctx())
+                    && ui.input(|i| i.key_pressed(Key::Enter))
+                {
                     save = true;
                     connect = ui.input(|i| i.modifiers.command);
                 }
@@ -2458,7 +2472,7 @@ impl App {
                         add_group = true;
                     }
                 });
-                if !egui::Popup::is_any_open(ui.ctx()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+                if !egui::Popup::is_any_open(ui.ctx()) && !editing::ime_composing(ui.ctx()) && ui.input(|i| i.key_pressed(Key::Enter)) {
                     add_group = true;
                 }
                 if add_group {
@@ -2651,6 +2665,7 @@ impl App {
                             }
                         });
                         if !egui::Popup::is_any_open(ui.ctx())
+                            && !editing::ime_composing(ui.ctx())
                             && ui.input(|i| i.key_pressed(Key::Enter))
                         {
                             connect = true;
@@ -3029,22 +3044,36 @@ impl App {
     }
     pub(crate) fn render(&mut self, ctx: &egui::Context) {
         let p = self.palette;
+        // While a candidate list is open the Enter belongs to the IME, not to
+        // the widget underneath. Letting it through made a text field surrender
+        // focus mid-composition, which threw away the characters being composed;
+        // the commit itself arrives as its own event and is untouched.
+        if editing::ime_composing(ctx) {
+            ctx.input_mut(|input| editing::swallow_ime_keys(&mut input.events));
+        }
         self.handle_dropped_files(ctx);
-        // A close request is held back once while sessions are still connected;
-        // the platform is told to abort it, and the dialog decides the rest.
+        // A platform close (Alt+F4, taskbar, the macOS traffic light) is held
+        // back once while sessions are still connected: the platform is told to
+        // abort it, and the dialog decides the rest. Without the confirmation
+        // the request is answered with a close of our own, because the native
+        // integration leaves the decision to the app.
         if self.screenshot.is_none()
             && !self.exit_confirmed
-            && self.settings.confirm_on_exit
             && ctx.input(|i| i.viewport().close_requested())
-            && self.has_live_sessions()
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_exit = true;
+            if self.settings.confirm_on_exit && self.has_live_sessions() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_exit = true;
+            } else {
+                self.request_exit(ctx);
+            }
         }
         if self.confirm_exit {
             egui::Window::new("确认退出")
                 .collapsible(false)
                 .resizable(false)
+                // Above the file window and anything else that can be raised.
+                .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.label("仍有未断开的连接，确定要退出吗？");
@@ -3402,7 +3431,9 @@ impl App {
                             self.search_focus = false;
                         }
                         if ui.button("查找").clicked()
-                            || (r.has_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
+                            || (r.has_focus()
+                                && !editing::ime_composing(ui.ctx())
+                                && ui.input(|i| i.key_pressed(Key::Enter)))
                         {
                             self.find(false);
                         }
@@ -3531,6 +3562,9 @@ impl App {
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        // Last, so every Enter check above saw the composition state as it was
+        // when the frame started rather than after this frame's commit.
+        editing::track_ime(ctx);
     }
 }
 impl eframe::App for App {
@@ -4098,6 +4132,104 @@ mod tests {
             "looking at the tab must clear the mark"
         );
         assert_eq!(app.tabs[0].seen_output, tab_output(&app.tabs[0]));
+    }
+
+    /// Closes run one frame and report whether a Close command was sent.
+    fn closes(ctx: &egui::Context, app: &mut App, size: Vec2) -> bool {
+        let output = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ctx| app.request_exit(ctx),
+        );
+        output
+            .viewport_output
+            .into_values()
+            .flat_map(|viewport| viewport.commands)
+            .any(|command| matches!(command, egui::ViewportCommand::Close))
+    }
+
+    /// With a live session the close is held back and the dialog is armed; only
+    /// a confirmation closes the window. This is what the titlebar button and a
+    /// platform close request both go through.
+    #[test]
+    fn closing_asks_first_while_a_session_is_live() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        app.settings.confirm_on_exit = true;
+        assert!(app.has_live_sessions(), "the startup shell is live");
+
+        assert!(!closes(&ctx, &mut app, size), "the close must be held back");
+        assert!(app.confirm_exit, "the dialog must be armed");
+
+        app.exit_confirmed = true;
+        assert!(closes(&ctx, &mut app, size), "confirming must close");
+    }
+
+    #[test]
+    fn closing_does_not_ask_when_nothing_is_connected() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        app.settings.confirm_on_exit = true;
+        app.execute(Action::Disconnect, &ctx);
+        assert!(!app.has_live_sessions());
+        assert!(closes(&ctx, &mut app, size), "nothing live means it closes");
+        assert!(!app.confirm_exit, "no dialog for a detached session");
+    }
+
+    /// Enter commits an IME composition, and egui does not filter it out, so a
+    /// form saving on Enter used to save while the user was still picking a
+    /// pinyin candidate. The save itself is what the test watches: an invalid
+    /// profile puts a message in the status bar.
+    #[test]
+    fn enter_does_not_save_a_form_while_a_candidate_list_is_open() {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        app.execute(Action::Remote, &ctx);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+
+        // Composing, then Enter to commit it: the form must stay put.
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                Event::Ime(egui::ImeEvent::Preedit("lianjie".into())),
+                key(Key::Enter, Modifiers::NONE),
+            ],
+            Modifiers::NONE,
+            size,
+        );
+        assert!(
+            app.error.is_none(),
+            "Enter while composing ran the save: {:?}",
+            app.error
+        );
+        assert!(app.remote_open, "the form must still be open");
+
+        // With the composition committed, Enter saves as usual.
+        frame(
+            &mut app,
+            &ctx,
+            vec![Event::Ime(egui::ImeEvent::Commit("连接".into()))],
+            Modifiers::NONE,
+            size,
+        );
+        app.remote.host = "example.com".into();
+        frame(
+            &mut app,
+            &ctx,
+            vec![key(Key::Enter, Modifiers::NONE)],
+            Modifiers::NONE,
+            size,
+        );
+        assert!(!app.remote_open, "a plain Enter still saves");
     }
 
     /// The toolbox types Linux commands, so it must not open on a local shell.

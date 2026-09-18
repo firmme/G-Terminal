@@ -146,7 +146,12 @@ impl ApplicationHandler<Event> for Runner {
             native.window.request_redraw();
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Run one more frame and let the app decide: it either closes
+                // the window itself or cancels the request to confirm first.
+                native.close_requested = true;
+                native.window.request_redraw();
+            }
             WindowEvent::Resized(size) => {
                 if let Err(error) = native.gpu.resize(size.width, size.height) {
                     self.fail(event_loop, error);
@@ -190,6 +195,11 @@ struct Native {
     input: egui_winit::State,
     info: egui::ViewportInfo,
     window: Arc<Window>,
+    /// The platform asked to close and the app has not answered yet. It is
+    /// carried into the next frame's viewport info so the app can hold the
+    /// close back with `CancelClose` — which is how the confirmation dialog
+    /// gets its say. Nothing here exits on its own.
+    close_requested: bool,
 }
 impl Native {
     fn new(
@@ -224,13 +234,22 @@ impl Native {
             input,
             info,
             window,
+            close_requested: false,
         })
     }
     fn draw(&mut self) -> Result<bool> {
         if self.window.is_minimized() == Some(true) || self.gpu.target.is_none() {
-            return Ok(false);
+            // Nothing can be drawn, so the confirmation cannot be shown either;
+            // a pending close request just goes through.
+            return Ok(self.close_requested);
         }
         egui_winit::update_viewport_info(&mut self.info, &self.ctx, &self.window, false);
+        // The close request rides in as a viewport event, which is where
+        // `ViewportInfo::close_requested` looks for it.
+        self.info.events.clear();
+        if self.close_requested {
+            self.info.events.push(egui::ViewportEvent::Close);
+        }
         let mut raw = self.input.take_egui_input(&self.window);
         raw.viewports
             .insert(egui::ViewportId::ROOT, self.info.clone());
@@ -239,12 +258,16 @@ impl Native {
         self.input.handle_platform_output(&self.window, platform);
         self.gpu.paint(&self.ctx, paint)?;
         let mut close = false;
+        let mut cancelled = false;
         let mut actions = vec![];
         if let Some(viewport) = viewports.get(&egui::ViewportId::ROOT) {
-            close = viewport
-                .commands
-                .iter()
-                .any(|c| matches!(c, egui::ViewportCommand::Close));
+            for command in &viewport.commands {
+                match command {
+                    egui::ViewportCommand::Close => close = true,
+                    egui::ViewportCommand::CancelClose => cancelled = true,
+                    _ => {}
+                }
+            }
             egui_winit::process_viewport_commands(
                 &self.ctx,
                 &mut self.info,
@@ -252,6 +275,10 @@ impl Native {
                 &self.window,
                 &mut actions,
             );
+        }
+        if cancelled {
+            self.close_requested = false;
+            self.info.events.clear();
         }
         for action in actions {
             let event = match action {
@@ -273,7 +300,8 @@ impl Native {
         unsafe {
             self.gpu.swap.Present(1, DXGI_PRESENT(0)).ok()?;
         }
-        Ok(close)
+        // Close wins; a request the app cancelled keeps the window open.
+        Ok(close || (self.close_requested && !cancelled))
     }
 }
 

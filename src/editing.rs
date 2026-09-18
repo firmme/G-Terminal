@@ -5,6 +5,72 @@
 
 use eframe::egui;
 
+fn ime_key() -> egui::Id {
+    egui::Id::new("g-terminal-ime-composing")
+}
+
+/// Whether an IME candidate list was open when this frame began.
+///
+/// Enter is how a composition is committed, and egui only filters a few keys
+/// while one is active — Enter is not among them. A form that saves on Enter
+/// therefore has to check this, or picking a pinyin candidate also submits the
+/// dialog. The answer is the state from the *start* of the frame: the commit and
+/// the Enter arrive together, so what matters is whether a list was up before
+/// they were handled.
+pub(crate) fn ime_composing(ctx: &egui::Context) -> bool {
+    let remembered = ctx.data(|data| data.get_temp::<bool>(ime_key()).unwrap_or(false));
+    // The same frame can already carry the composition — a key can arrive with
+    // it — so this frame's events count too, not just the remembered state.
+    remembered
+        || ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Ime(egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_))
+                )
+            })
+        })
+}
+
+/// Removes the keys an open candidate list owns.
+///
+/// Enter would otherwise make a single-line field surrender focus in the middle
+/// of a composition, which discards the characters being typed. Only the key
+/// events go: the commit arrives as [`egui::Event::Ime`] and still reaches the
+/// field.
+pub(crate) fn swallow_ime_keys(events: &mut Vec<egui::Event>) {
+    events.retain(|event| {
+        !matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: true,
+                ..
+            }
+        )
+    });
+}
+
+/// Refreshes [`ime_composing`] from the frame's events. Call once per frame,
+/// after everything that reads it has run.
+pub(crate) fn track_ime(ctx: &egui::Context) {
+    let mut composing = ime_composing(ctx);
+    ctx.input(|input| {
+        for event in &input.events {
+            match event {
+                egui::Event::Ime(egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_)) => {
+                    composing = true;
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => {
+                    composing = false;
+                }
+                _ => {}
+            }
+        }
+    });
+    ctx.data_mut(|data| data.insert_temp(ime_key(), composing));
+}
+
 /// A single-line field with the standard editing menu attached. `customize`
 /// adjusts the builder — width, hint text and so on — before it is added.
 pub(crate) fn field_with(
@@ -133,6 +199,26 @@ fn byte_index(text: &str, char_index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Enter belongs to the candidate list while it is open; the text of the
+    /// composition must be left alone.
+    #[test]
+    fn an_open_candidate_list_takes_enter_but_not_the_text() {
+        let mut events = vec![
+            egui::Event::Ime(egui::ImeEvent::Preedit("lianjie".into())),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("a".into()),
+        ];
+        swallow_ime_keys(&mut events);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(events[1], egui::Event::Text(_)));
+    }
 
     /// The menu works in character offsets while `String` splices bytes; CJK
     /// makes the two differ, so the conversion is what has to be right.

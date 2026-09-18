@@ -186,6 +186,7 @@ impl Login {
                     // Enter submits, matching the other connection dialogs. A
                     // combo/popup consumes Enter for itself first.
                     let enter = !egui::Popup::is_any_open(ui.ctx())
+                        && !editing::ime_composing(ui.ctx())
                         && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("连接").clicked() || enter {
                         self.error = None;
@@ -688,6 +689,9 @@ impl Files {
             .collapsible(false)
             .resizable(false)
             .default_width(400.0)
+            // A prompt the transfer is waiting on must never end up behind the
+            // file window, which is an ordinary window and can be raised.
+            .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(format!(
@@ -949,63 +953,19 @@ impl Files {
             conflict.batch,
         );
         let mut answer = None;
-        egui::Window::new("目标已存在")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(480.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        // A modal, not a window: the transfer is blocked until this is answered,
+        // and a window that shares the file window's grey made it easy to miss.
+        // The backdrop dims everything behind it, so there is no doubt about
+        // what is being asked or where the answer goes.
+        // A modal with a real header and a warn-coloured edge: the transfer is
+        // blocked until this is answered, so it has to read as one dialog rather
+        // than as a heap of equally sized lines and buttons.
+        let frame = egui::Frame::popup(&ctx.style())
+            .stroke(egui::Stroke::new(1.0_f32, p.warn.gamma_multiply(0.7)));
+        egui::Modal::new(egui::Id::new("sftp-transfer-conflict"))
+            .frame(frame)
             .show(ctx, |ui| {
-                ui.add(egui::Label::new(RichText::new(name).color(p.text).strong()).wrap());
-                ui.add(
-                    egui::Label::new(hint(
-                        &format!(
-                            "已有 {} · 本次 {} · 本批共 {} 个文件",
-                            format_size(existing),
-                            format_size(incoming),
-                            batch_size
-                        ),
-                        p,
-                    ))
-                    .wrap(),
-                );
-                ui.add_space(6.0);
-                // The 全部 buttons only mean something when the batch holds more
-                // than the file that asked.
-                let more = batch_size > 1;
-                ui.horizontal(|ui| {
-                    if ui.button("覆盖").clicked() {
-                        answer = Some(remote::ConflictChoice::Overwrite);
-                    }
-                    if ui
-                        .add_enabled(more, egui::Button::new("本批全部覆盖"))
-                        .clicked()
-                    {
-                        answer = Some(remote::ConflictChoice::OverwriteAll);
-                    }
-                    if ui.button("自动重命名").clicked() {
-                        answer = Some(remote::ConflictChoice::Rename);
-                    }
-                    if ui
-                        .add_enabled(more, egui::Button::new("本批全部重命名"))
-                        .clicked()
-                    {
-                        answer = Some(remote::ConflictChoice::RenameAll);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("跳过这个文件").clicked() {
-                        answer = Some(remote::ConflictChoice::Skip);
-                    }
-                    if ui
-                        .add_enabled(more, egui::Button::new("本批全部跳过"))
-                        .clicked()
-                    {
-                        answer = Some(remote::ConflictChoice::SkipAll);
-                    }
-                    if ui.button("取消剩余任务").clicked() {
-                        answer = Some(remote::ConflictChoice::CancelRemaining);
-                    }
-                });
+                answer = conflict_body(ui, &name, existing, incoming, batch_size, p);
             });
         let Some(choice) = answer else {
             return;
@@ -1238,7 +1198,9 @@ impl Files {
                     }
                 }
                 if refresh.clicked()
-                    || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || (edit.lost_focus()
+                        && !editing::ime_composing(ui.ctx())
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                 {
                     *next = Some(self.local_path.clone());
                 }
@@ -1451,7 +1413,9 @@ impl Files {
                     self.remote_path.clone_from(&path);
                 }
                 if refresh.clicked()
-                    || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || (edit.lost_focus()
+                        && !editing::ime_composing(ui.ctx())
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                 {
                     *next = Some(self.remote_path.clone());
                 }
@@ -1931,6 +1895,7 @@ impl Files {
                 .collapsible(false)
                 .resizable(false)
                 .default_width(460.0)
+                .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
                 .show(ctx, |ui| {
@@ -1991,6 +1956,7 @@ impl Files {
                 .collapsible(false)
                 .resizable(false)
                 .default_width(360.0)
+                .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     let edit =
@@ -2006,6 +1972,7 @@ impl Files {
                         if ui.add_enabled(valid, egui::Button::new("确定")).clicked()
                             || (valid
                                 && edit.lost_focus()
+                                && !editing::ime_composing(ui.ctx())
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                         {
                             submit = true;
@@ -2041,6 +2008,7 @@ impl Files {
                 .collapsible(false)
                 .resizable(false)
                 .default_width(400.0)
+                .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.add(egui::Label::new(RichText::new(message).color(p.warn)).wrap());
@@ -2428,6 +2396,98 @@ impl Files {
         self.dialogs(ctx, p);
     }
 }
+/// The body of the overwrite conflict dialog.
+///
+/// A header, the file it is about, the sizes, then the choices — laid out like
+/// a dialog rather than a list of sentences, because this one blocks a transfer
+/// until it is answered.
+pub(crate) fn conflict_body(
+    ui: &mut egui::Ui,
+    name: &str,
+    existing: u64,
+    incoming: u64,
+    batch_size: usize,
+    p: Palette,
+) -> Option<remote::ConflictChoice> {
+    let mut answer = None;
+    ui.set_width(470.0);
+    // A tinted header band, so the dialog announces itself before anything else
+    // is read — the same size for every line is what made it look like a list.
+    egui::Frame::new()
+        .fill(p.warn.gamma_multiply(0.18))
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("目标已存在")
+                    .color(p.warn)
+                    .size(17.0)
+                    .strong(),
+            );
+        });
+    ui.add_space(12.0);
+    ui.label(RichText::new(name).color(p.text).strong());
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!(
+            "已有 {} · 本次 {} · 本批共 {} 个文件",
+            format_size(existing),
+            format_size(incoming),
+            batch_size
+        ))
+        .color(p.muted),
+    );
+    ui.add_space(14.0);
+    // The 全部 buttons only mean something when the batch holds more than the
+    // file that asked.
+    let more = batch_size > 1;
+    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+    // The choices are grouped by what they affect: this file, the whole batch,
+    // then the one that stops everything.
+    ui.horizontal(|ui| {
+        if ui.button("覆盖").clicked() {
+            answer = Some(remote::ConflictChoice::Overwrite);
+        }
+        if ui.button("自动重命名").clicked() {
+            answer = Some(remote::ConflictChoice::Rename);
+        }
+        if ui.button("跳过这个文件").clicked() {
+            answer = Some(remote::ConflictChoice::Skip);
+        }
+    });
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(more, egui::Button::new("本批全部覆盖"))
+            .clicked()
+        {
+            answer = Some(remote::ConflictChoice::OverwriteAll);
+        }
+        if ui
+            .add_enabled(more, egui::Button::new("本批全部重命名"))
+            .clicked()
+        {
+            answer = Some(remote::ConflictChoice::RenameAll);
+        }
+        if ui
+            .add_enabled(more, egui::Button::new("本批全部跳过"))
+            .clicked()
+        {
+            answer = Some(remote::ConflictChoice::SkipAll);
+        }
+    });
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("取消剩余任务").clicked() {
+            answer = Some(remote::ConflictChoice::CancelRemaining);
+        }
+        ui.label(hint("文件不会被改动", p));
+    });
+    answer
+}
+
 pub fn format_size(n: u64) -> String {
     if n >= 1024 * 1024 {
         format!("{:.1} MiB", n as f64 / 1048576.0)
