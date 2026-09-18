@@ -3,6 +3,8 @@
 pub struct TerminalCallbacks {
     pub title: String,
     pub replies: Vec<u8>,
+    /// A BEL arrived since it was last cleared.
+    bell: bool,
 }
 
 impl vt100::Callbacks for TerminalCallbacks {
@@ -12,6 +14,10 @@ impl vt100::Callbacks for TerminalCallbacks {
             .filter(|c| !c.is_control())
             .take(120)
             .collect();
+    }
+
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.bell = true;
     }
 
     fn unhandled_csi(
@@ -72,7 +78,9 @@ impl Terminal {
         }
     }
 
-    pub fn process(&mut self, bytes: &[u8]) {
+    /// Feeds bytes to the parser and reports whether a BEL arrived. The flag is
+    /// consumed here so a session's readers can raise the bell once per ring.
+    pub fn process(&mut self, bytes: &[u8]) -> bool {
         // A bare ZRQINIT header means the server started rz/sz without a pager.
         self.probe_zmodem(bytes);
         for token in self.scanner.feed(bytes) {
@@ -99,6 +107,17 @@ impl Terminal {
             }
         }
         self.revision = self.revision.wrapping_add(1);
+        self.take_bell()
+    }
+
+    /// The shell's window title (OSC 0/2), trimmed. Empty when it set none.
+    pub fn title(&self) -> &str {
+        self.parser.callbacks().title.trim()
+    }
+
+    /// Whether a BEL arrived since the last call, clearing the flag.
+    fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.parser.callbacks_mut().bell)
     }
 
     /// Flags a ZMODEM hex header nobody has answered yet. The frame type says
@@ -402,5 +421,19 @@ mod tests {
         assert_eq!(t.parser.callbacks().replies, b"\x1b[4;9R\x1b[0n\x1b[?1;2c");
         t.process(b"\x1b]2;project-shell\x07");
         assert_eq!(t.parser.callbacks().title, "project-shell");
+        // The trimmed accessor the tab and window titles read.
+        assert_eq!(t.title(), "project-shell");
+    }
+
+    /// A BEL is reported once, then cleared, so a session's reader raises the
+    /// bell a single time per ring.
+    #[test]
+    fn a_bell_is_reported_once_and_cleared() {
+        let mut t = Terminal::new(5, 20, 10);
+        assert!(!t.process(b"no bell here"));
+        assert!(t.process(b"ring\x07"));
+        // The flag was consumed, so the next quiet read reports no bell.
+        assert!(!t.process(b"still quiet"));
+        assert!(t.process(b"\x07"));
     }
 }

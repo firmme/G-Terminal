@@ -601,6 +601,32 @@ impl Files {
         join_path(&self.directory.lock().unwrap().path, name)
     }
 
+    /// The remote directory the listing is showing, for the drag-and-drop hint.
+    pub fn remote_dir(&self) -> String {
+        self.directory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path
+            .clone()
+    }
+
+    /// Queues a local file or directory for upload into the directory the
+    /// window is showing. Used by files dropped onto the app window.
+    pub fn upload_path(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let name = file_name_of(&path);
+        if name.is_empty() {
+            self.error = Some("拖入的路径没有文件名".into());
+            return;
+        }
+        if self.remote_dir().is_empty() {
+            self.error = Some("远程目录还没加载完，请稍后再拖入".into());
+            return;
+        }
+        let directory = path.is_dir();
+        let remote = self.remote_child(&name);
+        self.transfer(path, remote, Direction::Upload, directory, ctx);
+    }
+
     /// Reserves the single operation slot for a short SFTP-side action.
     fn simple(&mut self, name: &str) -> Outcome {
         self.simple_progress(name).1

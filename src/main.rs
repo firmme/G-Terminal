@@ -10,10 +10,58 @@ mod remote_ui;
 mod shaping;
 mod theme;
 mod toolbox;
+mod update;
 mod view;
+
+/// The PNG files an `.iconset` needs, and the pixel size of each. `iconutil`
+/// only accepts these names, so they are fixed rather than derived.
+const ICONSET: [(&str, u32); 10] = [
+    ("icon_16x16.png", 16),
+    ("icon_16x16@2x.png", 32),
+    ("icon_32x32.png", 32),
+    ("icon_32x32@2x.png", 64),
+    ("icon_128x128.png", 128),
+    ("icon_128x128@2x.png", 256),
+    ("icon_256x256.png", 256),
+    ("icon_256x256@2x.png", 512),
+    ("icon_512x512.png", 512),
+    ("icon_512x512@2x.png", 1024),
+];
+
+/// Writes the application mark as the PNG set an `.iconset` directory expects.
+/// It is the same code-drawn [`appicon::pixels`] the window icon and the
+/// Windows `.ico` use, so the mark has one definition.
+fn export_iconset(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for (name, size) in ICONSET {
+        let rgba = appicon::pixels(size);
+        image::save_buffer(
+            dir.join(name),
+            &rgba,
+            size,
+            size,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    }
+    Ok(())
+}
 
 fn main() -> eframe::Result {
     let args: Vec<_> = std::env::args_os().collect();
+    // Packaging hook: emit the mark for `scripts/package-macos.sh` to turn into
+    // the bundle's `.icns`. It returns before any window is created.
+    if let Some(dir) = args
+        .windows(2)
+        .find(|a| a[0] == "--export-iconset")
+        .map(|a| a[1].clone())
+    {
+        if let Err(error) = export_iconset(std::path::Path::new(&dir)) {
+            eprintln!("export-iconset: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let screenshot = args
         .windows(2)
         .find(|a| a[0] == "--screenshot")

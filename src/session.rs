@@ -344,6 +344,9 @@ pub struct Traffic {
     pub up: std::sync::atomic::AtomicU64,
     /// Bytes received from the session.
     pub down: std::sync::atomic::AtomicU64,
+    /// The session's output rang the bell and nobody has looked yet. Read and
+    /// cleared by the UI, so a background tab can show it.
+    pub bell: std::sync::atomic::AtomicBool,
 }
 
 impl Traffic {
@@ -583,7 +586,11 @@ impl Session {
                         let replies = {
                             let mut terminal =
                                 output_terminal.lock().unwrap_or_else(|e| e.into_inner());
-                            terminal.process(&bytes[..n]);
+                            if terminal.process(&bytes[..n]) {
+                                reader_traffic
+                                    .bell
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                             std::mem::take(&mut terminal.parser.callbacks_mut().replies)
                         };
                         if !replies.is_empty() {
@@ -733,7 +740,11 @@ impl Session {
                         let replies = {
                             let mut terminal =
                                 output_terminal.lock().unwrap_or_else(|e| e.into_inner());
-                            terminal.process(&bytes[..n]);
+                            if terminal.process(&bytes[..n]) {
+                                output_traffic
+                                    .bell
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                             std::mem::take(&mut terminal.parser.callbacks_mut().replies)
                         };
                         if !replies.is_empty() {
@@ -904,7 +915,7 @@ impl Session {
                                     }
                                 } else {
                                     counted.add_down(data.len());
-                                    let replies = { let mut t=out.lock().unwrap(); t.process(&data); std::mem::take(&mut t.parser.callbacks_mut().replies) };
+                                    let replies = { let mut t=out.lock().unwrap(); if t.process(&data) { counted.bell.store(true, Ordering::Relaxed); } std::mem::take(&mut t.parser.callbacks_mut().replies) };
                                     if !replies.is_empty() { channel.data(&replies[..]).await?; }
                                     wake();
                                 }
@@ -927,10 +938,18 @@ impl Session {
                         .exit_code
                         .is_some();
                     if !finished {
-                        // Closed without an exit status: the transport dropped
-                        // rather than the shell exiting on its own.
-                        state.lock().unwrap_or_else(|e| e.into_inner()).exit_code = Some(255);
-                        report_end(&state, &out, "连接已断开（未收到退出状态）".into());
+                        if stopped.load(Ordering::Acquire) {
+                            // A deliberate disconnect closes the channel itself
+                            // (see the tick above), so a missing exit status is
+                            // expected here — reporting it would put a bogus
+                            // error on a screen the user just chose to leave.
+                            state.lock().unwrap_or_else(|e| e.into_inner()).exit_code = Some(0);
+                        } else {
+                            // Closed without an exit status: the transport
+                            // dropped rather than the shell exiting on its own.
+                            state.lock().unwrap_or_else(|e| e.into_inner()).exit_code = Some(255);
+                            report_end(&state, &out, "连接已断开（未收到退出状态）".into());
+                        }
                     }
                 }
             }

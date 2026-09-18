@@ -174,6 +174,21 @@ impl Pane {
         let mouse_encoding = terminal.parser.screen().mouse_protocol_encoding();
         let mouse =
             mouse_mode != vt100::MouseProtocolMode::None && !ui.input(|i| i.modifiers.shift);
+        // The link under a screen position, when the application does not own
+        // the mouse. `Cmd`/`Ctrl`-click opens it.
+        let link_under = |screen: &vt100::Screen, pos: Pos2| -> Option<(String, u16, u16, u16)> {
+            if mouse {
+                return None;
+            }
+            let (row, col) = pointer_cell(pos);
+            let (text, columns) = row_line(screen, row, cols);
+            link_at(&text, col as usize).and_then(|(url, start, end)| {
+                let start_col = *columns.get(start)?;
+                let end_col = *columns.get(end.saturating_sub(1))?;
+                Some((url, row, start_col, end_col))
+            })
+        };
+        let mut link = None;
         if self.revision != terminal.revision {
             self.selection = None;
             self.revision = terminal.revision;
@@ -213,7 +228,14 @@ impl Pane {
                 self.scroll_fraction -= lines as f32;
                 self.selection = None;
             }
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            link = ui
+                .input(|i| i.pointer.hover_pos())
+                .and_then(|pos| link_under(terminal.parser.screen(), pos));
+            ui.ctx().set_cursor_icon(if link.is_some() {
+                egui::CursorIcon::PointingHand
+            } else {
+                egui::CursorIcon::Text
+            });
         }
         if response.drag_started() && !mouse {
             if let Some(pos) = ui.input(|i| i.pointer.press_origin()) {
@@ -223,7 +245,17 @@ impl Pane {
             // A drag is not part of a run of clicks.
             self.clicks = 0;
         } else if response.clicked() {
-            if mouse {
+            let link_click = (!mouse && ui.input(|i| i.modifiers.command))
+                .then(|| response.interact_pointer_pos())
+                .flatten()
+                .and_then(|pos| link_under(terminal.parser.screen(), pos));
+            if let Some((url, ..)) = link_click {
+                // Cmd/Ctrl-click opens the link instead of placing a caret.
+                match crate::remote_ui::open_url(&url) {
+                    Ok(()) => notice = Some(format!("已打开 {url}")),
+                    Err(e) => error = Some(e),
+                }
+            } else if mouse {
                 // The application owns the pointer; only drop any selection.
                 self.selection = None;
             } else if let Some(pos) = response.interact_pointer_pos() {
@@ -366,6 +398,14 @@ impl Pane {
         }
 
         if active && keyboard_enabled {
+            // On Windows the Enter that commits an IME composition also arrives
+            // as a key event. Without this it would run the shell as well, so
+            // typing pinyin would execute the command the moment it is picked.
+            let ime_commit = ui.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, Event::Ime(ImeEvent::Commit(_))))
+            });
             for event in ui.input(|i| i.events.clone()) {
                 match event {
                     Event::Copy => {
@@ -406,7 +446,9 @@ impl Pane {
                         outgoing.push(bytes);
                     }
                     Event::Ime(ImeEvent::Preedit(text)) => {
-                        self.composing = true;
+                        // An empty preedit ends the composition; treating it as
+                        // still composing would swallow every later keystroke.
+                        self.composing = !text.is_empty();
                         self.preedit = text;
                     }
                     Event::Ime(ImeEvent::Commit(text)) => {
@@ -424,7 +466,10 @@ impl Pane {
                         modifiers,
                         ..
                     } if !self.composing => {
-                        if modifiers.ctrl && modifiers.shift && key == Key::C {
+                        if key == Key::Enter && ime_commit {
+                            // The IME consumed this Enter to commit the
+                            // composition; it must not reach the shell too.
+                        } else if modifiers.ctrl && modifiers.shift && key == Key::C {
                             if let Some((a, b)) = self.selection {
                                 copied = Some(selection_text(terminal.parser.screen(), a, b));
                             }
@@ -574,6 +619,16 @@ impl Pane {
             }
             for (text, rect, fg) in shaped_runs {
                 crate::shaping::draw(&text_painter, text.trim_end(), rect, size, fg);
+            }
+            // Underline the link the pointer is over, on top of the text.
+            if let Some((_, row, start, end)) = &link {
+                let y = content.min.y + (*row as f32 + 1.0) * cell.y - 2.0;
+                let x0 = content.min.x + *start as f32 * cell.x;
+                let x1 = content.min.x + (*end as f32 + 1.0) * cell.x;
+                text_painter.line_segment(
+                    [egui::pos2(x0, y), egui::pos2(x1, y)],
+                    Stroke::new(1.0_f32, palette.accent),
+                );
             }
         }
         let (row, col) = screen.cursor_position();
@@ -818,9 +873,94 @@ fn selection_text(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -> Strin
     result
 }
 
+/// One screen row as text, plus the screen column each character came from, so
+/// a link's character span can be mapped back to cells for an underline.
+fn row_line(screen: &vt100::Screen, row: u16, cols: u16) -> (String, Vec<u16>) {
+    let mut text = String::new();
+    let mut columns = Vec::new();
+    for col in 0..cols {
+        let Some(cell) = screen.cell(row, col) else {
+            continue;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let contents = cell.contents();
+        if contents.is_empty() {
+            text.push(' ');
+            columns.push(col);
+        } else {
+            for ch in contents.chars() {
+                text.push(ch);
+                columns.push(col);
+            }
+        }
+    }
+    (text, columns)
+}
+
+/// The URL covering character `index`, as `(url, start, end)` character
+/// indices. Only explicit `http(s)://` and `www.` links are taken, so ordinary
+/// words are not turned into links.
+fn link_at(text: &str, index: usize) -> Option<(String, usize, usize)> {
+    for marker in ["http://", "https://", "www."] {
+        let mut from = 0;
+        while let Some(found) = text[from..].find(marker) {
+            let start = from + found;
+            let mut end = start;
+            for (offset, ch) in text[start..].char_indices() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                end = start + offset + ch.len_utf8();
+            }
+            // Trailing punctuation is usually the sentence's, not the URL's.
+            while end > start {
+                let last = text[start..end].chars().next_back().unwrap();
+                if matches!(
+                    last,
+                    '.' | ',' | ';' | ':' | ')' | ']' | '}' | '\'' | '"' | '*'
+                ) {
+                    end -= last.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let start_char = text[..start].chars().count();
+            let end_char = text[..end].chars().count();
+            if index >= start_char && index < end_char {
+                let raw = &text[start..end];
+                let url = if raw.starts_with("www.") {
+                    format!("http://{raw}")
+                } else {
+                    raw.to_string()
+                };
+                return Some((url, start_char, end_char));
+            }
+            from = end.max(start + 1);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_are_found_only_under_the_pointer() {
+        let line = "see https://example.com/a, then http://x.test.";
+        let (url, start, end) = link_at(line, 10).expect("inside the first link");
+        assert_eq!(url, "https://example.com/a");
+        assert_eq!((start, end), (4, 25));
+        // A bare `www.` gets a scheme; the pointer has to be inside it.
+        let (url, _, _) = link_at("go to www.example.org now", 8).unwrap();
+        assert_eq!(url, "http://www.example.org");
+        assert!(link_at("go to www.example.org now", 2).is_none());
+        // Trailing punctuation is not part of the link.
+        let (url, _, _) = link_at("(http://a.test).", 2).unwrap();
+        assert_eq!(url, "http://a.test");
+    }
 
     /// `less` turns on application cursor keys, and then only the SS3 spelling
     /// of the arrows moves it — the CSI one scrolls nothing.

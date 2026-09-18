@@ -25,6 +25,8 @@ pub enum Icon {
     SplitVertical,
     ClosePane,
     Restart,
+    /// A bell, shown on a background tab whose session rang.
+    Bell,
     Search,
     Plus,
     ChevronLeft,
@@ -207,6 +209,13 @@ pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, wid
             // A power symbol: an open ring with a stem through the gap.
             ring(0.85, -1.9, 1.9);
             seg((0.0, -1.05), (0.0, -0.2));
+        }
+        Icon::Bell => {
+            // Dome, rim, top knob, clapper.
+            ring(0.55, std::f32::consts::PI, std::f32::consts::TAU);
+            seg((-0.62, 0.0), (0.62, 0.0));
+            seg((0.0, -0.72), (0.0, -0.52));
+            painter.circle_filled(p(0.0, 0.42), (width * 0.5).max(0.8), color);
         }
         Icon::Search => {
             ring(0.6, 0.0, std::f32::consts::TAU);
@@ -543,7 +552,7 @@ mod tests {
     /// one by mistyping an offset.
     #[test]
     fn every_icon_paints_something_at_every_size() {
-        const ALL: [Icon; 29] = [
+        const ALL: [Icon; 30] = [
             Icon::Terminal,
             Icon::Host,
             Icon::FolderUp,
@@ -556,6 +565,7 @@ mod tests {
             Icon::SplitVertical,
             Icon::ClosePane,
             Icon::Restart,
+            Icon::Bell,
             Icon::Search,
             Icon::Plus,
             Icon::ChevronLeft,

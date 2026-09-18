@@ -15,6 +15,9 @@ pub struct Settings {
     pub profiles: Vec<RemoteProfile>,
     pub serial_profiles: Vec<SerialProfile>,
     pub groups: Vec<String>,
+    /// Tab tag colours by group name, `#rrggbb`. A connection's own colour wins
+    /// over its group's; an empty entry means no colour.
+    pub group_colors: std::collections::BTreeMap<String, String>,
     pub copy_on_select: bool,
     pub hide_dotfiles: bool,
     /// Restore the tabs that were open when the program last closed, as
@@ -44,6 +47,7 @@ impl Default for Settings {
             profiles: Vec::new(),
             serial_profiles: Vec::new(),
             groups: Vec::new(),
+            group_colors: std::collections::BTreeMap::new(),
             copy_on_select: false,
             hide_dotfiles: true,
             restore_tabs: true,
@@ -54,6 +58,13 @@ impl Default for Settings {
         }
     }
 }
+
+/// Colours offered as tag presets, as `#rrggbb`. Nothing is picked by default,
+/// so a connection or group stays transparent until one is chosen.
+pub const TAG_COLORS: [&str; 9] = [
+    "#e06c75", "#e5c07b", "#98c379", "#56b6c2", "#61afef", "#c678dd", "#ff9e64", "#f783ac",
+    "#8bd5ca",
+];
 
 /// The engine used when settings carry none.
 pub const DEFAULT_SEARCH_ENGINE: &str = "google";
@@ -117,6 +128,8 @@ pub struct RemoteProfile {
     pub port: u16,
     pub identity: String,
     pub group: String,
+    /// Tab tag colour, `#rrggbb`; empty means none. Beats the group's colour.
+    pub color: String,
     pub jump: Option<Box<RemoteProfile>>,
     pub forwards: Vec<Forward>,
 }
@@ -137,6 +150,7 @@ impl Default for RemoteProfile {
             port: 22,
             identity: String::new(),
             group: String::new(),
+            color: String::new(),
             jump: None,
             forwards: Vec::new(),
         }
@@ -329,6 +343,7 @@ impl SshConfigBlock {
                 port: self.port.unwrap_or(22),
                 identity: self.identity.clone().unwrap_or_default(),
                 group: String::new(),
+                color: String::new(),
                 jump: self.jump.clone().map(Box::new),
                 forwards: Vec::new(),
             });
@@ -444,6 +459,8 @@ pub struct SerialProfile {
     pub port: String,
     pub baud: u32,
     pub group: String,
+    /// Tab tag colour, `#rrggbb`; empty means none. Beats the group's colour.
+    pub color: String,
 }
 
 impl Default for SerialProfile {
@@ -453,6 +470,7 @@ impl Default for SerialProfile {
             port: "auto".into(),
             baud: DEFAULT_BAUD,
             group: String::new(),
+            color: String::new(),
         }
     }
 }
@@ -534,6 +552,9 @@ impl Settings {
         }
         if let Some(v) = read_field(&value, "groups") {
             settings.groups = v;
+        }
+        if let Some(v) = read_field(&value, "group_colors") {
+            settings.group_colors = v;
         }
         if let Some(v) = read_field(&value, "copy_on_select") {
             settings.copy_on_select = v;
@@ -630,6 +651,30 @@ mod tests {
         assert!(s.serial_profiles.is_empty());
         // A config that predates the field still gets the default engine.
         assert_eq!(s.search_engine, DEFAULT_SEARCH_ENGINE);
+    }
+
+    #[test]
+    fn colors_round_trip_and_default_to_none() {
+        let mut settings = Settings::default();
+        // Nothing is coloured until it is picked.
+        assert!(settings.profiles.is_empty());
+        settings
+            .group_colors
+            .insert("prod".into(), TAG_COLORS[0].into());
+        settings.profiles.push(RemoteProfile {
+            group: "prod".into(),
+            color: TAG_COLORS[2].into(),
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&settings).unwrap();
+        let back = Settings::parse(json.as_bytes()).unwrap();
+        assert_eq!(
+            back.group_colors.get("prod").map(String::as_str),
+            Some(TAG_COLORS[0])
+        );
+        assert_eq!(back.profiles[0].color, TAG_COLORS[2]);
+        assert_eq!(RemoteProfile::default().color, "");
+        assert_eq!(SerialProfile::default().color, "");
     }
 
     #[test]

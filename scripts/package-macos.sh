@@ -40,6 +40,16 @@ binary = os.path.join(macos_dir, "g-terminal")
 shutil.copy2("target/release/g-terminal", binary)
 os.chmod(binary, 0o755)
 
+# The Finder / Dock icon. The mark is code-drawn, so the app itself exports the
+# PNG set and `iconutil` packs it into the bundle's `.icns`.
+iconset = os.path.join("dist", name + ".iconset")
+shutil.rmtree(iconset, ignore_errors=True)
+subprocess.check_call([binary, "--export-iconset", iconset])
+subprocess.check_call(
+    ["iconutil", "-c", "icns", iconset, "-o", os.path.join(resources, "G-Terminal.icns")]
+)
+shutil.rmtree(iconset, ignore_errors=True)
+
 with open(os.path.join(bundle, "Contents", "Info.plist"), "w") as handle:
     handle.write(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -49,6 +59,7 @@ with open(os.path.join(bundle, "Contents", "Info.plist"), "w") as handle:
     <key>CFBundleDisplayName</key><string>G-Terminal</string>
     <key>CFBundleIdentifier</key><string>dev.gterminal.G-Terminal</string>
     <key>CFBundleExecutable</key><string>g-terminal</string>
+    <key>CFBundleIconFile</key><string>G-Terminal</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>{version}</string>
     <key>CFBundleShortVersionString</key><string>{version}</string>

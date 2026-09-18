@@ -2,13 +2,14 @@ use crate::{
     editing, icons,
     remote_ui::{self, Files, Login, format_size, hint},
     theme::{Palette, load_fonts},
+    update,
     view::Pane,
 };
 use eframe::egui::{self, Align, Key, Layout, Rect, RichText, Sense};
 use g_terminal::{
     config::{
         BAUD_RATES, DEFAULT_BAUD, Forward, RemoteProfile, SEARCH_ENGINES, SerialProfile, Settings,
-        search_engine_label,
+        TAG_COLORS, search_engine_label,
     },
     layout::{Axis, Layout as PaneLayout, SavedTab},
     remote::Connection,
@@ -33,6 +34,100 @@ pub(crate) fn accel(shortcut: &str) -> String {
         shortcut.to_string()
     } else {
         shortcut.replace("Ctrl", ACCEL)
+    }
+}
+
+/// Parses `#rrggbb` into a colour. Empty or malformed input means no colour.
+fn parse_tag_color(hex: &str) -> Option<egui::Color32> {
+    let hex = hex.trim().strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let value = u32::from_str_radix(hex, 16).ok()?;
+    Some(egui::Color32::from_rgb(
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+    ))
+}
+
+/// Mixes `color` into `base`; `t` is how much of `color` shows.
+fn blend(base: egui::Color32, color: egui::Color32, t: f32) -> egui::Color32 {
+    let mix = |a: u8, b: u8| {
+        (a as f32 * (1.0 - t) + b as f32 * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    egui::Color32::from_rgb(
+        mix(base.r(), color.r()),
+        mix(base.g(), color.g()),
+        mix(base.b(), color.b()),
+    )
+}
+
+/// The tag colour for a session: the connection's own colour if it has one,
+/// otherwise its group's. Local sessions have neither.
+fn connection_color(
+    kind: &SessionKind,
+    group_colors: &std::collections::BTreeMap<String, String>,
+) -> Option<egui::Color32> {
+    let (color, group) = match kind {
+        SessionKind::Ssh(profile) | SessionKind::Sftp(profile) => (&profile.color, &profile.group),
+        SessionKind::Serial(profile) => (&profile.color, &profile.group),
+        SessionKind::Local(_) => return None,
+    };
+    parse_tag_color(color).or_else(|| group_colors.get(group).and_then(|hex| parse_tag_color(hex)))
+}
+
+/// A row of colour dots plus a "no colour" dot. Returns true when the selection
+/// changed; `selected` is the stored `#rrggbb`, empty for none.
+fn color_picker(ui: &mut egui::Ui, selected: &mut String, p: Palette) -> bool {
+    let mut changed = false;
+    for hex in std::iter::once("").chain(TAG_COLORS.iter().copied()) {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            let centre = rect.center();
+            match parse_tag_color(hex) {
+                Some(color) => {
+                    painter.circle_filled(centre, 6.0, color);
+                }
+                None => {
+                    let stroke = egui::Stroke::new(1.0_f32, p.muted);
+                    painter.circle_stroke(centre, 6.0, stroke);
+                    painter.line_segment(
+                        [
+                            centre + egui::vec2(-4.0, 4.0),
+                            centre + egui::vec2(4.0, -4.0),
+                        ],
+                        stroke,
+                    );
+                }
+            }
+            if *selected == hex {
+                painter.circle_stroke(centre, 8.0, egui::Stroke::new(1.5_f32, p.text));
+            }
+        }
+        if response
+            .on_hover_text(if hex.is_empty() { "无颜色" } else { hex })
+            .clicked()
+        {
+            *selected = hex.to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// macOS calls the key Option; the modifier itself is the same. The word is
+/// used rather than the ⌥ symbol because the loaded UI fonts do not carry it —
+/// it would render as a tofu box, like every glyph the app draws instead.
+fn alt_accel(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("Option+{key}")
+    } else {
+        format!("Alt+{key}")
     }
 }
 
@@ -65,14 +160,28 @@ fn tab_updated(tab: &Tab, active: bool) -> bool {
 #[derive(Clone)]
 enum Action {
     New(SessionKind),
+    /// Open another application window.
+    NewWindow,
+    /// Open a new tab with the same session as this tab's focused pane.
+    DuplicateSession(usize),
     Split(Axis),
     CloseTab(usize),
+    /// Close every tab except this one.
+    CloseOtherTabs(usize),
+    /// Close every tab whose sessions have all ended.
+    CloseDisconnectedTabs,
+    /// Look for a newer GitHub release.
+    CheckUpdates,
     ClosePane,
     Restart,
     Disconnect,
     Remote,
     Edit(usize),
     Remove(usize),
+    /// Copy a saved SSH connection.
+    Duplicate(usize),
+    /// Copy a saved serial connection.
+    DuplicateSerial(usize),
     SerialPicker,
     EditSerial(usize),
     RemoveSerial(usize),
@@ -251,6 +360,11 @@ pub struct App {
     confirm_exit: bool,
     /// The user has already agreed to close with sessions open.
     exit_confirmed: bool,
+    /// What the 检查更新 window shows; written by its worker thread.
+    update_status: Arc<Mutex<update::Status>>,
+    update_open: bool,
+    /// The current OS window title, so it is only sent when it changes.
+    window_title: String,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<std::path::PathBuf>) -> Self {
@@ -312,6 +426,9 @@ impl App {
             sidebar_panel_rect: None,
             confirm_exit: false,
             exit_confirmed: false,
+            update_status: Arc::new(Mutex::new(update::Status::Checking)),
+            update_open: false,
+            window_title: String::new(),
         };
         if app.settings.restore_tabs && app.screenshot.is_none() {
             app.restore();
@@ -358,6 +475,16 @@ impl App {
     fn active_link(&self) -> Option<SessionStatus> {
         let tab = self.tabs.get(self.active)?;
         Some(tab.panes.get(tab.focused)?.session.link())
+    }
+    /// Whether the focused pane is a remote (SSH / SFTP) session. A live local
+    /// shell can still be restarted, so the reconnect entry stays for it.
+    fn active_is_remote(&self) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        tab.panes
+            .get(tab.focused)
+            .is_some_and(|pane| pane.session.remote.is_some())
     }
     /// Whether any session is still running or connecting, which is what the
     /// exit confirmation protects.
@@ -433,12 +560,13 @@ impl App {
         let down = pane.session.traffic.down.load(Ordering::Relaxed);
         self.rates.sample(pane.id, up, down)
     }
-    fn note(&self, tab_id: u64, pane_id: u64, line: &str) {
+    /// Writes a red line on a pane's screen: a cancelled or failed step.
+    fn note_error(&self, tab_id: u64, pane_id: u64, line: &str) {
         if let Some(terminal) = self.terminal_of(tab_id, pane_id) {
             terminal
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .note(line);
+                .note_error(line);
         }
     }
     /// Starts a session, optionally inheriting the screen of the one it
@@ -604,6 +732,20 @@ impl App {
     }
     fn execute(&mut self, action: Action, ctx: &egui::Context) {
         match action {
+            Action::NewWindow => match std::env::current_exe() {
+                Ok(exe) => {
+                    if let Err(error) = std::process::Command::new(exe).spawn() {
+                        self.error = Some(format!("无法新建窗口：{error}"));
+                    }
+                }
+                Err(error) => self.error = Some(format!("无法定位程序：{error}")),
+            },
+            Action::DuplicateSession(i) => {
+                if let Some(tab) = self.tabs.get(i) {
+                    let kind = tab.panes[tab.focused].session.kind.clone();
+                    self.execute(Action::New(kind), ctx);
+                }
+            }
             Action::New(kind) => {
                 // The tab exists before the connection does, so the connection's
                 // notices and failures land in its own console.
@@ -666,6 +808,20 @@ impl App {
                     self.active = self.active.min(self.tabs.len().saturating_sub(1));
                 }
             }
+            Action::CloseOtherTabs(keep) => {
+                if keep < self.tabs.len() {
+                    let kept = self.tabs.remove(keep);
+                    self.tabs.clear();
+                    self.tabs.push(kept);
+                    self.active = 0;
+                }
+            }
+            Action::CloseDisconnectedTabs => {
+                self.tabs
+                    .retain(|tab| tab_link(tab) != SessionStatus::Detached);
+                self.active = self.active.min(self.tabs.len().saturating_sub(1));
+            }
+            Action::CheckUpdates => self.check_updates(ctx),
             Action::ClosePane => {
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     if t.panes.len() > 1 {
@@ -725,9 +881,12 @@ impl App {
                     // output stays readable and Alt+R can bring it back.
                     if !pending {
                         let index = self.tabs[self.active].focused;
+                        // Red, like the other end-of-session notices: leaving a
+                        // session is worth noticing, and the reconnect hint is
+                        // the actionable part.
                         self.tabs[self.active].panes[index]
                             .session
-                            .note("已断开（Alt+R 重连）");
+                            .note_error(&format!("已断开（{} 重连）", alt_accel("R")));
                         self.tabs[self.active].panes[index] = Pane::new(
                             pane_id,
                             Session::disconnected_reusing(
@@ -771,6 +930,44 @@ impl App {
                 self.settings.serial_profiles.remove(i);
                 self.persist();
             }
+            Action::Duplicate(i) => {
+                if let Some(profile) = self.settings.profiles.get(i).cloned() {
+                    let taken: Vec<String> = self
+                        .settings
+                        .profiles
+                        .iter()
+                        .map(|profile| profile.name.clone())
+                        .collect();
+                    let base = if profile.name.trim().is_empty() {
+                        profile.label()
+                    } else {
+                        profile.name.clone()
+                    };
+                    let mut copy = profile;
+                    copy.name = unique_copy_name(&base, &taken);
+                    self.settings.profiles.push(copy);
+                    self.persist();
+                }
+            }
+            Action::DuplicateSerial(i) => {
+                if let Some(profile) = self.settings.serial_profiles.get(i).cloned() {
+                    let taken: Vec<String> = self
+                        .settings
+                        .serial_profiles
+                        .iter()
+                        .map(|profile| profile.name.clone())
+                        .collect();
+                    let base = if profile.name.trim().is_empty() {
+                        profile.label()
+                    } else {
+                        profile.name.clone()
+                    };
+                    let mut copy = profile;
+                    copy.name = unique_copy_name(&base, &taken);
+                    self.settings.serial_profiles.push(copy);
+                    self.persist();
+                }
+            }
             Action::AdoptSshConfig(profile) => match profile.validate() {
                 Ok(()) => {
                     let label = profile.label();
@@ -786,29 +983,7 @@ impl App {
                 None => self.error = Some("服务器工具箱仅用于已连接的 SSH 会话".into()),
             },
             Action::Files => {
-                if let Some(c) = self
-                    .tabs
-                    .get(self.active)
-                    .and_then(|t| t.panes[t.focused].session.remote.clone())
-                {
-                    if self
-                        .files
-                        .as_ref()
-                        .is_none_or(|f| !Arc::ptr_eq(&f.connection, &c))
-                    {
-                        if self.files.as_ref().is_some_and(|f| {
-                            f.transfers.iter().any(|t| t.state.lock().unwrap().running)
-                        }) {
-                            self.error =
-                                Some("文件窗口还有传输任务，请完成或暂停后切换连接".into());
-                            return;
-                        }
-                        self.files = Some(Files::new(c, ctx, self.settings.hide_dotfiles));
-                    }
-                    self.files_open = true;
-                } else {
-                    self.error = Some("请先连接内置 SSH 会话".into());
-                }
+                self.ensure_files(ctx);
             }
         }
         self.search_hits.clear();
@@ -818,6 +993,7 @@ impl App {
             || self.remote_open
             || self.groups_open
             || self.help_open
+            || self.update_open
             || self.login.is_some()
             || self.files_open
         {
@@ -876,12 +1052,20 @@ impl App {
                             }
                             return false;
                         }
+                        // Disconnect only applies while something is connected;
+                        // a live remote connection cannot be "reconnected",
+                        // only a local shell can be restarted from here.
                         if modifiers.alt && *key == Key::C {
-                            action = Some(Action::Disconnect);
+                            if self.active_link() == Some(SessionStatus::Live) {
+                                action = Some(Action::Disconnect);
+                            }
                             return false;
                         }
                         if modifiers.alt && *key == Key::R {
-                            action = Some(Action::Restart);
+                            let live = self.active_link() == Some(SessionStatus::Live);
+                            if !(live && self.active_is_remote()) {
+                                action = Some(Action::Restart);
+                            }
                             return false;
                         }
                         if modifiers.command
@@ -1067,7 +1251,7 @@ impl App {
                         ui.max_rect().right()
                     };
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.menu_button(RichText::new("G  菜单").color(p.accent), |ui| {
+                        brand_menu_button(ui, p.accent, |ui| {
                             for (icon, text, shortcut, a) in [
                                 (
                                     icons::Icon::Terminal,
@@ -1077,6 +1261,7 @@ impl App {
                                         self.settings.default_shell.clone(),
                                     )),
                                 ),
+                                (icons::Icon::Terminal, "新建窗口", None, Action::NewWindow),
                                 (icons::Icon::Host, "新建 SSH 连接", None, Action::Remote),
                                 (
                                     icons::Icon::Terminal,
@@ -1110,36 +1295,37 @@ impl App {
                                     ui.close();
                                 }
                             }
-                            // Disconnect is only meaningful while something is
-                            // connected; reconnect / restart is always offered,
-                            // because a live session may still want restarting.
+                            // Only what the current link state can do is shown:
+                            // a connected session can be disconnected, a
+                            // dropped one reconnected. A live *local* shell can
+                            // still be restarted, so it keeps that entry.
                             let live = self.active_link() == Some(SessionStatus::Live);
-                            ui.add_enabled_ui(live, |ui| {
-                                if icons::icon_row(
+                            if live
+                                && icons::icon_row(
                                     ui,
                                     icons::Icon::ClosePane,
                                     "断开当前连接",
-                                    Some("Alt+C"),
+                                    Some(alt_accel("C").as_str()),
                                     p,
                                 )
                                 .clicked()
-                                {
-                                    *action = Some(Action::Disconnect);
-                                    ui.close();
-                                }
-                            });
-                            if icons::icon_row(
-                                ui,
-                                icons::Icon::Restart,
-                                if live {
-                                    "重新连接 / 重启"
-                                } else {
-                                    "重新连接"
-                                },
-                                Some("Alt+R"),
-                                p,
-                            )
-                            .clicked()
+                            {
+                                *action = Some(Action::Disconnect);
+                                ui.close();
+                            }
+                            if (!live || !self.active_is_remote())
+                                && icons::icon_row(
+                                    ui,
+                                    icons::Icon::Restart,
+                                    if live {
+                                        "重新连接 / 重启"
+                                    } else {
+                                        "重新连接"
+                                    },
+                                    Some(alt_accel("R").as_str()),
+                                    p,
+                                )
+                                .clicked()
                             {
                                 *action = Some(Action::Restart);
                                 ui.close();
@@ -1192,6 +1378,12 @@ impl App {
                                 .clicked()
                             {
                                 self.help_open = true;
+                                ui.close();
+                            }
+                            if icons::icon_row(ui, icons::Icon::Refresh, "检查更新", None, p)
+                                .clicked()
+                            {
+                                *action = Some(Action::CheckUpdates);
                                 ui.close();
                             }
                             ui.separator();
@@ -1290,14 +1482,56 @@ impl App {
                                                     .ctx()
                                                     .read_response(hit_id)
                                                     .is_some_and(|r| r.hovered());
+                                                // A connection or group colour
+                                                // tints the whole label; the
+                                                // connection's own colour wins.
+                                                let active = i == self.active;
+                                                let base = if active { p.raised } else { p.panel };
+                                                // Just enough tint to tell the three states
+                                                // apart: the active tab is a touch brighter with
+                                                // a soft outline, hover a touch brighter still
+                                                // than the plain panel — no shouting.
+                                                let (fill, stroke) = match connection_color(
+                                                    &t.panes[t.focused].session.kind,
+                                                    &self.settings.group_colors,
+                                                ) {
+                                                    Some(color) => (
+                                                        blend(
+                                                            base,
+                                                            color,
+                                                            if active {
+                                                                0.35
+                                                            } else if hovered {
+                                                                0.22
+                                                            } else {
+                                                                0.15
+                                                            },
+                                                        ),
+                                                        if active {
+                                                            egui::Stroke::new(
+                                                                1.0_f32,
+                                                                color.gamma_multiply(0.6),
+                                                            )
+                                                        } else {
+                                                            egui::Stroke::NONE
+                                                        },
+                                                    ),
+                                                    None if active => (
+                                                        blend(p.raised, p.accent, 0.16),
+                                                        egui::Stroke::new(
+                                                            1.0_f32,
+                                                            p.accent.gamma_multiply(0.45),
+                                                        ),
+                                                    ),
+                                                    None if hovered => (
+                                                        blend(p.panel, p.accent, 0.10),
+                                                        egui::Stroke::NONE,
+                                                    ),
+                                                    None => (p.panel, egui::Stroke::NONE),
+                                                };
                                                 egui::Frame::new()
-                                                    .fill(if i == self.active {
-                                                        p.raised
-                                                    } else if hovered {
-                                                        p.accent.gamma_multiply(0.18)
-                                                    } else {
-                                                        p.panel
-                                                    })
+                                                    .fill(fill)
+                                                    .stroke(stroke)
                                                     .inner_margin(egui::Margin::symmetric(6, 0))
                                                     .show(ui, |ui| {
                                                         let mut hit = None;
@@ -1337,13 +1571,23 @@ impl App {
                                                                 } else {
                                                                     p.muted
                                                                 };
-                                                                let text = pane
+                                                                // The shell's own title (OSC 0/2) wins over the
+                                                                // session label once it has set one.
+                                                                let title = pane
                                                                     .session
-                                                                    .kind
-                                                                    .label()
-                                                                    .chars()
-                                                                    .take(18)
-                                                                    .collect::<String>();
+                                                                    .terminal
+                                                                    .lock()
+                                                                    .unwrap_or_else(|e| e.into_inner())
+                                                                    .title()
+                                                                    .to_string();
+                                                                let text = if title.is_empty() {
+                                                                    pane.session.kind.label()
+                                                                } else {
+                                                                    title
+                                                                }
+                                                                .chars()
+                                                                .take(18)
+                                                                .collect::<String>();
                                                                 let label = RichText::new(text)
                                                                     .color(color);
                                                                 let label = if focused {
@@ -1359,6 +1603,28 @@ impl App {
                                                                 } else {
                                                                     label
                                                                 });
+                                                            }
+                                                            // A background tab whose session rang shows a
+                                                            // bell until the tab is looked at.
+                                                            if i != self.active
+                                                                && t.panes.iter().any(|pane| {
+                                                                    pane.session.traffic.bell.load(
+                                                                        std::sync::atomic::Ordering::Relaxed,
+                                                                    )
+                                                                })
+                                                            {
+                                                                let (bell, _) = ui
+                                                                    .allocate_exact_size(
+                                                                        egui::vec2(12.0, 12.0),
+                                                                        Sense::hover(),
+                                                                    );
+                                                                icons::draw(
+                                                                    ui.painter(),
+                                                                    bell,
+                                                                    icons::Icon::Bell,
+                                                                    p.warn,
+                                                                    1.2,
+                                                                );
                                                             }
                                                             // Inside the label row, so it hugs the
                                                             // text instead of floating at the tab's
@@ -1404,18 +1670,51 @@ impl App {
                                                             *action = Some(Action::CloseTab(i));
                                                         }
                                                         r.context_menu(|ui| {
-                                                            for (text, a) in [
+                                                            let others = self.tabs.len() > 1;
+                                                            let disconnected =
+                                                                self.tabs.iter().any(|tab| {
+                                                                    tab_link(tab)
+                                                                        == SessionStatus::Detached
+                                                                });
+                                                            for (text, enabled, a) in [
                                                                 (
                                                                     "左右分屏",
+                                                                    true,
                                                                     Action::Split(Axis::Horizontal),
                                                                 ),
                                                                 (
                                                                     "上下分屏",
+                                                                    true,
                                                                     Action::Split(Axis::Vertical),
                                                                 ),
-                                                                ("关闭标签", Action::CloseTab(i)),
+                                                                (
+                                                                    "复制会话",
+                                                                    true,
+                                                                    Action::DuplicateSession(i),
+                                                                ),
+                                                                (
+                                                                    "关闭标签",
+                                                                    true,
+                                                                    Action::CloseTab(i),
+                                                                ),
+                                                                (
+                                                                    "关闭其它标签页",
+                                                                    others,
+                                                                    Action::CloseOtherTabs(i),
+                                                                ),
+                                                                (
+                                                                    "关闭断开的标签页",
+                                                                    disconnected,
+                                                                    Action::CloseDisconnectedTabs,
+                                                                ),
                                                             ] {
-                                                                if ui.button(text).clicked() {
+                                                                if ui
+                                                                    .add_enabled(
+                                                                        enabled,
+                                                                        egui::Button::new(text),
+                                                                    )
+                                                                    .clicked()
+                                                                {
                                                                     self.active = i;
                                                                     *action = Some(a);
                                                                     ui.close();
@@ -1586,6 +1885,7 @@ impl App {
                             for (text, a) in [
                                 ("连接 SSH", Action::New(SessionKind::Ssh(profile.clone()))),
                                 ("编辑 / 跳板机 / 转发", Action::Edit(index)),
+                                ("复制连接", Action::Duplicate(index)),
                                 ("删除连接", Action::Remove(index)),
                             ] {
                                 if ui.button(text).clicked() {
@@ -1623,6 +1923,7 @@ impl App {
                                     Action::New(SessionKind::Serial(profile.clone())),
                                 ),
                                 ("编辑串口连接", Action::EditSerial(index)),
+                                ("复制连接", Action::DuplicateSerial(index)),
                                 ("删除连接", Action::RemoveSerial(index)),
                             ] {
                                 if ui.button(text).clicked() {
@@ -1910,6 +2211,11 @@ impl App {
                                     edit.desired_width(full)
                                 });
                                 ui.end_row();
+                                ui.label("标签颜色");
+                                ui.horizontal(|ui| {
+                                    color_picker(ui, &mut self.remote.color, p);
+                                });
+                                ui.end_row();
                             });
                         egui::CollapsingHeader::new("ProxyJump 跳板机").show(ui, |ui| {
                             let mut enabled = self.remote.jump.is_some();
@@ -2073,6 +2379,11 @@ impl App {
                                         }
                                     });
                                 ui.end_row();
+                                ui.label("标签颜色");
+                                ui.horizontal(|ui| {
+                                    color_picker(ui, &mut self.serial.color, p);
+                                });
+                                ui.end_row();
                             });
                         ui.label(hint(
                             "串口填 auto 时，连接优先选普通串口，并跳过本程序已占用的串口。",
@@ -2158,18 +2469,50 @@ impl App {
                         self.new_group.clear();
                     }
                 }
+                // Edited apart from the group list so the colours map is not
+                // borrowed while the names are.
+                let mut colors: Vec<String> = self
+                    .settings
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        self.settings
+                            .group_colors
+                            .get(group)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .collect();
                 let mut remove = None;
                 let mut rename = None;
+                let mut recolor = false;
                 for (i, group) in self.settings.groups.iter_mut().enumerate() {
                     let old = group.clone();
                     ui.horizontal(|ui| {
-                        if ui.text_edit_singleline(group).changed() {
+                        if editing::field_with(ui, group, |edit| edit.desired_width(150.0)).changed()
+                        {
                             rename = Some((old.clone(), group.clone()));
+                        }
+                        ui.label(hint("颜色", p));
+                        if color_picker(ui, &mut colors[i], p) {
+                            recolor = true;
                         }
                         if ui.small_button("删除").clicked() {
                             remove = Some(i);
                         }
                     });
+                }
+                if recolor {
+                    for (group, color) in self.settings.groups.iter().zip(colors.iter()) {
+                        if color.is_empty() {
+                            self.settings.group_colors.remove(group);
+                        } else {
+                            self.settings
+                                .group_colors
+                                .insert(group.clone(), color.clone());
+                        }
+                    }
+                    modified = true;
                 }
                 if let Some((old, new)) = rename {
                     for p in &mut self.settings.profiles {
@@ -2182,10 +2525,15 @@ impl App {
                             p.group = new.clone();
                         }
                     }
+                    // The group's colour is keyed by name, so it moves too.
+                    if let Some(color) = self.settings.group_colors.remove(&old) {
+                        self.settings.group_colors.insert(new.clone(), color);
+                    }
                     modified = true;
                 }
                 if let Some(i) = remove {
                     let group = self.settings.groups.remove(i);
+                    self.settings.group_colors.remove(&group);
                     for p in &mut self.settings.profiles {
                         if p.group == group {
                             p.group.clear();
@@ -2198,7 +2546,10 @@ impl App {
                     }
                     modified = true;
                 }
-                ui.label(hint("删除分组后，连接移到未分组。", p));
+                ui.label(hint(
+                    "标签颜色：连接自身的颜色优先于分组；都为空时不着色。删除分组后，连接移到未分组。",
+                    p,
+                ));
             });
         self.groups_open = open;
         if modified {
@@ -2318,6 +2669,7 @@ impl App {
                     port: picker.port.clone(),
                     baud: picker.baud,
                     group: String::new(),
+                    color: String::new(),
                 })));
                 open = false;
             }
@@ -2347,10 +2699,16 @@ impl App {
                 for (key, description) in [
                     (accel("Ctrl+Shift+T / W"), "新建标签 / 关闭窗格"),
                     (accel("Ctrl+Shift+D / E"), "左右 / 上下分屏"),
-                    ("Ctrl+Tab / Alt+Right".to_string(), "切换标签 / 窗格"),
+                    (
+                        format!("Ctrl+Tab / {}", alt_accel("Right")),
+                        "切换标签 / 窗格",
+                    ),
                     (copy_paste, "复制 / 粘贴"),
                     ("Ctrl+C".to_string(), "终端中断"),
-                    ("Alt+C / Alt+R".to_string(), "断开 / 重连当前会话"),
+                    (
+                        format!("{} / {}", alt_accel("C"), alt_accel("R")),
+                        "断开 / 重连当前会话",
+                    ),
                     (accel("Ctrl+Shift+F"), "全部保留历史查找"),
                     (accel("Ctrl+Shift+B / Ctrl+,"), "导航栏 / 设置"),
                     ("中键 / Shift+鼠标".to_string(), "粘贴 / 强制选择"),
@@ -2378,7 +2736,7 @@ impl App {
                 // Backing out leaves the pre-created pane, marked so it still
                 // offers a retry.
                 if let Some((tab_id, pane_id)) = self.login_target.take() {
-                    self.note(tab_id, pane_id, "connect cancelled");
+                    self.note_error(tab_id, pane_id, "connect cancelled");
                     if let Some((tab, index)) = self.locate(tab_id, pane_id) {
                         let kind = self.tabs[tab].panes[index].session.kind.clone();
                         let terminal = self.tabs[tab].panes[index].session.terminal.clone();
@@ -2402,7 +2760,248 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(150));
             }
         }
+        self.update_window(ctx, p);
     }
+
+    /// Kicks off a background check and leaves the result in `update_status`.
+    fn check_updates(&mut self, ctx: &egui::Context) {
+        self.update_open = true;
+        let status = self.update_status.clone();
+        *status.lock().unwrap() = update::Status::Checking;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let next = update::check().unwrap_or_else(update::Status::Failed);
+            *status.lock().unwrap() = next;
+            ctx.request_repaint();
+        });
+    }
+
+    /// Downloads the release and lets `update::install` swap the bundle once
+    /// this process is gone, then quits.
+    fn start_update(&mut self, ctx: &egui::Context, release: update::Release) {
+        let (Some(url), Some(name)) = (release.asset, release.asset_name) else {
+            return;
+        };
+        let status = self.update_status.clone();
+        *status.lock().unwrap() = update::Status::Downloading;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result =
+                update::download(&url, &name).and_then(|archive| update::install(&archive));
+            match result {
+                Ok(()) => {
+                    *status.lock().unwrap() = update::Status::Ready;
+                    ctx.request_repaint();
+                    // Let the "正在重启" note paint before the process goes away.
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    *status.lock().unwrap() = update::Status::Failed(error);
+                    ctx.request_repaint();
+                }
+            }
+        });
+    }
+
+    /// The 检查更新 window.
+    fn update_window(&mut self, ctx: &egui::Context, p: Palette) {
+        if !self.update_open {
+            return;
+        }
+        let status = self.update_status.lock().unwrap().clone();
+        let mut open = true;
+        let mut retry = false;
+        let mut start = None;
+        egui::Window::new("检查更新")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .show(ctx, |ui| match &status {
+                update::Status::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("正在检查 GitHub 上的最新版本…");
+                    });
+                }
+                update::Status::UpToDate { current } => {
+                    ui.label(format!("已是最新版本（{current}）。"));
+                }
+                update::Status::Failed(error) => {
+                    ui.colored_label(p.danger, error);
+                    if ui.button("重试").clicked() {
+                        retry = true;
+                    }
+                }
+                update::Status::Available(release) => {
+                    ui.label(format!(
+                        "发现新版本 {}（当前 {}）。",
+                        release.version,
+                        update::current_version()
+                    ));
+                    if !release.notes.trim().is_empty() {
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(160.0)
+                            .show(ui, |ui| {
+                                ui.add(egui::Label::new(hint(&release.notes, p)).wrap());
+                            });
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if release.asset.is_some() {
+                            if ui.button("下载并更新").clicked() {
+                                start = Some(release.clone());
+                            }
+                        } else {
+                            ui.label(hint("当前平台没有预编译包，请打开发布页手动下载。", p));
+                        }
+                        if ui.button("打开发布页").clicked() {
+                            let _ = crate::remote_ui::open_url(&release.url);
+                        }
+                    });
+                }
+                update::Status::Downloading => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("正在下载新版本…");
+                    });
+                }
+                update::Status::Ready => {
+                    ui.label("更新已就绪，正在重启…");
+                }
+            });
+        self.update_open = open;
+        if retry {
+            self.check_updates(ctx);
+        }
+        if let Some(release) = start {
+            self.start_update(ctx, release);
+        }
+    }
+
+    /// Opens (or switches to) the file window for the focused SSH connection.
+    /// The menu and drag-and-drop both call this; on failure `self.error` says
+    /// why.
+    fn ensure_files(&mut self, ctx: &egui::Context) -> bool {
+        let Some(connection) = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.panes[t.focused].session.remote.clone())
+        else {
+            self.error = Some("请先连接内置 SSH 会话".into());
+            return false;
+        };
+        if self
+            .files
+            .as_ref()
+            .is_none_or(|f| !Arc::ptr_eq(&f.connection, &connection))
+        {
+            if self
+                .files
+                .as_ref()
+                .is_some_and(|f| f.transfers.iter().any(|t| t.state.lock().unwrap().running))
+            {
+                self.error = Some("文件窗口还有传输任务，请完成或暂停后切换连接".into());
+                return false;
+            }
+            self.files = Some(Files::new(connection, ctx, self.settings.hide_dotfiles));
+        }
+        self.files_open = true;
+        true
+    }
+
+    /// Uploads files dropped onto the window through the file window's queue.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        if !self.ensure_files(ctx) {
+            return;
+        }
+        if let Some(files) = self.files.as_mut() {
+            for path in dropped {
+                files.upload_path(path, ctx);
+            }
+        }
+    }
+
+    /// Dims the window and names the target while files are dragged over it.
+    fn drop_overlay(&self, ctx: &egui::Context, p: Palette) {
+        let hovering = ctx.input(|i| i.raw.hovered_files.len());
+        if hovering == 0 {
+            return;
+        }
+        let directory = self
+            .files
+            .as_ref()
+            .map(|files| files.remote_dir())
+            .unwrap_or_default();
+        let rect = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop-overlay"),
+        ));
+        painter.rect_filled(rect, 0, p.bg.gamma_multiply(0.72));
+        painter.rect_stroke(
+            rect.shrink(8.0),
+            8.0,
+            egui::Stroke::new(2.0_f32, p.accent),
+            egui::StrokeKind::Inside,
+        );
+        let text = if directory.is_empty() {
+            format!("松开上传 {hovering} 个文件（先连接 SSH 会话）")
+        } else {
+            format!("松开上传 {hovering} 个文件到 {directory}")
+        };
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(16.0),
+            p.text,
+        );
+    }
+
+    /// Keeps the OS window title on the focused shell's own title (OSC 0/2),
+    /// falling back to its session label. Sent only when it changes.
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        if self.screenshot.is_some() {
+            return;
+        }
+        let shell = self.tabs.get(self.active).map(|tab| {
+            let pane = &tab.panes[tab.focused];
+            let title = pane
+                .session
+                .terminal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .title()
+                .to_string();
+            if title.is_empty() {
+                pane.session.kind.label()
+            } else {
+                title
+            }
+        });
+        let title = match shell {
+            Some(shell) if !shell.is_empty() => format!("{shell} — G-Terminal"),
+            _ => "G-Terminal".to_string(),
+        };
+        if title != self.window_title {
+            self.window_title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+    }
+
     fn find(&mut self, next: bool) {
         if let Some(t) = self.tabs.get_mut(self.active) {
             if !next {
@@ -2430,6 +3029,7 @@ impl App {
     }
     pub(crate) fn render(&mut self, ctx: &egui::Context) {
         let p = self.palette;
+        self.handle_dropped_files(ctx);
         // A close request is held back once while sessions are still connected;
         // the platform is told to abort it, and the dialog decides the rest.
         if self.screenshot.is_none()
@@ -2489,7 +3089,16 @@ impl App {
         // after the strip has been drawn.
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.seen_output = tab_output(tab);
+            // The active tab's bell has been seen; clear it.
+            for pane in &tab.panes {
+                pane.session
+                    .traffic
+                    .bell
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
         }
+        self.update_window_title(ctx);
+        self.drop_overlay(ctx, p);
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
@@ -2822,6 +3431,7 @@ impl App {
                     && !self.remote_open
                     && !self.groups_open
                     && !self.help_open
+                    && !self.update_open
                     && !self.search_open
                     && self.login.is_none()
                     && !self.files_open
@@ -2960,6 +3570,22 @@ fn tab_link(tab: &Tab) -> SessionStatus {
     worst
 }
 
+/// A name for a duplicated connection: `<base> 副本`, numbered when that name
+/// is already in use.
+fn unique_copy_name(base: &str, taken: &[String]) -> String {
+    let candidate = format!("{base} 副本");
+    if !taken.iter().any(|name| name == &candidate) {
+        return candidate;
+    }
+    for index in 2.. {
+        let candidate = format!("{base} 副本 {index}");
+        if !taken.iter().any(|name| name == &candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
 /// Which frame icon a titlebar button paints. `Restore` and `Maximize` are the
 /// same button in two states.
 #[derive(Clone, Copy, PartialEq)]
@@ -2968,6 +3594,57 @@ enum TitleButton {
     Maximize,
     Restore,
     Minimize,
+}
+
+/// The menu button. `G` is a Latin capital, which is shorter than the CJK glyphs
+/// beside it, so it is drawn one size up and the two runs are lined up by their
+/// painted bounds instead of egui's galley centring, which leaves `G` small and
+/// low against 菜单.
+fn brand_menu_button(
+    ui: &mut egui::Ui,
+    color: egui::Color32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let first = ui.fonts_mut(|fonts| {
+        fonts.layout_no_wrap("G".to_owned(), egui::FontId::proportional(17.0), color)
+    });
+    let rest = ui.fonts_mut(|fonts| {
+        fonts.layout_no_wrap("  菜单".to_owned(), egui::FontId::proportional(14.0), color)
+    });
+
+    let padding = ui.spacing().button_padding;
+    let size = egui::vec2(
+        first.size().x + rest.size().x + padding.x * 2.0,
+        (first.size().y.max(rest.size().y) + padding.y * 2.0).max(ui.spacing().interact_size.y),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, false);
+        ui.painter().rect(
+            rect,
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+
+        // Painted bounds, not font metrics: the glyphs' visual centres are what
+        // has to agree, and a CJK run's metrics say little about where its ink
+        // sits. `mesh_bounds` is each run's ink.
+        let ink_centre = |galley: &egui::Galley| {
+            galley.rows.first().map_or(galley.size().y / 2.0, |row| {
+                row.visuals.mesh_bounds.center().y
+            })
+        };
+        let middle = rect.center().y;
+        let first_pos = egui::pos2(rect.left() + padding.x, middle - ink_centre(&first));
+        let rest_pos = egui::pos2(first_pos.x + first.size().x, middle - ink_centre(&rest));
+        let painter = ui.painter();
+        painter.galley(first_pos, first, color);
+        painter.galley(rest_pos, rest, color);
+    }
+    egui::Popup::menu(&response).show(|ui| add_contents(ui));
+    response
 }
 
 /// The topbar's inner margin. macOS runs the content under a hidden native
@@ -3809,6 +4486,77 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::BeginResize(_))),
             "a click in the middle started a resize: {seen:?}"
+        );
+    }
+}
+
+/// Platform-independent helpers, tested everywhere: the app's own test module
+/// is Windows-only because it drives the window chrome.
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn copy_names_are_numbered_when_taken() {
+        let taken = vec!["prod 副本".to_string(), "prod 副本 2".to_string()];
+        assert_eq!(unique_copy_name("prod", &taken), "prod 副本 3");
+        assert_eq!(unique_copy_name("dev", &[]), "dev 副本");
+    }
+
+    #[test]
+    fn the_color_picker_lays_out_and_starts_unselected() {
+        let ctx = egui::Context::default();
+        let mut selected = String::new();
+        let mut changed = false;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                changed = color_picker(ui, &mut selected, Palette::new(false));
+            });
+        });
+        assert!(!changed, "nothing is picked without a click");
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn tag_colors_parse_and_prefer_the_connection() {
+        use g_terminal::config::{RemoteProfile, TAG_COLORS};
+        use std::collections::BTreeMap;
+
+        assert_eq!(
+            parse_tag_color("#8bd5ca"),
+            Some(egui::Color32::from_rgb(0x8b, 0xd5, 0xca))
+        );
+        assert_eq!(parse_tag_color(""), None);
+        assert_eq!(parse_tag_color("#xyzxyz"), None);
+
+        let mut groups = BTreeMap::new();
+        groups.insert("prod".to_string(), TAG_COLORS[0].to_string());
+
+        // The group colour applies while the connection has none.
+        let grouped = RemoteProfile {
+            group: "prod".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            connection_color(&SessionKind::Ssh(grouped), &groups),
+            parse_tag_color(TAG_COLORS[0])
+        );
+
+        // The connection's own colour wins over the group's.
+        let own = RemoteProfile {
+            group: "prod".into(),
+            color: TAG_COLORS[2].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            connection_color(&SessionKind::Ssh(own), &groups),
+            parse_tag_color(TAG_COLORS[2])
+        );
+
+        // Local sessions carry no colour at all.
+        assert_eq!(
+            connection_color(&SessionKind::Local("shell".into()), &groups),
+            None
         );
     }
 }

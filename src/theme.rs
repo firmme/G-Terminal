@@ -210,6 +210,16 @@ fn first_existing(paths: &[&'static str]) -> &'static str {
         .unwrap_or(paths[0])
 }
 
+/// How far to drop the CJK fallback so its baseline lines up with the Latin
+/// font's, as a fraction of the font size. The right value depends on the
+/// fallback face, so it is measured per platform; 0.25 em is macOS (Hiragino /
+/// PingFang against egui's Latin font). Windows and Linux have not been
+/// measured, so they are left alone rather than guessed.
+#[cfg(target_os = "macos")]
+const CJK_BASELINE_NUDGE: f32 = 0.25;
+#[cfg(not(target_os = "macos"))]
+const CJK_BASELINE_NUDGE: f32 = 0.0;
+
 pub fn load_fonts(ctx: &egui::Context) {
     // File-backed pages are faulted in on demand, rather than reading the whole
     // ~19 MiB CJK collection into a private heap allocation at startup.
@@ -262,9 +272,16 @@ pub fn load_fonts(ctx: &egui::Context) {
             .collect()
     });
     for &(name, ref bytes, mono) in system_fonts {
-        fonts
-            .font_data
-            .insert(name.into(), FontData::from_static(bytes.bytes()).into());
+        let mut data = FontData::from_static(bytes.bytes());
+        if !mono {
+            // The CJK fallback's baseline sits well above the Latin font's
+            // (5pt at 20pt on macOS), which leaves every Chinese glyph riding
+            // high beside English and digits. Nudge it down onto the Latin
+            // baseline; the offset scales with the font size, so one factor
+            // covers every text size.
+            data.tweak.y_offset_factor = CJK_BASELINE_NUDGE;
+        }
+        fonts.font_data.insert(name.into(), data.into());
         if mono {
             fonts
                 .families
