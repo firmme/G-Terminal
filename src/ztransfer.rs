@@ -406,7 +406,10 @@ async fn receive_loop<S: AsyncRead + AsyncWrite + Unpin>(
                         tokio::fs::try_exists(&part).await.unwrap_or(false),
                         "续传文件已被移除"
                     );
-                    tokio::fs::OpenOptions::new().append(true).open(&part).await?
+                    tokio::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&part)
+                        .await?
                 } else {
                     let _ = tokio::fs::remove_file(&part).await;
                     tokio::fs::OpenOptions::new()
@@ -690,31 +693,32 @@ mod tests {
         std::fs::write(into.join("source.bin"), b"occupied").unwrap();
         let (ask, mut questions, answers) = ask_channel();
         let handle = Handle::new("source.bin", Some(ask));
-        let saved = crate::remote::runtime().block_on(async {
-            let (mut a, mut b) = tokio::io::duplex(8192);
-            let answering = async {
-                let question = questions
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("传输没有提出问题"))?;
-                assert!(question.existing.is_some());
-                answers
-                    .send(Decision::Rename("kept.bin".into()))
-                    .map_err(|_| anyhow::anyhow!("文件窗口已关闭"))?;
-                Ok::<(), anyhow::Error>(())
-            };
-            let (_, received, ()) = tokio::time::timeout(Duration::from_secs(20), async {
-                tokio::try_join!(
-                    send(&mut a, &source, &handle),
-                    receive(&mut b, &into, &handle),
-                    answering
-                )
+        let saved = crate::remote::runtime()
+            .block_on(async {
+                let (mut a, mut b) = tokio::io::duplex(8192);
+                let answering = async {
+                    let question = questions
+                        .recv()
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("传输没有提出问题"))?;
+                    assert!(question.existing.is_some());
+                    answers
+                        .send(Decision::Rename("kept.bin".into()))
+                        .map_err(|_| anyhow::anyhow!("文件窗口已关闭"))?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                let (_, received, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+                    tokio::try_join!(
+                        send(&mut a, &source, &handle),
+                        receive(&mut b, &into, &handle),
+                        answering
+                    )
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("ZMODEM roundtrip timed out"))??;
+                Ok::<PathBuf, anyhow::Error>(received)
             })
-            .await
-            .map_err(|_| anyhow::anyhow!("ZMODEM roundtrip timed out"))??;
-            Ok::<PathBuf, anyhow::Error>(received)
-        })
-        .unwrap();
+            .unwrap();
         assert_eq!(saved, into.join("kept.bin"));
         assert_eq!(std::fs::read(into.join("kept.bin")).unwrap(), bytes);
         assert_eq!(std::fs::read(into.join("source.bin")).unwrap(), b"occupied");

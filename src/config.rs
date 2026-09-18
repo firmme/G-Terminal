@@ -17,8 +17,19 @@ pub struct Settings {
     pub groups: Vec<String>,
     pub copy_on_select: bool,
     pub hide_dotfiles: bool,
-    pub restore_workspace: bool,
+    /// Restore the tabs that were open when the program last closed, as
+    /// disconnected panes: no shell is started and no host is contacted.
+    pub restore_tabs: bool,
+    /// Ask before closing the window while a session is still connected.
+    pub confirm_on_exit: bool,
+    /// Keep the navigation bar out of the layout and reveal it on hover.
+    pub auto_hide_sidebar: bool,
     pub workspace: Vec<crate::layout::SavedTab>,
+    /// Hosts read from `~/.ssh/config` at startup. Never persisted: the file is
+    /// re-read on every launch, so an edit there is never shadowed by a stale
+    /// copy in `settings.json`.
+    #[serde(skip)]
+    pub ssh_config_profiles: Vec<RemoteProfile>,
 }
 
 impl Default for Settings {
@@ -35,8 +46,11 @@ impl Default for Settings {
             groups: Vec::new(),
             copy_on_select: false,
             hide_dotfiles: true,
-            restore_workspace: true,
+            restore_tabs: true,
+            confirm_on_exit: true,
+            auto_hide_sidebar: false,
             workspace: Vec::new(),
+            ssh_config_profiles: Vec::new(),
         }
     }
 }
@@ -193,6 +207,227 @@ impl RemoteProfile {
     }
 }
 
+/// `~/.ssh/config`, when the platform can name a home directory.
+pub fn ssh_config_path() -> Option<PathBuf> {
+    directories::UserDirs::new()
+        .map(|dirs| PathBuf::from(dirs.home_dir()).join(".ssh").join("config"))
+}
+
+/// Reads and parses `~/.ssh/config`. A missing or unreadable file is not an
+/// error — not having one is the normal state.
+pub fn load_ssh_config() -> Vec<RemoteProfile> {
+    match ssh_config_path().and_then(|path| std::fs::read_to_string(path).ok()) {
+        Some(text) => parse_ssh_config(&text),
+        None => Vec::new(),
+    }
+}
+
+/// Parses an OpenSSH client config, keeping only `Host` blocks that carry a
+/// `HostName`. Every non-wildcard alias on the `Host` line becomes its own
+/// connection pointing at that hostname, which is what the user typed to reach
+/// it. Global options before the first `Host` line, `Include` and `Match`
+/// blocks are ignored: this is a connection list, not an OpenSSH client.
+pub fn parse_ssh_config(text: &str) -> Vec<RemoteProfile> {
+    let mut profiles = Vec::new();
+    let mut block = SshConfigBlock::default();
+    for raw in text.lines() {
+        let Some((key, value)) = ssh_directive(raw) else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("Host") {
+            if let Some(parsed) = block.into_profiles() {
+                profiles.extend(parsed);
+            }
+            block = SshConfigBlock {
+                started: true,
+                aliases: value.split_whitespace().map(str::to_string).collect(),
+                ..Default::default()
+            };
+            continue;
+        }
+        if !block.started {
+            continue;
+        }
+        block.set(&key, &value);
+    }
+    if let Some(parsed) = block.into_profiles() {
+        profiles.extend(parsed);
+    }
+    resolve_jump_aliases(&mut profiles);
+    profiles
+}
+
+/// A `ProxyJump` normally names another alias, and OpenSSH resolves it against
+/// the same file. This client does not read configs at connect time, so the
+/// alias is replaced with the hostname it stands for, losing only the nested
+/// jump (which this client does not support anyway).
+fn resolve_jump_aliases(profiles: &mut [RemoteProfile]) {
+    let targets: Vec<(String, RemoteProfile)> = profiles
+        .iter()
+        .map(|profile| (profile.name.clone(), profile.clone()))
+        .collect();
+    for profile in profiles.iter_mut() {
+        let Some(jump) = profile.jump.as_mut() else {
+            continue;
+        };
+        let Some((_, target)) = targets.iter().find(|(name, _)| *name == jump.host) else {
+            continue;
+        };
+        jump.host = target.host.clone();
+        if jump.user.is_empty() {
+            jump.user = target.user.clone();
+        }
+        if jump.port == 22 {
+            jump.port = target.port;
+        }
+        if jump.identity.is_empty() {
+            jump.identity = target.identity.clone();
+        }
+    }
+}
+
+/// One `Host` block, collected before it is turned into profiles.
+#[derive(Default)]
+struct SshConfigBlock {
+    started: bool,
+    aliases: Vec<String>,
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    identity: Option<String>,
+    jump: Option<RemoteProfile>,
+}
+
+impl SshConfigBlock {
+    /// First value wins, matching OpenSSH's own resolution order.
+    fn set(&mut self, key: &str, value: &str) {
+        match key.to_ascii_lowercase().as_str() {
+            "hostname" if self.hostname.is_none() => self.hostname = Some(value.to_string()),
+            "user" if self.user.is_none() => self.user = Some(value.to_string()),
+            "port" if self.port.is_none() => self.port = value.parse().ok(),
+            "identityfile" if self.identity.is_none() => self.identity = Some(expand_home(value)),
+            "proxyjump" if self.jump.is_none() => self.jump = parse_proxy_jump(value),
+            _ => {}
+        }
+    }
+
+    fn into_profiles(self) -> Option<Vec<RemoteProfile>> {
+        let hostname = self.hostname?;
+        if hostname.trim().is_empty() {
+            return None;
+        }
+        // A wildcard pattern is a rule, not an address to connect to.
+        let mut profiles = Vec::new();
+        for alias in self.aliases {
+            if alias.contains('*') || alias.contains('?') {
+                continue;
+            }
+            profiles.push(RemoteProfile {
+                name: alias,
+                host: hostname.clone(),
+                user: self.user.clone().unwrap_or_default(),
+                port: self.port.unwrap_or(22),
+                identity: self.identity.clone().unwrap_or_default(),
+                group: String::new(),
+                jump: self.jump.clone().map(Box::new),
+                forwards: Vec::new(),
+            });
+        }
+        (!profiles.is_empty()).then_some(profiles)
+    }
+}
+
+/// The first hop of a `ProxyJump`, which is all this client supports.
+fn parse_proxy_jump(value: &str) -> Option<RemoteProfile> {
+    let first = value.split(',').next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    let (user, rest) = match first.split_once('@') {
+        Some((user, rest)) => (user.to_string(), rest),
+        None => (String::new(), first),
+    };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => (rest.to_string(), 22),
+        },
+        None => (rest.to_string(), 22),
+    };
+    if host.trim().is_empty() {
+        return None;
+    }
+    Some(RemoteProfile {
+        host,
+        user,
+        port,
+        ..Default::default()
+    })
+}
+
+/// Splits one config line into a directive and its value, honouring comments
+/// and the `Key value` / `Key=value` forms.
+fn ssh_directive(raw: &str) -> Option<(String, String)> {
+    let line = strip_comment(raw);
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (key, value) = match line.split_once('=') {
+        Some((key, value)) if !key.trim().contains(char::is_whitespace) => (key.trim(), value),
+        _ => match line.split_once(char::is_whitespace) {
+            Some((key, value)) => (key, value),
+            None => (line, ""),
+        },
+    };
+    Some((key.to_string(), unquote(value.trim())))
+}
+
+/// Drops an unquoted `#` comment: `#` inside quotes is part of the value.
+fn strip_comment(line: &str) -> &str {
+    let mut quote = None;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '"' | '\'' if quote == Some(ch) => quote = None,
+            '"' | '\'' if quote.is_none() => quote = Some(ch),
+            '#' if quote.is_none() => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn unquote(value: &str) -> String {
+    if value.len() >= 2
+        && let Some(inner) = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return inner.to_string();
+    }
+    if value.len() >= 2
+        && let Some(inner) = value
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+    {
+        return inner.to_string();
+    }
+    value.to_string()
+}
+
+/// Expands a leading `~` in a config path, which OpenSSH does for
+/// `IdentityFile`.
+fn expand_home(value: &str) -> String {
+    let Some(home) = directories::UserDirs::new().map(|dirs| PathBuf::from(dirs.home_dir())) else {
+        return value.to_string();
+    };
+    match value.strip_prefix("~/") {
+        Some(rest) => home.join(rest).to_string_lossy().into_owned(),
+        None if value == "~" => home.to_string_lossy().into_owned(),
+        None => value.to_string(),
+    }
+}
+
 /// Line speeds offered as presets. 115200 is the default, and is what a
 /// console cable almost always expects.
 pub const BAUD_RATES: [u32; 8] = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
@@ -306,8 +541,14 @@ impl Settings {
         if let Some(v) = read_field(&value, "hide_dotfiles") {
             settings.hide_dotfiles = v;
         }
-        if let Some(v) = read_field(&value, "restore_workspace") {
-            settings.restore_workspace = v;
+        if let Some(v) = read_field(&value, "restore_tabs") {
+            settings.restore_tabs = v;
+        }
+        if let Some(v) = read_field(&value, "confirm_on_exit") {
+            settings.confirm_on_exit = v;
+        }
+        if let Some(v) = read_field(&value, "auto_hide_sidebar") {
+            settings.auto_hide_sidebar = v;
         }
         if let Some(entries) = value.get("workspace").and_then(|v| v.as_array()) {
             // A tab that cannot be rebuilt is skipped; the others still are.
@@ -321,25 +562,30 @@ impl Settings {
 
     pub fn load() -> Result<Self> {
         let path = Self::path();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let raw = std::fs::read(&path)?;
-        match Self::parse(&raw) {
-            Ok(mut settings) => {
-                settings.font_size = settings.font_size.clamp(10.0, 28.0);
-                settings.scrollback = settings.scrollback.clamp(100, 50_000);
-                Ok(settings)
+        let mut settings = if !path.exists() {
+            Self::default()
+        } else {
+            let raw = std::fs::read(&path)?;
+            match Self::parse(&raw) {
+                Ok(mut settings) => {
+                    settings.font_size = settings.font_size.clamp(10.0, 28.0);
+                    settings.scrollback = settings.scrollback.clamp(100, 50_000);
+                    settings
+                }
+                Err(e) => {
+                    // A file that cannot be read at all must not be replaced by
+                    // the defaults this failure returns, so it is put aside for
+                    // recovery instead of being overwritten on the next save.
+                    let backup = path.with_extension("json.broken");
+                    let _ = std::fs::rename(&path, &backup);
+                    return Err(e).with_context(|| format!("无法读取设置 {}", path.display()));
+                }
             }
-            Err(e) => {
-                // A file that cannot be read at all must not be replaced by the
-                // defaults this failure returns, so it is put aside for
-                // recovery instead of being overwritten on the next save.
-                let backup = path.with_extension("json.broken");
-                let _ = std::fs::rename(&path, &backup);
-                Err(e).with_context(|| format!("无法读取设置 {}", path.display()))
-            }
-        }
+        };
+        // The SSH config is authoritative and never stored, so it is (re)read
+        // here rather than parsed out of the settings file.
+        settings.ssh_config_profiles = load_ssh_config();
+        Ok(settings)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -380,7 +626,7 @@ mod tests {
         assert_eq!(s.profiles[0].label(), "10.0.0.8");
         assert!(s.profiles[0].group.is_empty());
         assert!(!s.copy_on_select);
-        assert!(s.restore_workspace);
+        assert!(s.restore_tabs);
         assert!(s.serial_profiles.is_empty());
         // A config that predates the field still gets the default engine.
         assert_eq!(s.search_engine, DEFAULT_SEARCH_ENGINE);
@@ -476,6 +722,88 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn ssh_config_imports_only_host_blocks_with_a_hostname() {
+        let config = "\
+# ~/.ssh/config
+Host *
+    ServerAliveInterval 30
+Host web web-alias
+    HostName web.example.com
+    User deploy
+    Port 2222
+    IdentityFile ~/.ssh/id_web
+    ProxyJump bastion
+Host wildcard-*
+    HostName nope
+Host no-hostname
+    User nobody
+";
+        let profiles = parse_ssh_config(config);
+        // Only the two aliases of the block that names a host, never `*`.
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].name, "web");
+        assert_eq!(profiles[0].host, "web.example.com");
+        assert_eq!(profiles[0].user, "deploy");
+        assert_eq!(profiles[0].port, 2222);
+        assert_eq!(profiles[0].identity, expand_home("~/.ssh/id_web"));
+        assert_eq!(profiles[1].name, "web-alias");
+        assert_eq!(profiles[1].host, "web.example.com");
+        // A global option before the first Host must not leak into the import.
+        assert!(profiles.iter().all(|p| p.port != 30));
+        let jump = profiles[0].jump.as_ref().unwrap();
+        assert_eq!(jump.host, "bastion");
+        assert_eq!(jump.port, 22);
+    }
+
+    #[test]
+    fn ssh_config_accepts_equals_quotes_and_comments() {
+        let config = r#"
+Host=quoted
+  HostName="a#b.example.com" # trailing comment
+  Port=2200
+"#;
+        let profiles = parse_ssh_config(config);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "quoted");
+        assert_eq!(profiles[0].host, "a#b.example.com");
+        assert_eq!(profiles[0].port, 2200);
+    }
+
+    #[test]
+    fn proxy_jump_splits_user_host_port_in_any_combination() {
+        let jump = parse_proxy_jump("root@jump.example.com:2022").unwrap();
+        assert_eq!(jump.user, "root");
+        assert_eq!(jump.host, "jump.example.com");
+        assert_eq!(jump.port, 2022);
+        let plain = parse_proxy_jump("bastion").unwrap();
+        assert_eq!(plain.user, "");
+        assert_eq!(plain.host, "bastion");
+        assert_eq!(plain.port, 22);
+        // Multiple hops: only the first is usable here.
+        assert_eq!(parse_proxy_jump("a,b,c").unwrap().host, "a");
+        assert!(parse_proxy_jump("  ").is_none());
+    }
+
+    #[test]
+    fn proxy_jump_aliases_resolve_to_the_imported_host() {
+        let config = "\
+Host bastion
+    HostName jumphost.example.com
+    User admin
+    Port 2022
+Host app
+    HostName 10.0.0.5
+    ProxyJump bastion
+";
+        let profiles = parse_ssh_config(config);
+        let app = profiles.iter().find(|p| p.name == "app").unwrap();
+        let jump = app.jump.as_ref().unwrap();
+        assert_eq!(jump.host, "jumphost.example.com");
+        assert_eq!(jump.user, "admin");
+        assert_eq!(jump.port, 2022);
     }
 
     #[test]

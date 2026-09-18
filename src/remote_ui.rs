@@ -183,7 +183,11 @@ impl Login {
                     if let Some(error) = &self.error {
                         ui.colored_label(p.danger, error);
                     }
-                    if ui.button("连接").clicked() {
+                    // Enter submits, matching the other connection dialogs. A
+                    // combo/popup consumes Enter for itself first.
+                    let enter = !egui::Popup::is_any_open(ui.ctx())
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("连接").clicked() || enter {
                         self.error = None;
                         self.quiet = false;
                         self.job = Some(remote::connect(

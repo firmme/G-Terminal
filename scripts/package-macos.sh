@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Packages the macOS build the way scripts/package.ps1 packages Windows: the
-# binary, README, LICENSE, and a third-party notice that carries the license
-# files shipping next to each crate.
+# app, README, LICENSE, and a third-party notice that carries the license files
+# shipping next to each crate.
+#
+# The executable is wrapped in a .app bundle. A bare binary double-clicked in
+# Finder is handed to Terminal, which then runs the program in a console
+# window; a bundle is what LaunchServices recognises as a windowed application,
+# so it opens without that Terminal window.
 set -euo pipefail
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
@@ -23,10 +28,44 @@ root = os.path.join("dist", name)
 shutil.rmtree(root, ignore_errors=True)
 os.makedirs(root, exist_ok=True)
 
-shutil.copy2("target/release/g-terminal", root)
+# The bundle: Contents/MacOS holds the executable, Contents/Resources the
+# documentation and third-party notices.
+bundle = os.path.join(root, "G-Terminal.app")
+macos_dir = os.path.join(bundle, "Contents", "MacOS")
+resources = os.path.join(bundle, "Contents", "Resources")
+os.makedirs(macos_dir, exist_ok=True)
+os.makedirs(resources, exist_ok=True)
+
+binary = os.path.join(macos_dir, "g-terminal")
+shutil.copy2("target/release/g-terminal", binary)
+os.chmod(binary, 0o755)
+
+with open(os.path.join(bundle, "Contents", "Info.plist"), "w") as handle:
+    handle.write(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>G-Terminal</string>
+    <key>CFBundleDisplayName</key><string>G-Terminal</string>
+    <key>CFBundleIdentifier</key><string>dev.gterminal.G-Terminal</string>
+    <key>CFBundleExecutable</key><string>g-terminal</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleVersion</key><string>{version}</string>
+    <key>CFBundleShortVersionString</key><string>{version}</string>
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+</dict>
+</plist>
+""")
+
+# A copy of the docs sits beside the bundle too, for anyone who unpacks it just
+# to read them.
 for extra in ("README.md", "LICENSE"):
     if os.path.exists(extra):
         shutil.copy2(extra, root)
+        shutil.copy2(extra, resources)
 
 notices = [
     "G-Terminal third-party dependencies (Cargo.lock, including platform-specific build dependencies).",
@@ -50,12 +89,12 @@ for package in sorted(meta["packages"], key=lambda p: (p["name"], p["version"]))
         and os.path.isfile(os.path.join(crate_root, entry))
     ]
     if license_files:
-        target = os.path.join(root, "licenses", f'{package["name"]}-{package["version"]}')
+        target = os.path.join(resources, "licenses", f'{package["name"]}-{package["version"]}')
         os.makedirs(target, exist_ok=True)
         for entry in license_files:
             shutil.copy2(os.path.join(crate_root, entry), target)
 
-with open(os.path.join(root, "THIRD-PARTY-NOTICES.txt"), "w") as handle:
+with open(os.path.join(resources, "THIRD-PARTY-NOTICES.txt"), "w") as handle:
     handle.write("\n".join(notices) + "\n")
 
 archive = os.path.join("dist", name + ".tar.gz")

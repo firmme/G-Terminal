@@ -76,6 +76,8 @@ enum Action {
     SerialPicker,
     EditSerial(usize),
     RemoveSerial(usize),
+    /// Copy a host imported from `~/.ssh/config` into the saved connections.
+    AdoptSshConfig(RemoteProfile),
     Toolbox,
     Files,
 }
@@ -112,10 +114,14 @@ impl SerialPicker {
     /// attached.
     fn refresh(&mut self) {
         self.ports = serial::available_ports();
-        if self.ports.is_empty() {
-            self.port = "auto".into();
-        } else if !self.ports.iter().any(|p| p.name == self.port) {
-            self.port = self.ports[0].name.clone();
+        // A manually typed device survives a refresh; only an empty field is
+        // filled in from the list.
+        if self.port.trim().is_empty() {
+            self.port = self
+                .ports
+                .first()
+                .map(|port| port.name.clone())
+                .unwrap_or_else(|| "auto".into());
         }
     }
 }
@@ -233,6 +239,18 @@ pub struct App {
     screenshot: Option<std::path::PathBuf>,
     started: std::time::Instant,
     screenshot_requested: bool,
+    /// In auto-hide mode, whether the bar has been pinned open by the topbar
+    /// button instead of hiding until hovered.
+    sidebar_pinned: bool,
+    /// Whether the auto-hidden navigation bar is currently expanded.
+    sidebar_reveal: bool,
+    /// The floating navigation bar's rect from the last frame, so the pointer
+    /// moving onto it keeps it open.
+    sidebar_panel_rect: Option<Rect>,
+    /// The exit confirmation is on screen.
+    confirm_exit: bool,
+    /// The user has already agreed to close with sessions open.
+    exit_confirmed: bool,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<std::path::PathBuf>) -> Self {
@@ -289,9 +307,14 @@ impl App {
             screenshot,
             started: std::time::Instant::now(),
             screenshot_requested: false,
+            sidebar_pinned: false,
+            sidebar_reveal: false,
+            sidebar_panel_rect: None,
+            confirm_exit: false,
+            exit_confirmed: false,
         };
-        if app.settings.restore_workspace && app.screenshot.is_none() {
-            app.restore(ctx);
+        if app.settings.restore_tabs && app.screenshot.is_none() {
+            app.restore();
         }
         if app.tabs.is_empty() {
             app.execute(
@@ -329,6 +352,21 @@ impl App {
             )),
             _ => None,
         }
+    }
+    /// The link state of the focused pane, which is what the menu's
+    /// disconnect / reconnect entry is chosen from.
+    fn active_link(&self) -> Option<SessionStatus> {
+        let tab = self.tabs.get(self.active)?;
+        Some(tab.panes.get(tab.focused)?.session.link())
+    }
+    /// Whether any session is still running or connecting, which is what the
+    /// exit confirmation protects.
+    fn has_live_sessions(&self) -> bool {
+        self.tabs.iter().any(|tab| {
+            tab.panes
+                .iter()
+                .any(|pane| pane.session.pending() || pane.session.link() == SessionStatus::Live)
+        })
     }
     /// Puts a tab on screen before its connection is attempted, so the
     /// connection's own notices and failures have a console that clearly
@@ -534,7 +572,10 @@ impl App {
             }
         }
     }
-    fn restore(&mut self, ctx: &egui::Context) {
+    /// Rebuilds the saved tabs. Every pane, local included, is restored
+    /// disconnected, so no shell starts and no host is contacted until the user
+    /// asks for it.
+    fn restore(&mut self) {
         for saved in self.settings.workspace.clone().into_iter().take(32) {
             if saved.sessions.is_empty()
                 || saved.sessions.len() > 32
@@ -544,19 +585,11 @@ impl App {
             }
             let mut panes = vec![];
             for kind in saved.sessions {
-                if matches!(kind, SessionKind::Local(_)) {
-                    if let Some(p) = self.spawn(kind, ctx) {
-                        panes.push(p);
-                    } else {
-                        break;
-                    }
-                } else {
-                    self.next_id += 1;
-                    panes.push(Pane::new(
-                        self.next_id,
-                        Session::disconnected(kind, self.settings.scrollback),
-                    ));
-                }
+                self.next_id += 1;
+                panes.push(Pane::new(
+                    self.next_id,
+                    Session::disconnected(kind, self.settings.scrollback),
+                ));
             }
             if !panes.is_empty() && saved.layout.valid(panes.len()) {
                 self.tabs.push(Tab {
@@ -738,6 +771,15 @@ impl App {
                 self.settings.serial_profiles.remove(i);
                 self.persist();
             }
+            Action::AdoptSshConfig(profile) => match profile.validate() {
+                Ok(()) => {
+                    let label = profile.label();
+                    self.settings.profiles.push(profile);
+                    self.persist();
+                    self.notify(format!("已保存连接 {label}"));
+                }
+                Err(e) => self.error = Some(e.to_string()),
+            },
             Action::SerialPicker => self.serial_picker = Some(SerialPicker::new()),
             Action::Toolbox => match self.focused_ssh() {
                 Some((profile, _)) => self.toolbox = Some(crate::toolbox::Toolbox::new(&profile)),
@@ -1061,18 +1103,46 @@ impl App {
                                     Some(accel("Ctrl+Shift+W")),
                                     Action::ClosePane,
                                 ),
-                                (
-                                    icons::Icon::Restart,
-                                    "重新连接 / 重启",
-                                    None,
-                                    Action::Restart,
-                                ),
                             ] {
                                 if icons::icon_row(ui, icon, text, shortcut.as_deref(), p).clicked()
                                 {
                                     *action = Some(a);
                                     ui.close();
                                 }
+                            }
+                            // Disconnect is only meaningful while something is
+                            // connected; reconnect / restart is always offered,
+                            // because a live session may still want restarting.
+                            let live = self.active_link() == Some(SessionStatus::Live);
+                            ui.add_enabled_ui(live, |ui| {
+                                if icons::icon_row(
+                                    ui,
+                                    icons::Icon::ClosePane,
+                                    "断开当前连接",
+                                    Some("Alt+C"),
+                                    p,
+                                )
+                                .clicked()
+                                {
+                                    *action = Some(Action::Disconnect);
+                                    ui.close();
+                                }
+                            });
+                            if icons::icon_row(
+                                ui,
+                                icons::Icon::Restart,
+                                if live {
+                                    "重新连接 / 重启"
+                                } else {
+                                    "重新连接"
+                                },
+                                Some("Alt+R"),
+                                p,
+                            )
+                            .clicked()
+                            {
+                                *action = Some(Action::Restart);
+                                ui.close();
                             }
                             if icons::icon_row(
                                 ui,
@@ -1100,14 +1170,8 @@ impl App {
                                 self.groups_open = true;
                                 ui.close();
                             }
-                            if icons::icon_row(
-                                ui,
-                                icons::Icon::Settings,
-                                "服务器工具箱（初始化服务器）",
-                                None,
-                                p,
-                            )
-                            .clicked()
+                            if icons::icon_row(ui, icons::Icon::Settings, "服务器工具箱", None, p)
+                                .clicked()
                             {
                                 *action = Some(Action::Toolbox);
                                 ui.close();
@@ -1140,20 +1204,37 @@ impl App {
                                 p,
                             ));
                         });
-                        if icons::icon_button(
-                            ui,
-                            if self.settings.sidebar {
-                                icons::Icon::ChevronLeft
+                        // In auto-hide mode the button no longer hides the bar
+                        // outright: expanding pins it open, and hiding sends it
+                        // back to hovering. Outside that mode it stays a plain
+                        // show/hide toggle.
+                        let auto_hide = self.settings.auto_hide_sidebar;
+                        let docked = self.settings.sidebar && (!auto_hide || self.sidebar_pinned);
+                        let (icon, hover) = if auto_hide {
+                            if docked {
+                                (icons::Icon::ChevronLeft, "改为自动隐藏")
                             } else {
-                                icons::Icon::ChevronRight
-                            },
-                            p,
-                            icons::Size::Button,
-                        )
-                        .on_hover_text("展开 / 收起导航栏")
-                        .clicked()
+                                (icons::Icon::ChevronRight, "固定展开导航栏")
+                            }
+                        } else if self.settings.sidebar {
+                            (icons::Icon::ChevronLeft, "收起导航栏")
+                        } else {
+                            (icons::Icon::ChevronRight, "展开导航栏")
+                        };
+                        if icons::icon_button(ui, icon, p, icons::Size::Button)
+                            .on_hover_text(hover)
+                            .clicked()
                         {
-                            self.settings.sidebar = !self.settings.sidebar;
+                            if auto_hide {
+                                if self.settings.sidebar {
+                                    self.sidebar_pinned = !self.sidebar_pinned;
+                                } else {
+                                    self.settings.sidebar = true;
+                                    self.sidebar_pinned = true;
+                                }
+                            } else {
+                                self.settings.sidebar = !self.settings.sidebar;
+                            }
                         }
                         ui.separator();
                         // Bound the strip so a stretch of empty bar always remains for
@@ -1392,193 +1473,266 @@ impl App {
             .default_width(185.0)
             .width_range(140.0..=320.0)
             .frame(egui::Frame::new().fill(p.panel).inner_margin(5))
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::CollapsingHeader::new(RichText::new("本地 Shell").color(p.muted))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            for shell in local_shells() {
-                                // Double-click, like every other row in the
-                                // sidebar, so a stray click cannot open a pane.
-                                let row = icons::icon_row(
-                                    ui,
-                                    icons::Icon::Terminal,
-                                    &shell.label,
-                                    None,
-                                    p,
-                                );
-                                if row.double_clicked() {
-                                    *action =
-                                        Some(Action::New(SessionKind::Local(shell.value.clone())));
-                                }
-                                // The executable path matters on Unix, where
-                                // several shells can share a name.
-                                row.on_hover_text(if shell.value.contains('/') {
-                                    format!("双击打开 · {}", shell.value)
-                                } else {
-                                    "双击打开".to_string()
-                                });
-                            }
-                            ui.separator();
-                            let serial =
-                                icons::icon_row(ui, icons::Icon::Host, "连接串口…", None, p);
-                            if serial.double_clicked() {
-                                *action = Some(Action::SerialPicker);
-                            }
-                            serial.on_hover_text("双击打开串口选择");
+            .show(ctx, |ui| self.sidebar_contents(ui, action));
+    }
+    /// The navigation bar's body, shared by the docked panel and the floating
+    /// overlay that auto-hide uses.
+    fn sidebar_contents(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+        let p = self.palette;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("本地 Shell").color(p.muted))
+                .default_open(true)
+                .show(ui, |ui| {
+                    for shell in local_shells() {
+                        // Double-click, like every other row in the
+                        // sidebar, so a stray click cannot open a pane.
+                        let row = icons::icon_row(ui, icons::Icon::Terminal, &shell.label, None, p);
+                        if row.double_clicked() {
+                            *action = Some(Action::New(SessionKind::Local(shell.value.clone())));
+                        }
+                        // The executable path matters on Unix, where
+                        // several shells can share a name.
+                        row.on_hover_text(if shell.value.contains('/') {
+                            format!("双击打开 · {}", shell.value)
+                        } else {
+                            "双击打开".to_string()
                         });
-                    ui.horizontal(|ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(15.0, 15.0), Sense::hover());
-                        icons::draw(ui.painter(), rect, icons::Icon::Host, p.muted, 1.2);
-                        ui.label(hint("连接", p));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icons::icon_button(ui, icons::Icon::Group, p, icons::Size::Row)
-                                .on_hover_text("分组管理")
-                                .clicked()
-                            {
-                                self.groups_open = true;
-                            }
-                            if icons::icon_button(ui, icons::Icon::Plus, p, icons::Size::Row)
-                                .on_hover_text("新建连接")
-                                .clicked()
-                            {
-                                *action = Some(Action::Remote);
-                            }
-                        });
-                    });
-                    let mut groups = self.settings.groups.clone();
-                    for group in self
+                    }
+                    ui.separator();
+                    let serial = icons::icon_row(ui, icons::Icon::Host, "连接串口…", None, p);
+                    if serial.double_clicked() {
+                        *action = Some(Action::SerialPicker);
+                    }
+                    serial.on_hover_text("双击打开串口选择");
+                });
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), Sense::hover());
+                icons::draw(ui.painter(), rect, icons::Icon::Host, p.muted, 1.2);
+                ui.label(hint("连接", p));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icons::icon_button(ui, icons::Icon::Group, p, icons::Size::Row)
+                        .on_hover_text("分组管理")
+                        .clicked()
+                    {
+                        self.groups_open = true;
+                    }
+                    if icons::icon_button(ui, icons::Icon::Plus, p, icons::Size::Row)
+                        .on_hover_text("新建连接")
+                        .clicked()
+                    {
+                        *action = Some(Action::Remote);
+                    }
+                });
+            });
+            let mut groups = self.settings.groups.clone();
+            for group in self
+                .settings
+                .profiles
+                .iter()
+                .map(|p| &p.group)
+                .chain(self.settings.serial_profiles.iter().map(|p| &p.group))
+            {
+                if !group.is_empty() && !groups.contains(group) {
+                    groups.push(group.clone());
+                }
+            }
+            groups.insert(0, String::new());
+            let any_profiles =
+                !self.settings.profiles.is_empty() || !self.settings.serial_profiles.is_empty();
+            for group in groups {
+                let count = self
+                    .settings
+                    .profiles
+                    .iter()
+                    .filter(|p| p.group == group)
+                    .count()
+                    + self
+                        .settings
+                        .serial_profiles
+                        .iter()
+                        .filter(|p| p.group == group)
+                        .count();
+                if group.is_empty() && count == 0 && any_profiles {
+                    continue;
+                }
+                egui::CollapsingHeader::new(format!(
+                    "{} ({count})",
+                    if group.is_empty() {
+                        "未分组"
+                    } else {
+                        &group
+                    }
+                ))
+                .id_salt((&group, "group"))
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (index, profile) in self
                         .settings
                         .profiles
                         .iter()
-                        .map(|p| &p.group)
-                        .chain(self.settings.serial_profiles.iter().map(|p| &p.group))
+                        .enumerate()
+                        .filter(|(_, p)| p.group == group)
                     {
-                        if !group.is_empty() && !groups.contains(group) {
-                            groups.push(group.clone());
+                        let r = icons::icon_row(ui, icons::Icon::Host, &profile.label(), None, p);
+                        if r.double_clicked() {
+                            *action = Some(Action::New(SessionKind::Ssh(profile.clone())));
                         }
-                    }
-                    groups.insert(0, String::new());
-                    let any_profiles = !self.settings.profiles.is_empty()
-                        || !self.settings.serial_profiles.is_empty();
-                    for group in groups {
-                        let count = self
-                            .settings
-                            .profiles
-                            .iter()
-                            .filter(|p| p.group == group)
-                            .count()
-                            + self
-                                .settings
-                                .serial_profiles
-                                .iter()
-                                .filter(|p| p.group == group)
-                                .count();
-                        if group.is_empty() && count == 0 && any_profiles {
-                            continue;
-                        }
-                        egui::CollapsingHeader::new(format!(
-                            "{} ({count})",
-                            if group.is_empty() {
-                                "未分组"
-                            } else {
-                                &group
-                            }
+                        r.on_hover_text(format!(
+                            "{}:{} · 双击连接 / 右键管理",
+                            profile.destination(),
+                            profile.port
                         ))
-                        .id_salt((&group, "group"))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            for (index, profile) in self
-                                .settings
-                                .profiles
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, p)| p.group == group)
-                            {
-                                let r = icons::icon_row(
-                                    ui,
-                                    icons::Icon::Host,
-                                    &profile.label(),
-                                    None,
-                                    p,
-                                );
-                                if r.double_clicked() {
-                                    *action = Some(Action::New(SessionKind::Ssh(profile.clone())));
+                        .context_menu(|ui| {
+                            for (text, a) in [
+                                ("连接 SSH", Action::New(SessionKind::Ssh(profile.clone()))),
+                                ("编辑 / 跳板机 / 转发", Action::Edit(index)),
+                                ("删除连接", Action::Remove(index)),
+                            ] {
+                                if ui.button(text).clicked() {
+                                    *action = Some(a);
+                                    ui.close();
                                 }
-                                r.on_hover_text(format!(
-                                    "{}:{} · 双击连接 / 右键管理",
-                                    profile.destination(),
-                                    profile.port
-                                ))
-                                .context_menu(|ui| {
-                                    for (text, a) in [
-                                        (
-                                            "连接 SSH",
-                                            Action::New(SessionKind::Ssh(profile.clone())),
-                                        ),
-                                        ("编辑 / 跳板机 / 转发", Action::Edit(index)),
-                                        ("删除连接", Action::Remove(index)),
-                                    ] {
-                                        if ui.button(text).clicked() {
-                                            *action = Some(a);
-                                            ui.close();
-                                        }
-                                    }
-                                });
                             }
-                            for (index, profile) in self
-                                .settings
-                                .serial_profiles
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, p)| p.group == group)
-                            {
-                                let r = icons::icon_row(
-                                    ui,
-                                    icons::Icon::Terminal,
-                                    &profile.label(),
-                                    None,
-                                    p,
-                                );
-                                if r.double_clicked() {
-                                    *action =
-                                        Some(Action::New(SessionKind::Serial(profile.clone())));
+                        });
+                    }
+                    for (index, profile) in self
+                        .settings
+                        .serial_profiles
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| p.group == group)
+                    {
+                        let r =
+                            icons::icon_row(ui, icons::Icon::Terminal, &profile.label(), None, p);
+                        if r.double_clicked() {
+                            *action = Some(Action::New(SessionKind::Serial(profile.clone())));
+                        }
+                        r.on_hover_text(format!(
+                            "串口 {} · {} bps · 双击连接 / 右键管理",
+                            if profile.auto() {
+                                "auto".to_string()
+                            } else {
+                                profile.port.clone()
+                            },
+                            profile.baud
+                        ))
+                        .context_menu(|ui| {
+                            for (text, a) in [
+                                (
+                                    "连接串口",
+                                    Action::New(SessionKind::Serial(profile.clone())),
+                                ),
+                                ("编辑串口连接", Action::EditSerial(index)),
+                                ("删除连接", Action::RemoveSerial(index)),
+                            ] {
+                                if ui.button(text).clicked() {
+                                    *action = Some(a);
+                                    ui.close();
                                 }
-                                r.on_hover_text(format!(
-                                    "串口 {} · {} bps · 双击连接 / 右键管理",
-                                    if profile.auto() {
-                                        "auto".to_string()
-                                    } else {
-                                        profile.port.clone()
-                                    },
-                                    profile.baud
-                                ))
-                                .context_menu(|ui| {
-                                    for (text, a) in [
-                                        (
-                                            "连接串口",
-                                            Action::New(SessionKind::Serial(profile.clone())),
-                                        ),
-                                        ("编辑串口连接", Action::EditSerial(index)),
-                                        ("删除连接", Action::RemoveSerial(index)),
-                                    ] {
-                                        if ui.button(text).clicked() {
-                                            *action = Some(a);
-                                            ui.close();
-                                        }
-                                    }
-                                });
                             }
                         });
                     }
                 });
-            });
+            }
+            // Hosts imported from ~/.ssh/config. They live outside the
+            // saved groups because the file, not settings.json, owns
+            // them; "保存到连接" copies one over when it is worth keeping.
+            if !self.settings.ssh_config_profiles.is_empty() {
+                let imported = self.settings.ssh_config_profiles.clone();
+                let count = imported.len();
+                egui::CollapsingHeader::new(format!("SSH-CONFIG ({count})"))
+                    .id_salt("ssh-config")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for profile in imported {
+                            let r =
+                                icons::icon_row(ui, icons::Icon::Host, &profile.label(), None, p);
+                            if r.double_clicked() {
+                                *action = Some(Action::New(SessionKind::Ssh(profile.clone())));
+                            }
+                            r.on_hover_text(format!(
+                                "{}:{} · 双击连接",
+                                profile.destination(),
+                                profile.port
+                            ))
+                            .context_menu(|ui| {
+                                if ui.button("连接 SSH").clicked() {
+                                    *action = Some(Action::New(SessionKind::Ssh(profile.clone())));
+                                    ui.close();
+                                }
+                                if ui.button("保存到连接").clicked() {
+                                    *action = Some(Action::AdoptSshConfig(profile.clone()));
+                                    ui.close();
+                                }
+                            });
+                        }
+                    });
+            }
+        });
+    }
+    /// Auto-hide mode: the bar is out of the layout and drops in from the left
+    /// when the pointer reaches a slim strip at the window edge.
+    fn sidebar_overlay(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
+        let p = self.palette;
+        const STRIP_WIDTH: f32 = 9.0;
+        const PANEL_WIDTH: f32 = 185.0;
+        let avail = ctx.available_rect();
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let strip = Rect::from_min_size(
+            egui::pos2(avail.left(), avail.top()),
+            egui::vec2(STRIP_WIDTH, avail.height()),
+        );
+        let over_strip = pointer.is_some_and(|pos| strip.contains(pos));
+        let over_panel = pointer.is_some_and(|pos| {
+            self.sidebar_panel_rect
+                .is_some_and(|rect| rect.contains(pos))
+        });
+        // A context menu opened from the bar counts as still hovering it.
+        let over_menu = self.sidebar_reveal && egui::Popup::is_any_open(ctx);
+        let reveal = over_strip || over_panel || over_menu;
+        self.sidebar_reveal = reveal;
+        if reveal {
+            let rect = Rect::from_min_size(avail.min, egui::vec2(PANEL_WIDTH, avail.height()));
+            self.sidebar_panel_rect = Some(rect);
+            egui::Area::new(egui::Id::new("navigation-overlay"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.min)
+                .show(ctx, |ui| {
+                    ui.set_width(PANEL_WIDTH);
+                    ui.set_max_height(avail.height());
+                    egui::Frame::new()
+                        .fill(p.panel)
+                        .stroke(egui::Stroke::new(1.0_f32, p.muted.gamma_multiply(0.4)))
+                        .inner_margin(5)
+                        .show(ui, |ui| {
+                            ui.set_width(PANEL_WIDTH - 10.0);
+                            ui.set_max_height(avail.height() - 10.0);
+                            self.sidebar_contents(ui, action);
+                        });
+                });
+        } else {
+            self.sidebar_panel_rect = None;
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("navigation-strip"),
+            ));
+            let center = egui::pos2(avail.left() + 4.0, avail.center().y);
+            let tab = Rect::from_center_size(center, egui::vec2(9.0, 42.0));
+            painter.rect_filled(tab, 3.0, p.panel.gamma_multiply(0.65));
+            icons::draw(
+                &painter,
+                Rect::from_center_size(center, egui::vec2(9.0, 9.0)),
+                icons::Icon::ChevronRight,
+                p.muted,
+                1.4,
+            );
+        }
     }
     fn dialogs(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
         let p = self.palette;
         let mut open = self.settings_open;
         let mut changed = false;
+        let auto_hide_before = self.settings.auto_hide_sidebar;
         egui::Window::new("偏好设置")
             .open(&mut open)
             .collapsible(false)
@@ -1611,8 +1765,20 @@ impl App {
                     .changed();
                 changed |= ui
                     .checkbox(
-                        &mut self.settings.restore_workspace,
-                        "启动时恢复标签与分屏布局",
+                        &mut self.settings.restore_tabs,
+                        "启动时恢复上次关闭的标签（不重连）",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.confirm_on_exit,
+                        "关闭窗口时确认（有活动会话）",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.auto_hide_sidebar,
+                        "自动隐藏导航栏（鼠标移到左侧时悬浮展开）",
                     )
                     .changed();
                 ui.label(hint(
@@ -1620,7 +1786,7 @@ impl App {
                     p,
                 ));
                 ui.label(hint(
-                    "恢复会新建 Shell；远程会话要求重新认证，不恢复进程。",
+                    "恢复只还原标签，全部显示为断开；点「重新连接」后才连上。",
                     p,
                 ));
                 ui.horizontal(|ui| {
@@ -1659,6 +1825,11 @@ impl App {
                 ui.label(hint(Settings::path().to_string_lossy().as_ref(), p));
             });
         self.settings_open = open;
+        if self.settings.auto_hide_sidebar != auto_hide_before {
+            // Turning auto-hide on starts with the bar hidden; turning it off
+            // leaves it docked.
+            self.sidebar_pinned = !self.settings.auto_hide_sidebar;
+        }
         if changed {
             self.palette = Palette::new(self.settings.light_theme);
             self.palette.apply(ctx, self.settings.light_theme);
@@ -1673,6 +1844,11 @@ impl App {
             .collapsible(false)
             .default_width(480.0)
             .show(ctx, |ui| {
+                // Rows come in two widths so the form reads as a grid rather
+                // than as a ragged column: long values span the form, short ones
+                // (ports, groups, rates) take half.
+                let full = 300.0;
+                let half = 150.0;
                 ui.horizontal(|ui| {
                     ui.label("类型");
                     ui.selectable_value(&mut self.profile_kind, ProfileKind::Ssh, "SSH");
@@ -1687,22 +1863,23 @@ impl App {
                             .show(ui, |ui| {
                                 ui.label("主机 / IP");
                                 editing::field_with(ui, &mut self.remote.host, |edit| {
-                                    edit.desired_width(280.0)
+                                    edit.desired_width(full)
                                 });
                                 ui.end_row();
                                 ui.label("端口");
-                                ui.add(
+                                ui.add_sized(
+                                    egui::vec2(half, 20.0),
                                     egui::DragValue::new(&mut self.remote.port).range(1..=65535),
                                 );
                                 ui.end_row();
                                 ui.label("连接名称");
                                 editing::field_with(ui, &mut self.remote.name, |edit| {
-                                    edit.desired_width(280.0)
+                                    edit.desired_width(full)
                                 });
                                 ui.end_row();
                                 ui.label("分组");
                                 egui::ComboBox::from_id_salt("profile-group")
-                                    .width(200.0)
+                                    .width(half)
                                     .selected_text(if self.remote.group.is_empty() {
                                         "未分组"
                                     } else {
@@ -1725,12 +1902,12 @@ impl App {
                                 ui.end_row();
                                 ui.label("用户名");
                                 editing::field_with(ui, &mut self.remote.user, |edit| {
-                                    edit.desired_width(280.0)
+                                    edit.desired_width(full)
                                 });
                                 ui.end_row();
                                 ui.label("私钥路径");
                                 editing::field_with(ui, &mut self.remote.identity, |edit| {
-                                    edit.desired_width(280.0)
+                                    edit.desired_width(full)
                                 });
                                 ui.end_row();
                             });
@@ -1750,20 +1927,23 @@ impl App {
                                     .show(ui, |ui| {
                                         ui.label("地址");
                                         editing::field_with(ui, &mut j.host, |edit| {
-                                            edit.desired_width(280.0)
+                                            edit.desired_width(full)
                                         });
                                         ui.end_row();
                                         ui.label("端口");
-                                        ui.add(egui::DragValue::new(&mut j.port).range(1..=65535));
+                                        ui.add_sized(
+                                            egui::vec2(half, 20.0),
+                                            egui::DragValue::new(&mut j.port).range(1..=65535),
+                                        );
                                         ui.end_row();
                                         ui.label("用户名");
                                         editing::field_with(ui, &mut j.user, |edit| {
-                                            edit.desired_width(280.0)
+                                            edit.desired_width(full)
                                         });
                                         ui.end_row();
                                         ui.label("私钥");
                                         editing::field_with(ui, &mut j.identity, |edit| {
-                                            edit.desired_width(280.0)
+                                            edit.desired_width(full)
                                         });
                                         ui.end_row();
                                     });
@@ -1780,7 +1960,7 @@ impl App {
                                         );
                                         ui.label("→");
                                         editing::field_with(ui, &mut f.target_host, |edit| {
-                                            edit.desired_width(160.0)
+                                            edit.desired_width(half)
                                         });
                                         ui.add(
                                             egui::DragValue::new(&mut f.target_port)
@@ -1811,14 +1991,19 @@ impl App {
                             .min_col_width(72.0)
                             .show(ui, |ui| {
                                 ui.label("串口");
+                                // Typing a device name and picking one from the
+                                // list are both allowed; the field is what is
+                                // actually stored.
+                                editing::field_with(ui, &mut self.serial.port, |edit| {
+                                    edit.desired_width(full)
+                                        .hint_text(format!("{} 或 auto", serial::PORT_EXAMPLE))
+                                });
+                                ui.end_row();
+                                ui.label("选择端口");
                                 ui.horizontal(|ui| {
-                                    editing::field_with(ui, &mut self.serial.port, |edit| {
-                                        edit.desired_width(180.0)
-                                            .hint_text(format!("{} 或 auto", serial::PORT_EXAMPLE))
-                                    });
                                     egui::ComboBox::from_id_salt("serial-port-pick")
-                                        .selected_text("▾")
-                                        .width(150.0)
+                                        .selected_text("选择端口")
+                                        .width(half)
                                         .show_ui(ui, |ui| {
                                             ui.selectable_value(
                                                 &mut self.serial.port,
@@ -1848,7 +2033,7 @@ impl App {
                                 ui.end_row();
                                 ui.label("波特率");
                                 egui::ComboBox::from_id_salt("serial-baud")
-                                    .width(120.0)
+                                    .width(half)
                                     .selected_text(self.serial.baud.to_string())
                                     .show_ui(ui, |ui| {
                                         for baud in BAUD_RATES {
@@ -1862,12 +2047,12 @@ impl App {
                                 ui.end_row();
                                 ui.label("连接名称");
                                 editing::field_with(ui, &mut self.serial.name, |edit| {
-                                    edit.desired_width(280.0)
+                                    edit.desired_width(full)
                                 });
                                 ui.end_row();
                                 ui.label("分组");
                                 egui::ComboBox::from_id_salt("serial-group")
-                                    .width(200.0)
+                                    .width(half)
                                     .selected_text(if self.serial.group.is_empty() {
                                         "未分组"
                                     } else {
@@ -1904,6 +2089,13 @@ impl App {
                         connect = true;
                     }
                 });
+                ui.label(hint("回车保存，Ctrl+回车保存并连接。", p));
+                // A popup consumes Enter itself (picking from a combo), so this
+                // only fires while the form has the keyboard.
+                if !egui::Popup::is_any_open(ui.ctx()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    save = true;
+                    connect = ui.input(|i| i.modifiers.command);
+                }
             });
         self.remote_open = open;
         if refresh_ports {
@@ -1948,17 +2140,24 @@ impl App {
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
+                let mut add_group = false;
                 ui.horizontal(|ui| {
                     editing::field_with(ui, &mut self.new_group, |edit| edit.desired_width(180.0));
                     if ui.button("添加").clicked() {
-                        let name = self.new_group.trim().to_string();
-                        if !name.is_empty() && !self.settings.groups.contains(&name) {
-                            self.settings.groups.push(name);
-                            modified = true;
-                            self.new_group.clear();
-                        }
+                        add_group = true;
                     }
                 });
+                if !egui::Popup::is_any_open(ui.ctx()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    add_group = true;
+                }
+                if add_group {
+                    let name = self.new_group.trim().to_string();
+                    if !name.is_empty() && !self.settings.groups.contains(&name) {
+                        self.settings.groups.push(name);
+                        modified = true;
+                        self.new_group.clear();
+                    }
+                }
                 let mut remove = None;
                 let mut rename = None;
                 for (i, group) in self.settings.groups.iter_mut().enumerate() {
@@ -2047,8 +2246,18 @@ impl App {
                     .resizable(false)
                     .default_width(340.0)
                     .show(ctx, |ui| {
+                        // The list can be empty (nothing attached) and a device
+                        // may need a name the system did not enumerate, so the
+                        // port is always typable as well as selectable.
+                        ui.horizontal(|ui| {
+                            ui.label("串口");
+                            editing::field_with(ui, &mut picker.port, |edit| {
+                                edit.desired_width(200.0)
+                                    .hint_text(format!("{} 或 auto", serial::PORT_EXAMPLE))
+                            });
+                        });
                         if picker.ports.is_empty() {
-                            ui.label(hint("未检测到串口设备。可在连接配置里填 auto。", p));
+                            ui.label(hint("未检测到串口设备，可手动输入或填 auto。", p));
                         } else {
                             ui.label(hint("普通串口在前，蓝牙串口在后。", p));
                             egui::ScrollArea::vertical()
@@ -2090,6 +2299,11 @@ impl App {
                                 cancel = true;
                             }
                         });
+                        if !egui::Popup::is_any_open(ui.ctx())
+                            && ui.input(|i| i.key_pressed(Key::Enter))
+                        {
+                            connect = true;
+                        }
                     });
                 if refresh {
                     picker.refresh();
@@ -2216,6 +2430,36 @@ impl App {
     }
     pub(crate) fn render(&mut self, ctx: &egui::Context) {
         let p = self.palette;
+        // A close request is held back once while sessions are still connected;
+        // the platform is told to abort it, and the dialog decides the rest.
+        if self.screenshot.is_none()
+            && !self.exit_confirmed
+            && self.settings.confirm_on_exit
+            && ctx.input(|i| i.viewport().close_requested())
+            && self.has_live_sessions()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_exit = true;
+        }
+        if self.confirm_exit {
+            egui::Window::new("确认退出")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("仍有未断开的连接，确定要退出吗？");
+                    ui.horizontal(|ui| {
+                        if ui.button("退出").clicked() {
+                            self.exit_confirmed = true;
+                            self.confirm_exit = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button("取消").clicked() {
+                            self.confirm_exit = false;
+                        }
+                    });
+                });
+        }
         // macOS keeps its native resize border; the other platforms are
         // frameless and have to detect the edges themselves.
         if !cfg!(target_os = "macos") {
@@ -2404,7 +2648,11 @@ impl App {
                 }
             });
         if self.settings.sidebar {
-            self.sidebar(ctx, &mut action);
+            if self.settings.auto_hide_sidebar && !self.sidebar_pinned {
+                self.sidebar_overlay(ctx, &mut action);
+            } else {
+                self.sidebar(ctx, &mut action);
+            }
         }
         if let Some((tab_id, pane_id)) = self.split_chooser {
             let exists = self
@@ -3389,6 +3637,41 @@ mod tests {
         app.execute(Action::RemoveSerial(0), &ctx);
         assert!(app.settings.serial_profiles.is_empty());
         assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    /// The auto-hidden bar is out of the layout until the pointer reaches the
+    /// left strip, and collapses again when it leaves. The reveal state is the
+    /// whole interaction, so it is asserted directly.
+    #[test]
+    fn auto_hidden_sidebar_reveals_on_the_left_strip() {
+        let ctx = egui::Context::default();
+        let settings = Settings {
+            auto_hide_sidebar: true,
+            ..Settings::default()
+        };
+        let mut app = App::from_settings(&ctx, settings, None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        assert!(!app.sidebar_reveal, "the bar must start hidden");
+        frame(
+            &mut app,
+            &ctx,
+            vec![Event::PointerMoved(egui::pos2(3.0, 400.0))],
+            Modifiers::NONE,
+            size,
+        );
+        assert!(app.sidebar_reveal, "the left strip must reveal the bar");
+        frame(
+            &mut app,
+            &ctx,
+            vec![Event::PointerMoved(egui::pos2(900.0, 400.0))],
+            Modifiers::NONE,
+            size,
+        );
+        assert!(
+            !app.sidebar_reveal,
+            "leaving the bar and the strip must collapse it"
+        );
     }
 
     /// Runs one frame and collects the viewport commands it produced, so window
