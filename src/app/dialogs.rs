@@ -567,6 +567,7 @@ impl App {
         if self.serial_picker.is_some() {
             let mut open = true;
             let mut connect = false;
+            let mut inspect = false;
             let mut cancel = false;
             let mut refresh = false;
             if let Some(picker) = &mut self.serial_picker {
@@ -625,6 +626,13 @@ impl App {
                             if ui.button("刷新").clicked() {
                                 refresh = true;
                             }
+                            if ui
+                                .button("占用排查")
+                                .on_hover_text("查看哪个程序占着这个端口")
+                                .clicked()
+                            {
+                                inspect = true;
+                            }
                             if ui.button("取消").clicked() {
                                 cancel = true;
                             }
@@ -642,6 +650,9 @@ impl App {
             }
             if cancel {
                 open = false;
+            }
+            if inspect && let Some(picker) = &self.serial_picker {
+                *action = Some(Action::FindPortOwner(picker.port.clone()));
             }
             if connect && let Some(picker) = &self.serial_picker {
                 *action = Some(Action::New(SessionKind::Serial(SerialProfile {
@@ -741,6 +752,11 @@ impl App {
             }
         }
         self.update_window(ctx, p);
+        if let Some(window) = &mut self.port_owner
+            && !window.show(ctx, p)
+        {
+            self.port_owner = None;
+        }
     }
 
     /// The close request the platform raises while sessions are still live

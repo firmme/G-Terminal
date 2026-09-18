@@ -39,6 +39,8 @@ pub(crate) fn accel(shortcut: &str) -> String {
 
 mod dialogs;
 mod panes;
+mod port_owner;
+use port_owner::*;
 mod sidebar;
 mod status;
 mod titlebar;
@@ -100,6 +102,8 @@ enum Action {
     /// Copy a saved serial connection.
     DuplicateSerial(usize),
     SerialPicker,
+    /// Look for the program holding a serial port.
+    FindPortOwner(String),
     EditSerial(usize),
     RemoveSerial(usize),
     /// Copy a host imported from `~/.ssh/config` into the saved connections.
@@ -168,6 +172,8 @@ pub struct App {
     serial_ports: Vec<serial::SerialPortInfo>,
     /// Set while the 本地 Shell serial picker is open.
     serial_picker: Option<SerialPicker>,
+    /// Set while the 串口占用排查 window is open.
+    port_owner: Option<PortOwnerWindow>,
     /// Set while the server toolbox is open.
     toolbox: Option<crate::toolbox::Toolbox>,
     /// Which tab of the 连接配置 window is in front.
@@ -244,6 +250,7 @@ impl App {
             serial: SerialProfile::default(),
             serial_ports: Vec::new(),
             serial_picker: None,
+            port_owner: None,
             toolbox: None,
             profile_kind: ProfileKind::Ssh,
             editing_profile: None,
@@ -467,7 +474,12 @@ impl App {
             }
             None => {
                 // The failure is already in the console; leave a pane that
-                // offers a retry instead of a dead one.
+                // offers a retry instead of a dead one. A serial port that
+                // would not open is very often another program holding it, so
+                // the owner prompt comes up with the port already filled in.
+                if let SessionKind::Serial(profile) = &kind {
+                    self.port_owner = Some(PortOwnerWindow::new(profile.port.clone(), ctx));
+                }
                 if let Some((tab, index)) = self.locate(tab_id, pane_id) {
                     let terminal = self.tabs[tab].panes[index].session.terminal.clone();
                     self.tabs[tab].panes[index] = Pane::new(
@@ -822,6 +834,9 @@ impl App {
                 Err(e) => self.error = Some(e.to_string()),
             },
             Action::SerialPicker => self.serial_picker = Some(SerialPicker::new()),
+            Action::FindPortOwner(port) => {
+                self.port_owner = Some(PortOwnerWindow::new(port, ctx));
+            }
             Action::Toolbox => match self.focused_ssh() {
                 Some((profile, _)) => self.toolbox = Some(crate::toolbox::Toolbox::new(&profile)),
                 None => self.error = Some("服务器工具箱仅用于已连接的 SSH 会话".into()),

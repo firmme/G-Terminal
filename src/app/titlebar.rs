@@ -129,6 +129,12 @@ impl App {
                                     None,
                                     Action::SerialPicker,
                                 ),
+                                (
+                                    icons::Icon::Host,
+                                    "串口占用排查",
+                                    None,
+                                    Action::FindPortOwner(self.port_owner_default()),
+                                ),
                                 (icons::Icon::File, "文件与传输队列", None, Action::Files),
                                 (
                                     icons::Icon::SplitHorizontal,

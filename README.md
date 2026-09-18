@@ -18,6 +18,8 @@ G 菜单，包含服务器工具箱（初始化服务器）：
 
 ![串口连接](docs/screenshots/serial-connection.png)
 
+串口被别的程序占着时，错误提示之外还有「串口占用排查」（G 菜单，串口选择窗口里也有「占用排查」按钮）：它列出持有该端口的进程名、PID 与路径，可以只结束那个程序；Windows 与 Linux 上还能「重启设备」，让占用者的句柄失效而不必关掉它。Windows 走系统句柄表（同 Sysinternals `handle.exe` 的思路），Linux 读 `/proc/<pid>/fd` 按设备号比对，macOS 用 `libproc` 列描述符；三者都只读，列出的进程是否结束完全由用户决定。查看其他用户或高完整性进程的句柄需要管理员权限，未提权时会在窗口里说明。
+
 后台标签有新输出时标签文字带下划线，切回后自动消失：
 
 ![标签页活动标记](docs/screenshots/tab-activity.png)

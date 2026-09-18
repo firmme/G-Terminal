@@ -3,6 +3,7 @@ pub mod config;
 pub mod graphics;
 pub mod input;
 pub mod layout;
+pub mod port_owner;
 pub mod remote;
 pub mod serial;
 pub mod session;
