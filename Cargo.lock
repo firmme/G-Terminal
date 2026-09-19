@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "g-terminal"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "accesskit_winit",
  "anyhow",

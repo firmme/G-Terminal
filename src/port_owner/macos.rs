@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 pub const SUPPORTED: bool = true;
 pub const CAN_RELEASE: bool = false;
+/// There is no prompt-free way to raise privileges here, and an osascript one would need the user's password for a task the app cannot check.
+pub const CAN_ELEVATE: bool = false;
 
 const PROC_PIDLISTFDS: i32 = 1;
 const PROC_PIDFDVNODEPATHINFO: i32 = 2;
@@ -92,6 +94,12 @@ pub fn elevated() -> bool {
     uid == 0
 }
 
+pub fn port_is_free(port: &str) -> Result<bool, String> {
+    // A second open succeeds here too, so the descriptor scan answers; libproc
+    // makes it cheap enough to run before a connect.
+    Ok(scan(port)?.owners.iter().all(Owner::is_self))
+}
+
 pub fn scan(port: &str) -> Result<Report, String> {
     let target = fs::canonicalize(port).map_err(|e| format!("无法读取 {port}：{e}"))?;
     let me = unsafe { c::geteuid() };
@@ -153,6 +161,14 @@ pub fn kill(pid: u32) -> Result<String, String> {
     } else {
         Err("进程仍未退出，请用 root 权限重试".into())
     }
+}
+
+pub fn elevate_kill(_pid: u32, _report: &std::path::Path) -> Result<(), String> {
+    Err("macOS 上请以 root 重新运行本程序后再结束该进程".into())
+}
+
+pub fn elevate_release(_port: &str, _report: &std::path::Path) -> Result<(), String> {
+    Err("macOS 上请以 root 重新运行本程序".into())
 }
 
 pub fn release(_port: &str) -> Result<String, String> {

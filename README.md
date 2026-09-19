@@ -2,7 +2,7 @@
 
 Windows 优先的原生 GPU 终端，使用 Rust、egui，Windows 默认使用原生 Direct3D 11 渲染，其他平台保留 wgpu，无 Electron、Chromium 或 WebView。
 
-当前版本 **0.4.4**。Windows x64 便携版沿用本机 Windows / MSVC 环境验证；macOS 使用隐藏标题栏的原生窗口、用户 `$SHELL` 与系统字体，已在 Apple Silicon 完成编译、测试、界面冒烟与本机打包。Linux 的平台入口保留，尚未实机验证或发布。推荐 Windows 11；ConPTY 要求 Windows 10 1809 或更新版本。
+当前版本 **0.4.5**。Windows x64 便携版沿用本机 Windows / MSVC 环境验证；macOS 使用隐藏标题栏的原生窗口、用户 `$SHELL` 与系统字体，已在 Apple Silicon 完成编译、测试、界面冒烟与本机打包。Linux 的平台入口保留，尚未实机验证或发布。推荐 Windows 11；ConPTY 要求 Windows 10 1809 或更新版本。
 
 ## 截图
 
@@ -18,7 +18,7 @@ G 菜单，包含服务器工具箱（初始化服务器）：
 
 ![串口连接](docs/screenshots/serial-connection.png)
 
-串口被别的程序占着时，错误提示之外还有「串口占用排查」（G 菜单，串口选择窗口里也有「占用排查」按钮）：它列出持有该端口的进程名、PID 与路径，可以只结束那个程序；Windows 与 Linux 上还能「重启设备」，让占用者的句柄失效而不必关掉它。Windows 走系统句柄表（同 Sysinternals `handle.exe` 的思路），Linux 读 `/proc/<pid>/fd` 按设备号比对，macOS 用 `libproc` 列描述符；三者都只读，列出的进程是否结束完全由用户决定。查看其他用户或高完整性进程的句柄需要管理员权限，未提权时会在窗口里说明。
+串口被别的程序占着时，错误提示之外还有「串口占用排查」（G 菜单，串口选择窗口里也有「占用排查」按钮）：它列出持有该端口的进程名、PID 与路径，可以只结束那个程序；Windows 与 Linux 上还能「重启设备」，让占用者的句柄失效而不必关掉它。Windows 走系统句柄表（同 Sysinternals `handle.exe` 的思路），Linux 读 `/proc/<pid>/fd` 按设备号比对，macOS 用 `libproc` 列描述符；三者都只读，列出的进程是否结束完全由用户决定。查看其他用户或高完整性进程的句柄需要管理员权限，未提权时会在窗口里说明。结束不了的程序（属于别的用户、或自身以管理员运行）会给出「以管理员身份结束」：Windows 用 `runas` 重新启动自己、弹出 UAC 授权，Linux 走 `pkexec`，被授权的副本执行完把结果写回窗口；不想结束进程时就「重启设备」。
 
 后台标签有新输出时标签文字带下划线，切回后自动消失：
 

@@ -5,9 +5,14 @@ use super::Report;
 
 pub const SUPPORTED: bool = false;
 pub const CAN_RELEASE: bool = false;
+pub const CAN_ELEVATE: bool = false;
 
 pub fn elevated() -> bool {
     false
+}
+
+pub fn port_is_free(_port: &str) -> Result<bool, String> {
+    Ok(true)
 }
 
 pub fn scan(_port: &str) -> Result<Report, String> {
@@ -16,6 +21,14 @@ pub fn scan(_port: &str) -> Result<Report, String> {
 
 pub fn kill(_pid: u32) -> Result<String, String> {
     Err("此平台尚不支持结束占用串口的进程".into())
+}
+
+pub fn elevate_kill(_pid: u32, _report: &std::path::Path) -> Result<(), String> {
+    Err("此平台尚不支持请求管理员授权".into())
+}
+
+pub fn elevate_release(_port: &str, _report: &std::path::Path) -> Result<(), String> {
+    Err("此平台尚不支持请求管理员授权".into())
 }
 
 pub fn release(_port: &str) -> Result<String, String> {

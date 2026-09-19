@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 pub const SUPPORTED: bool = true;
 /// Restarting a USB serial device writes to sysfs, which needs root.
 pub const CAN_RELEASE: bool = true;
+pub const CAN_ELEVATE: bool = true;
 
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
@@ -29,6 +30,12 @@ mod c {
 pub fn elevated() -> bool {
     let uid = unsafe { c::geteuid() };
     uid == 0
+}
+
+pub fn port_is_free(port: &str) -> Result<bool, String> {
+    // A second open succeeds on Unix, so the owner scan is what answers; it
+    // reads /proc and is far cheaper than the Windows handle walk.
+    Ok(scan(port)?.owners.iter().all(Owner::is_self))
 }
 
 pub fn scan(port: &str) -> Result<Report, String> {
@@ -124,6 +131,42 @@ pub fn release(port: &str) -> Result<String, String> {
     Ok(format!("已重启 {name}（驱动 {driver}），现在可以重新连接"))
 }
 
+/// Ends a process through `pkexec`, which is the polkit prompt a desktop shows
+/// for privileged work. The copy the prompt starts runs `--kill-pid` and writes
+/// its outcome to `report`.
+pub fn elevate_kill(pid: u32, report: &Path) -> Result<(), String> {
+    if pid == std::process::id() {
+        return Err("那是本程序自己，不能结束".into());
+    }
+    pkexec(&["--kill-pid", &pid.to_string()], report)
+}
+
+/// Restarts the device through `pkexec`, the same way.
+pub fn elevate_release(port: &str, report: &Path) -> Result<(), String> {
+    pkexec(&["--release-port", port], report)
+}
+
+fn pkexec(arguments: &[&str], report: &Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位本程序：{e}"))?;
+    let status = std::process::Command::new("pkexec")
+        .arg(&exe)
+        .args(arguments)
+        .arg("--report")
+        .arg(report)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "系统上没有 pkexec（polkit），无法请求管理员授权".to_string()
+            } else {
+                format!("无法启动 pkexec：{e}")
+            }
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("管理员授权被取消或失败".into())
+    }
+}
 fn describe(action: &str, error: &std::io::Error) -> String {
     if error.kind() == std::io::ErrorKind::PermissionDenied {
         format!("{action}设备需要 root 权限，请以 root 运行或改用结束进程")

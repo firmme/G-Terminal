@@ -66,9 +66,35 @@ pub const SUPPORTED: bool = imp::SUPPORTED;
 /// Whether restarting the device under the port is implemented.
 pub const CAN_RELEASE: bool = imp::CAN_RELEASE;
 
+/// Whether the app can ask for administrator rights by relaunching itself. A
+/// task that is out of reach is not out of reach for its elevated copy, so the
+/// prompt offers that instead of giving up.
+pub const CAN_ELEVATE: bool = imp::CAN_ELEVATE;
+
+/// Relaunches this app privileged to end `pid`, writing the outcome to
+/// `report`. Returns once the elevation request was answered; the report
+/// arrives later, when the privileged copy has run.
+pub fn elevate_kill(pid: u32, report: &std::path::Path) -> Result<(), String> {
+    imp::elevate_kill(pid, report)
+}
+
+/// Relaunches this app privileged to restart the device behind `port`.
+pub fn elevate_release(port: &str, report: &std::path::Path) -> Result<(), String> {
+    imp::elevate_release(port, report)
+}
+
 /// Whether the current process is elevated (administrator/root).
 pub fn elevated() -> bool {
     imp::elevated()
+}
+
+/// Whether `port` can be opened right now. The check has to be cheap, because
+/// it runs before every serial connect: on Windows a held port is refused at
+/// once, so an open attempt answers it; on Unix a second open would succeed, so
+/// the owner scan answers instead.
+pub fn port_is_free(port: &str) -> Result<bool, String> {
+    let resolved = crate::serial::resolve(port).map_err(|e| format!("{e:#}"))?;
+    imp::port_is_free(&resolved)
 }
 
 /// Lists the processes holding `port`, resolving `auto` first.

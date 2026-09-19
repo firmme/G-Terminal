@@ -47,8 +47,40 @@ fn export_iconset(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Runs one privileged action for the owner prompt's elevated copy, if the
+/// command line asks for one. The outcome goes to `--report`, because a release
+/// build has no console to print to and the caller is watching that file.
+fn run_elevated_action(args: &[std::ffi::OsString]) -> Option<i32> {
+    let value = |flag: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].clone())
+    };
+    let outcome = if let Some(pid) = value("--kill-pid")
+        .and_then(|value| value.to_str().and_then(|text| text.parse::<u32>().ok()))
+    {
+        g_terminal::port_owner::kill(pid)
+    } else {
+        let port = value("--release-port")?;
+        g_terminal::port_owner::release(&port.to_string_lossy())
+    };
+    let message = match outcome {
+        Ok(message) => message,
+        Err(error) => format!("失败：{error}"),
+    };
+    if let Some(path) = value("--report") {
+        let _ = std::fs::write(path, message.as_bytes());
+    }
+    Some(0)
+}
+
 fn main() -> eframe::Result {
-    let args: Vec<_> = std::env::args_os().collect();
+    let args: Vec<_> = std::env::args_os().collect(); // The owner prompt relaunches the app with "runas" (Windows) or pkexec
+    // (Linux) to end a process or restart a device this user may not touch.
+    // The copy runs one action and exits, before any window exists.
+    if let Some(code) = run_elevated_action(&args) {
+        std::process::exit(code);
+    }
     // Packaging hook: emit the mark for `scripts/package-macos.sh` to turn into
     // the bundle's `.icns`. It returns before any window is created.
     if let Some(dir) = args
@@ -120,4 +152,42 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, screenshot)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The elevated-helper flags are the only thing that starts it; every other
+    /// command line has to fall through to the app itself.
+    #[test]
+    fn ordinary_arguments_do_not_start_the_helper() {
+        assert_eq!(run_elevated_action(&[]), None);
+        let args: Vec<_> = ["--screenshot", "shot.png", "--export-iconset", "out"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert_eq!(run_elevated_action(&args), None);
+    }
+
+    /// An action always answers through the report file, even when the action
+    /// itself failed: that file is the only channel back to the caller.
+    #[test]
+    fn an_action_that_cannot_run_still_reports() {
+        let report = std::env::temp_dir().join("g-terminal-helper-test.txt");
+        let _ = std::fs::remove_file(&report);
+        // A pid that cannot exist, so nothing is really touched.
+        let args: Vec<_> = [
+            std::ffi::OsString::from("--kill-pid"),
+            std::ffi::OsString::from("4294967280"),
+            std::ffi::OsString::from("--report"),
+            report.clone().into_os_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(run_elevated_action(&args), Some(0));
+        let message = std::fs::read_to_string(&report).expect("the report must be written");
+        let _ = std::fs::remove_file(&report);
+        assert!(message.contains("失败"), "{message}");
+    }
 }

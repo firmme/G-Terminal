@@ -174,6 +174,8 @@ pub struct App {
     serial_picker: Option<SerialPicker>,
     /// Set while the 串口占用排查 window is open.
     port_owner: Option<PortOwnerWindow>,
+    /// A serial connect waiting on the owner check.
+    serial_probe: Option<SerialProbe>,
     /// Set while the server toolbox is open.
     toolbox: Option<crate::toolbox::Toolbox>,
     /// Which tab of the 连接配置 window is in front.
@@ -251,6 +253,7 @@ impl App {
             serial_ports: Vec::new(),
             serial_picker: None,
             port_owner: None,
+            serial_probe: None,
             toolbox: None,
             profile_kind: ProfileKind::Ssh,
             editing_profile: None,
@@ -459,35 +462,30 @@ impl App {
         let previous = self.terminal_of(tab_id, pane_id);
         let target = connect_target(&kind);
         self.announce(tab_id, pane_id, target.as_deref());
-        // A serial port may already be held by another program. macOS lets the
-        // second open succeed and the two readers then split the stream, so the
-        // holder is looked up first and the connect is refused with the answer
-        // instead of leaving a half-broken connection behind.
-        let busy = match &kind {
-            SessionKind::Serial(profile) => g_terminal::port_owner::scan(&profile.port)
-                .ok()
-                .filter(|report| !report.owners.is_empty()),
-            _ => None,
-        };
-        let pane = match busy {
-            Some(report) => {
-                let names = report
-                    .owners
-                    .iter()
-                    .map(|owner| format!("{} (PID {})", owner.name, owner.pid))
-                    .collect::<Vec<_>>()
-                    .join("、");
-                self.note_error(
-                    tab_id,
-                    pane_id,
-                    &format!("串口 {} 已被占用：{names}", report.port),
-                );
-                self.port_owner = Some(PortOwnerWindow::new(report.port, true, ctx));
-                None
-            }
-            None => self.respawn(kind.clone(), previous, ctx),
-        };
-        match pane {
+        // A serial port may already be held by another program: Windows refuses
+        // the second open, and macOS/Linux let it through and split the stream.
+        // The port is checked first, but on a worker — the check opens the
+        // device and on some platforms has to walk every handle in the system,
+        // and doing that here used to freeze the window with nothing on screen.
+        if matches!(kind, SessionKind::Serial(_)) && g_terminal::port_owner::SUPPORTED {
+            self.serial_probe = Some(SerialProbe::start(tab_id, pane_id, kind, previous, ctx));
+            return;
+        }
+        self.finish_connect(tab_id, pane_id, kind, previous, ctx);
+    }
+
+    /// Connects once any pre-check has cleared the pane, and leaves a retryable
+    /// pane behind when the connection fails.
+    fn finish_connect(
+        &mut self,
+        tab_id: u64,
+        pane_id: u64,
+        kind: SessionKind,
+        previous: Option<Arc<Mutex<Terminal>>>,
+        ctx: &egui::Context,
+    ) {
+        let target = connect_target(&kind);
+        match self.respawn(kind.clone(), previous, ctx) {
             Some(pane) => {
                 if let Some((tab, index)) = self.locate(tab_id, pane_id) {
                     self.tabs[tab].panes[index] = pane;
@@ -510,21 +508,50 @@ impl App {
                 {
                     self.port_owner = Some(PortOwnerWindow::new(profile.port.clone(), true, ctx));
                 }
-                if let Some((tab, index)) = self.locate(tab_id, pane_id) {
-                    let terminal = self.tabs[tab].panes[index].session.terminal.clone();
-                    self.tabs[tab].panes[index] = Pane::new(
-                        pane_id,
-                        Session::disconnected_reusing(
-                            kind,
-                            self.settings.scrollback,
-                            Some(terminal),
-                        ),
-                    );
-                    self.tabs[tab].focused = index;
-                    self.active = tab;
-                }
+                self.fail_pane(tab_id, pane_id, kind);
             }
         }
+    }
+
+    /// Replaces a pane whose connection did not happen with one that offers a
+    /// retry, keeping whatever the console already said.
+    fn fail_pane(&mut self, tab_id: u64, pane_id: u64, kind: SessionKind) {
+        if let Some((tab, index)) = self.locate(tab_id, pane_id) {
+            let terminal = self.tabs[tab].panes[index].session.terminal.clone();
+            self.tabs[tab].panes[index] = Pane::new(
+                pane_id,
+                Session::disconnected_reusing(kind, self.settings.scrollback, Some(terminal)),
+            );
+            self.tabs[tab].focused = index;
+            self.active = tab;
+        }
+    }
+
+    /// Acts on a finished serial pre-check: connects, or names the holder.
+    pub(super) fn poll_serial_probe(&mut self, ctx: &egui::Context) {
+        let Some(probe) = &self.serial_probe else {
+            return;
+        };
+        let Some(free) = probe.take() else {
+            return;
+        };
+        let probe = self.serial_probe.take().expect("just checked");
+        let (tab_id, pane_id, kind, previous) = probe.parts();
+        if free {
+            self.finish_connect(tab_id, pane_id, kind, previous, ctx);
+            return;
+        }
+        let port = match &kind {
+            SessionKind::Serial(profile) => profile.port.clone(),
+            _ => String::new(),
+        };
+        self.note_error(
+            tab_id,
+            pane_id,
+            &format!("串口 {port} 已被其它程序占用，可在弹出的窗口里查看占用者"),
+        );
+        self.port_owner = Some(PortOwnerWindow::new(port, true, ctx));
+        self.fail_pane(tab_id, pane_id, kind);
     }
     fn add_connection(&mut self, connection: Arc<Connection>, ctx: &egui::Context) {
         // A reconnect reuses the pane's screen, so the output seen before the
@@ -1070,6 +1097,7 @@ impl App {
         }
         self.split_chooser(ctx, p);
         self.poll_zmodem_offer(ctx);
+        self.poll_serial_probe(ctx);
         if let Some(text) = self.panes(ctx, &mut action, p) {
             self.notify(text);
         }

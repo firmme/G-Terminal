@@ -14,7 +14,7 @@ use super::{Owner, Report};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use winreg::RegKey;
@@ -23,6 +23,7 @@ use winreg::types::FromRegValue;
 
 pub const SUPPORTED: bool = true;
 pub const CAN_RELEASE: bool = true;
+pub const CAN_ELEVATE: bool = true;
 
 type Handle = *mut c_void;
 
@@ -33,6 +34,16 @@ const DUPLICATE_SAME_ACCESS: u32 = 0x0002;
 /// Only handles opened for I/O carry these; the filter keeps the scan from
 /// duplicating every event and registry key in the system.
 const FILE_TYPE_CHAR: u32 = 0x0002;
+const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+const SW_HIDE: i32 = 0;
+const ERROR_CANCELLED: u32 = 1223;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_SHARING_VIOLATION: u32 = 32;
+const ERROR_BUSY: u32 = 170;
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const OPEN_EXISTING: u32 = 3;
+const INVALID_HANDLE_VALUE: isize = -1;
 const FILE_READ_DATA: u32 = 0x0001;
 const FILE_WRITE_DATA: u32 = 0x0002;
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
@@ -63,6 +74,15 @@ unsafe extern "system" {
     fn CloseHandle(handle: Handle) -> i32;
     fn GetCurrentProcess() -> Handle;
     fn GetFileType(handle: Handle) -> u32;
+    fn CreateFileW(
+        file: *const u16,
+        access: u32,
+        share: u32,
+        security: *const c_void,
+        creation: u32,
+        attributes: u32,
+        template: *mut c_void,
+    ) -> Handle;
     fn DuplicateHandle(
         source_process: Handle,
         source: Handle,
@@ -87,6 +107,33 @@ unsafe extern "system" {
     fn GetWindowThreadProcessId(window: *mut c_void, pid: *mut u32) -> u32;
     fn IsWindowVisible(window: *mut c_void) -> i32;
     fn PostMessageW(window: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
+    fn GetLastError() -> u32;
+}
+
+/// What `ShellExecuteExW` is told to do. Only the fields the relaunch sets are
+/// named; the rest are zeroed, which is the documented "not used" value.
+#[repr(C)]
+struct ShellExecuteInfoW {
+    cb_size: u32,
+    f_mask: u32,
+    hwnd: *mut c_void,
+    lp_verb: *const u16,
+    lp_file: *const u16,
+    lp_parameters: *const u16,
+    lp_directory: *const u16,
+    n_show: i32,
+    h_inst_app: *mut c_void,
+    lp_idlist: *mut c_void,
+    lp_class: *const u16,
+    hkey_class: *mut c_void,
+    dw_hot_key: u32,
+    h_icon: *mut c_void,
+    h_process: *mut c_void,
+}
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
 }
 
 #[link(name = "ntdll")]
@@ -248,6 +295,36 @@ pub fn elevated() -> bool {
     }
 }
 
+/// Whether the port can be opened. Windows refuses a second open of a held
+/// port, so one open attempt is the whole answer, and the handle walk is left
+/// to the prompt, which only runs when there is something to show.
+pub fn port_is_free(port: &str) -> Result<bool, String> {
+    let path = wide(&format!("\\\\.\\{port}"));
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle as isize == INVALID_HANDLE_VALUE {
+        let code = unsafe { GetLastError() };
+        // Held by someone: the port exists but cannot be shared. Anything else
+        // (a missing port, a dead driver) is left to the connect itself, which
+        // reports it far better than a boolean could.
+        return Ok(!matches!(
+            code,
+            ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_BUSY
+        ));
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(true)
+}
+
 pub fn scan(port: &str) -> Result<Report, String> {
     let targets = device_names(port);
     let candidates = handles_for_io()?;
@@ -298,7 +375,17 @@ pub fn kill(pid: u32) -> Result<String, String> {
     let message = if stopped {
         format!("已关闭 {windows} 个窗口，进程已退出")
     } else if unsafe { TerminateProcess(handle, 1) } != 0 {
-        format!("已发送关闭请求，随后强制结束了进程（{windows} 个窗口）")
+        // `TerminateProcess` only asks. A protected or service-hosted process
+        // can survive it, and reporting "ended" for one that did not is worse
+        // than reporting the failure.
+        if unsafe { WaitForSingleObject(handle, 2000) } != WAIT_TIMEOUT {
+            format!("已发送关闭请求，随后强制结束了进程（{windows} 个窗口）")
+        } else {
+            unsafe { CloseHandle(handle) };
+            return Err(format!(
+                "PID {pid} 没有退出（可能受系统保护或由服务托管），可改用「重启设备」"
+            ));
+        }
     } else {
         unsafe { CloseHandle(handle) };
         return Err("结束进程失败，请以管理员身份重新运行本程序".into());
@@ -712,10 +799,57 @@ fn wide_string(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&units[..length])
 }
 
+/// Ends a process from an elevated copy of the app. The prompt cannot do it
+/// itself when the task belongs to another user or a higher integrity level, so
+/// the app is relaunched with `runas` — that is what raises the UAC prompt —
+/// and the copy runs `--kill-pid`, writing its outcome to `report`.
+pub fn elevate_kill(pid: u32, report: &Path) -> Result<(), String> {
+    if pid == std::process::id() {
+        return Err("那是本程序自己，不能结束".into());
+    }
+    run_elevated("--kill-pid", &pid.to_string(), report)
+}
+
+/// Restarts the device from an elevated copy, the same way.
+pub fn elevate_release(port: &str, report: &Path) -> Result<(), String> {
+    run_elevated("--release-port", port, report)
+}
+
+fn run_elevated(flag: &str, value: &str, report: &Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位本程序：{e}"))?;
+    let verb = wide("runas");
+    let file = wide(&exe.to_string_lossy());
+    let parameters = wide(&format!("{flag} {value} --report \"{}\"", report.display()));
+    let mut info: ShellExecuteInfoW = unsafe { std::mem::zeroed() };
+    info.cb_size = std::mem::size_of::<ShellExecuteInfoW>() as u32;
+    info.f_mask = SEE_MASK_NOCLOSEPROCESS;
+    info.lp_verb = verb.as_ptr();
+    info.lp_file = file.as_ptr();
+    info.lp_parameters = parameters.as_ptr();
+    info.n_show = SW_HIDE;
+    let launched = unsafe { ShellExecuteExW(&mut info) };
+    if !info.h_process.is_null() {
+        unsafe { CloseHandle(info.h_process) };
+    }
+    if launched != 0 {
+        return Ok(());
+    }
+    let code = unsafe { GetLastError() };
+    Err(if code == ERROR_CANCELLED {
+        "已取消管理员授权，未执行".into()
+    } else {
+        format!("无法以管理员身份启动（错误 {code}）")
+    })
+}
+
+/// NUL-terminated UTF-16, for the Win32 calls that take strings.
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain([0]).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn a_handle_name_may_carry_a_suffix() {
         assert!(name_matches("\\Device\\Serial0", "\\Device\\Serial0"));
@@ -723,6 +857,13 @@ mod tests {
         assert!(name_matches("\\??\\COM3", "\\??\\COM3"));
         assert!(!name_matches("\\Device\\Serial10", "\\Device\\Serial1"));
         assert!(!name_matches("\\Device\\Serial", "\\Device\\Serial0"));
+    }
+
+    /// A port that is not there must not be reported as held: the connect
+    /// itself says "cannot open COM199" far better than "busy" would.
+    #[test]
+    fn a_missing_port_is_free_rather_than_busy() {
+        assert!(port_is_free("COM199").unwrap_or(true));
     }
 
     #[test]

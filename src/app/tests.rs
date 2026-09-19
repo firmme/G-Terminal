@@ -31,6 +31,22 @@ fn frame(app: &mut App, ctx: &egui::Context, events: Vec<Event>, modifiers: Modi
     );
 }
 
+/// Pumps frames until a pending serial owner check has answered and the connect
+/// it guards has settled. The check runs on a worker (it opens the device, and
+/// on some platforms walks system handles), so a test cannot assume it is done
+/// by the time `connect_pane` returns.
+fn settle_serial(app: &mut App, ctx: &egui::Context, size: Vec2) {
+    for _ in 0..400 {
+        app.poll_serial_probe(ctx);
+        if app.serial_probe.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        frame(app, ctx, vec![], Modifiers::NONE, size);
+    }
+    frame(app, ctx, vec![], Modifiers::NONE, size);
+}
+
 fn key(key: Key, modifiers: Modifiers) -> Event {
     Event::Key {
         key,
@@ -228,7 +244,9 @@ fn the_spinner_runs_only_while_a_connection_is_pending() {
     assert!(app.connecting(), "a pending pane must spin");
     frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
     app.connect_pane(tab_id, pane_id, serial, &ctx);
+    settle_serial(&mut app, &ctx, size);
     assert!(!app.connecting(), "a settled attempt must stop the spinner");
+    assert!(app.serial_probe.is_none(), "the probe must be consumed");
 }
 
 /// The arrows light on a burst and settle back to idle once it stops.
@@ -519,6 +537,7 @@ fn a_failed_connection_reports_in_its_own_console() {
         before + 1,
         "the tab must exist before the connect attempt"
     );
+    settle_serial(&mut app, &ctx, size);
     let terminal = app.tabs.last().unwrap().panes[0].session.terminal.clone();
     let text = terminal.lock().unwrap().parser.screen().contents();
     assert!(text.contains("connect to COM199"), "{text}");
