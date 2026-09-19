@@ -752,10 +752,14 @@ impl App {
             }
         }
         self.update_window(ctx, p);
-        if let Some(window) = &mut self.port_owner
-            && !window.show(ctx, p)
-        {
-            self.port_owner = None;
+        if let Some(window) = &mut self.port_owner {
+            let outcome = window.show(ctx, p);
+            if outcome.reconnect {
+                *action = Some(Action::Restart);
+            }
+            if !outcome.keep_open || outcome.reconnect {
+                self.port_owner = None;
+            }
         }
     }
 

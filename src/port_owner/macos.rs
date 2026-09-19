@@ -63,18 +63,29 @@ struct VnodeInfo {
     fsid: [i32; 2],
 }
 
-/// `struct vnode_fdinfowithpath`: the vnode info followed by its path.
+/// `struct proc_fileinfo`, read as bytes: only its size matters here.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct VnodeInfoPath {
+struct ProcFileInfo {
+    bytes: [u8; 24],
+}
+
+/// `struct vnode_fdinfowithpath`: `proc_fileinfo`, then the vnode info, then the
+/// path. `PROC_PIDFDVNODEPATHINFO` fills *this* — despite the name it is not a
+/// bare `vnode_info_path`, and a 1176-byte buffer is refused with no write.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VnodeFdInfoWithPath {
+    file: ProcFileInfo,
     vnode: VnodeInfo,
     path: [u8; MAXPATHLEN],
 }
 
-const VNODE_INFO_PATH_SIZE: usize = std::mem::size_of::<VnodeInfoPath>();
-/// The path must start right after the vnode info for the two to line up.
+const VNODE_INFO_PATH_SIZE: usize = std::mem::size_of::<VnodeFdInfoWithPath>();
+/// The path must land 24 bytes past the vnode info, which is what the kernel
+/// writes; the asserts keep the two in step.
 const _: () = assert!(std::mem::size_of::<VnodeInfo>() == 152);
-const _: () = assert!(VNODE_INFO_PATH_SIZE == 152 + MAXPATHLEN);
+const _: () = assert!(VNODE_INFO_PATH_SIZE == 24 + 152 + MAXPATHLEN);
 
 pub fn elevated() -> bool {
     let uid = unsafe { c::geteuid() };
@@ -193,7 +204,7 @@ impl Process {
         // `VnodeInfoPath` opens with 64-bit fields, so the buffer has to be
         // aligned for them.
         let mut buffer = vec![0u64; VNODE_INFO_PATH_SIZE.div_ceil(8)];
-        let info = buffer.as_mut_ptr() as *mut VnodeInfoPath;
+        let info = buffer.as_mut_ptr() as *mut VnodeFdInfoWithPath;
         let written = unsafe {
             proc_pidfdinfo(
                 self.pid,

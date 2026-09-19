@@ -249,8 +249,35 @@ pub fn open(name: &str, baud: u32) -> Result<SerialPort> {
         .with_context(|| format!("无法打开串口 {name}（可能被其它程序占用）"))?;
     port.set_read_timeout(READ_TIMEOUT)?;
     port.set_write_timeout(WRITE_TIMEOUT)?;
+    // Ask the tty layer for exclusive use, so a later opener fails instead of
+    // silently splitting the incoming bytes with us. macOS and Linux both let a
+    // device be opened twice by default. This does not disturb a program that
+    // opened the port *before* us — that one is caught by the owner scan before
+    // connecting.
+    set_exclusive(&port);
     Ok(port)
 }
+
+/// Sets `TIOCEXCL` on the port. The request number differs by platform; the
+/// call is best-effort, because a device that refuses it still works, just
+/// without the guarantee.
+#[cfg(unix)]
+fn set_exclusive(port: &SerialPort) {
+    use std::os::unix::io::AsRawFd;
+    #[cfg(target_os = "macos")]
+    const TIOCEXCL: std::ffi::c_ulong = 0x2000_740d;
+    #[cfg(not(target_os = "macos"))]
+    const TIOCEXCL: std::ffi::c_ulong = 0x540c;
+    unsafe extern "C" {
+        fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+    }
+    unsafe {
+        ioctl(port.as_raw_fd(), TIOCEXCL);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_exclusive(_port: &SerialPort) {}
 
 /// Opens a port on a worker so a wedged driver cannot freeze the UI. The caller
 /// waits at most `timeout`; if the open is still stuck, the worker's eventual

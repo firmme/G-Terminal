@@ -459,7 +459,35 @@ impl App {
         let previous = self.terminal_of(tab_id, pane_id);
         let target = connect_target(&kind);
         self.announce(tab_id, pane_id, target.as_deref());
-        match self.respawn(kind.clone(), previous, ctx) {
+        // A serial port may already be held by another program. macOS lets the
+        // second open succeed and the two readers then split the stream, so the
+        // holder is looked up first and the connect is refused with the answer
+        // instead of leaving a half-broken connection behind.
+        let busy = match &kind {
+            SessionKind::Serial(profile) => g_terminal::port_owner::scan(&profile.port)
+                .ok()
+                .filter(|report| !report.owners.is_empty()),
+            _ => None,
+        };
+        let pane = match busy {
+            Some(report) => {
+                let names = report
+                    .owners
+                    .iter()
+                    .map(|owner| format!("{} (PID {})", owner.name, owner.pid))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                self.note_error(
+                    tab_id,
+                    pane_id,
+                    &format!("串口 {} 已被占用：{names}", report.port),
+                );
+                self.port_owner = Some(PortOwnerWindow::new(report.port, true, ctx));
+                None
+            }
+            None => self.respawn(kind.clone(), previous, ctx),
+        };
+        match pane {
             Some(pane) => {
                 if let Some((tab, index)) = self.locate(tab_id, pane_id) {
                     self.tabs[tab].panes[index] = pane;
@@ -477,8 +505,10 @@ impl App {
                 // offers a retry instead of a dead one. A serial port that
                 // would not open is very often another program holding it, so
                 // the owner prompt comes up with the port already filled in.
-                if let SessionKind::Serial(profile) = &kind {
-                    self.port_owner = Some(PortOwnerWindow::new(profile.port.clone(), ctx));
+                if let SessionKind::Serial(profile) = &kind
+                    && self.port_owner.is_none()
+                {
+                    self.port_owner = Some(PortOwnerWindow::new(profile.port.clone(), true, ctx));
                 }
                 if let Some((tab, index)) = self.locate(tab_id, pane_id) {
                     let terminal = self.tabs[tab].panes[index].session.terminal.clone();
@@ -835,7 +865,7 @@ impl App {
             },
             Action::SerialPicker => self.serial_picker = Some(SerialPicker::new()),
             Action::FindPortOwner(port) => {
-                self.port_owner = Some(PortOwnerWindow::new(port, ctx));
+                self.port_owner = Some(PortOwnerWindow::new(port, false, ctx));
             }
             Action::Toolbox => match self.focused_ssh() {
                 Some((profile, _)) => self.toolbox = Some(crate::toolbox::Toolbox::new(&profile)),

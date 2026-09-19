@@ -8,7 +8,18 @@ use super::*;
 /// One prompt's worth of state, shared with whatever worker is running.
 pub(super) struct PortOwnerWindow {
     port: String,
+    /// Set when the window was opened by a connect that was refused or failed,
+    /// so it can offer to reconnect once the port is free. A window opened from
+    /// the menu has no failed connect to retry.
+    retry: bool,
     state: Arc<Mutex<OwnerState>>,
+}
+
+/// What the window asks the app to do after a frame.
+pub(super) struct PortOwnerOutcome {
+    pub keep_open: bool,
+    /// The port is free and the refused connect should be tried again.
+    pub reconnect: bool,
 }
 
 struct OwnerState {
@@ -25,9 +36,10 @@ enum Phase {
 }
 
 impl PortOwnerWindow {
-    pub(super) fn new(port: String, ctx: &egui::Context) -> Self {
+    pub(super) fn new(port: String, retry: bool, ctx: &egui::Context) -> Self {
         let window = Self {
             port,
+            retry,
             state: Arc::new(Mutex::new(OwnerState {
                 phase: Phase::Scanning,
                 note: None,
@@ -88,12 +100,13 @@ impl PortOwnerWindow {
         });
     }
 
-    /// Draws the window, returning whether it should stay open.
-    pub(super) fn show(&mut self, ctx: &egui::Context, p: Palette) -> bool {
+    /// Draws the window and returns what it wants next.
+    pub(super) fn show(&mut self, ctx: &egui::Context, p: Palette) -> PortOwnerOutcome {
         let mut open = true;
         let mut rescan = false;
-        let mut kill = None;
+        let mut kill: Option<Vec<u32>> = None;
         let mut release = false;
+        let mut reconnect = false;
         // The state is copied out before drawing: the window's closure would
         // otherwise hold the lock while a button asks for another scan.
         let (phase, note) = match self.state.lock() {
@@ -105,24 +118,24 @@ impl PortOwnerWindow {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(520.0)
+            .default_width(400.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("端口");
                     editing::field_with(ui, &mut self.port, |edit| {
-                        edit.desired_width(200.0)
-                            .hint_text(format!("{} 或 auto", serial::PORT_EXAMPLE))
+                        edit.desired_width(170.0).hint_text("端口或 auto")
                     });
                     if ui.button("查找").clicked() {
                         rescan = true;
                     }
                 });
+                ui.separator();
 
                 match &phase {
                     Phase::Scanning => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(hint("正在查找占用该端口的程序…", p));
+                            ui.label(hint("正在查找占用程序…", p));
                         });
                         // The spinner has to keep turning, and the worker's
                         // wake alone would only give it one frame.
@@ -130,99 +143,108 @@ impl PortOwnerWindow {
                     }
                     Phase::Failed(error) => {
                         ui.colored_label(p.danger, error.as_str());
+                        if ui.button("重试").clicked() {
+                            rescan = true;
+                        }
                     }
                     Phase::Listed(report) => {
-                        if report.owners.is_empty() {
-                            ui.label(hint("没有发现其它程序持有该端口。", p));
-                        }
-                        for owner in &report.owners {
+                        // This process is not a blocker: it is the one asking.
+                        let blockers: Vec<_> =
+                            report.owners.iter().filter(|o| !o.is_self()).collect();
+                        if blockers.is_empty() {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(&owner.name).strong().color(p.text));
-                                ui.label(hint(&format!("PID {}", owner.pid), p));
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if owner.is_self() {
-                                        ui.label(hint("本程序自己", p));
-                                    } else if owner.killable {
-                                        if ui
-                                            .button("结束进程")
-                                            .on_hover_text("先请求关闭窗口，再强制结束")
-                                            .clicked()
-                                        {
-                                            kill = Some(owner.pid);
-                                        }
-                                    } else {
-                                        ui.label(hint("需要管理员权限", p));
-                                    }
-                                });
+                                ui.label(RichText::new("✓ 端口空闲").color(p.ok).strong());
+                                if self.retry && ui.button("重新连接").clicked() {
+                                    reconnect = true;
+                                }
                             });
-                            if let Some(path) = &owner.path {
-                                ui.label(hint(&path.display().to_string(), p));
+                            // Only worth saying when nothing was found: a holder
+                            // may be one of the processes that cannot be read.
+                            if report.hidden > 0 {
+                                ui.label(hint(
+                                    &format!(
+                                        "另有 {} 个进程受保护；以管理员身份运行可查看。",
+                                        report.hidden
+                                    ),
+                                    p,
+                                ));
                             }
-                        }
-                        if report.hidden > 0 {
-                            ui.label(hint(
-                                &format!(
-                                    "另有 {} 个进程的句柄没有权限查看；以管理员身份运行本程序可见。",
-                                    report.hidden
-                                ),
-                                p,
-                            ));
-                        }
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button("重新查找")
-                                .on_hover_text("关闭其它程序后再查一次")
-                                .clicked()
-                            {
-                                rescan = true;
+                        } else {
+                            ui.label(
+                                RichText::new(format!("⚠ 端口被 {} 个程序占用", blockers.len()))
+                                    .color(p.warn)
+                                    .strong(),
+                            );
+                            for owner in &blockers {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&owner.name).color(p.text));
+                                    ui.label(hint(&format!("PID {}", owner.pid), p));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if owner.killable {
+                                            if ui.button("结束").clicked() {
+                                                kill = Some(vec![owner.pid]);
+                                            }
+                                        } else {
+                                            ui.label(hint("需管理员", p));
+                                        }
+                                    });
+                                });
                             }
-                            if g_terminal::port_owner::CAN_RELEASE
-                                && ui
-                                    .button("重启设备")
-                                    .on_hover_text("禁用再启用该串口设备，让占用者的句柄失效")
-                                    .clicked()
-                            {
-                                release = true;
-                            }
-                        });
-                        ui.label(hint(
-                            "Windows 的串口是独占的，两个程序无法同时打开；\
-                             Linux 与 macOS 通常允许重复打开，但两边的数据会互相抢。",
-                            p,
-                        ));
-                        if g_terminal::port_owner::CAN_RELEASE {
-                            ui.label(hint(
-                                "重启设备需要管理员权限；占用者可能随后重新打开该端口。",
-                                p,
-                            ));
-                        }
-                        if !g_terminal::port_owner::elevated() {
-                            ui.label(hint(
-                                "未以管理员身份运行：其它用户的进程可能不会列出，也无法结束。",
-                                p,
-                            ));
+                            ui.horizontal(|ui| {
+                                if ui.button("重新查找").clicked() {
+                                    rescan = true;
+                                }
+                                if blockers.iter().filter(|o| o.killable).count() > 1
+                                    && ui.button("全部结束").clicked()
+                                {
+                                    kill = Some(
+                                        blockers
+                                            .iter()
+                                            .filter(|o| o.killable)
+                                            .map(|o| o.pid)
+                                            .collect(),
+                                    );
+                                }
+                                if g_terminal::port_owner::CAN_RELEASE
+                                    && ui
+                                        .button("重启设备")
+                                        .on_hover_text("禁用再启用设备，让占用者的句柄失效")
+                                        .clicked()
+                                {
+                                    release = true;
+                                }
+                            });
+                            ui.label(hint("结束后重新连接。", p));
                         }
                     }
                 }
 
                 if let Some(note) = &note {
                     ui.separator();
-                    ui.colored_label(p.text, note.as_str());
+                    ui.label(note.as_str());
                 }
             });
 
         if rescan {
             self.rescan(ctx);
         }
-        if let Some(pid) = kill {
-            self.act(ctx, move || g_terminal::port_owner::kill(pid));
+        if let Some(pids) = kill {
+            self.act(ctx, move || {
+                let mut lines = Vec::new();
+                for pid in pids {
+                    lines.push(g_terminal::port_owner::kill(pid).unwrap_or_else(|e| e));
+                }
+                Ok(lines.join("；"))
+            });
         }
         if release {
             let port = self.port.clone();
             self.act(ctx, move || g_terminal::port_owner::release(&port));
         }
-        open
+        PortOwnerOutcome {
+            keep_open: open,
+            reconnect,
+        }
     }
 }
 
@@ -255,6 +277,7 @@ impl PortOwnerWindow {
     fn settled(port: &str, phase: Phase) -> Self {
         Self {
             port: port.into(),
+            retry: true,
             state: Arc::new(Mutex::new(OwnerState {
                 phase,
                 note: Some("已结束进程（PID 4242）".into()),
@@ -315,7 +338,10 @@ mod tests {
         for window in [&mut listed, &mut empty, &mut failed] {
             for _ in 0..2 {
                 let _ = ctx.run(Default::default(), |ctx| {
-                    assert!(window.show(ctx, palette), "the window must stay open");
+                    assert!(
+                        window.show(ctx, palette).keep_open,
+                        "the window must stay open"
+                    );
                 });
             }
         }
