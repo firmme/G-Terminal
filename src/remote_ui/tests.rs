@@ -633,13 +633,29 @@ fn a_narrow_pane_makes_the_table_overflow_sideways() {
                         link: false,
                     },
                 ];
-                let output = egui::ScrollArea::both()
+                let width = child.available_width().max(MIN_TABLE_WIDTH);
+                let output = egui::ScrollArea::horizontal()
                     .id_salt("narrow-probe")
                     .auto_shrink([false, false])
-                    .max_height(150.0)
                     .show(&mut child, |ui| {
-                        let width = ui.available_width().max(MIN_TABLE_WIDTH);
-                        table_row(ui, &cells, &REMOTE_COLUMNS, false, width);
+                        ui.set_min_width(width);
+                        table_header(
+                            ui,
+                            Palette::new(false),
+                            &REMOTE_COLUMNS,
+                            &["名称", "大小", "权限", "修改时间"],
+                            width,
+                        );
+                        egui::ScrollArea::vertical().max_height(120.0).show_rows(
+                            ui,
+                            ROW_HEIGHT,
+                            100,
+                            |ui, range| {
+                                for _ in range {
+                                    table_row(ui, &cells, &REMOTE_COLUMNS, false, width);
+                                }
+                            },
+                        );
                     });
                 measured = Some((output.content_size.x, output.inner_rect.width()));
             });
@@ -650,4 +666,64 @@ fn a_narrow_pane_makes_the_table_overflow_sideways() {
         content > viewport,
         "content is {content} wide in a {viewport} viewport, so no bar would appear"
     );
+}
+
+/// Opt-in probe for the 10k-row path; no fixed time assertion across hardware.
+#[test]
+#[ignore]
+fn benchmark_ten_thousand_file_rows() {
+    let ctx = egui::Context::default();
+    for mode in ["full", "visible-only"] {
+        let mut samples = Vec::new();
+        for i in 0..12 {
+            let start = std::time::Instant::now();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let draw_rows = |ui: &mut egui::Ui, range: std::ops::Range<usize>| {
+                            for row in range {
+                                let cells = [Cell {
+                                    text: format!("file-{row:05}.txt"),
+                                    right: false,
+                                    color: egui::Color32::WHITE,
+                                    full: None,
+                                    icon: None,
+                                    link: false,
+                                }];
+                                table_row(ui, &cells, &LOCAL_COLUMNS, false, 600.0);
+                            }
+                        };
+                        if mode == "full" {
+                            egui::ScrollArea::both().max_height(600.0).show(ui, |ui| {
+                                draw_rows(ui, 0..10_000);
+                            });
+                        } else {
+                            egui::ScrollArea::vertical().max_height(600.0).show_rows(
+                                ui,
+                                ROW_HEIGHT,
+                                10_000,
+                                |ui, range| draw_rows(ui, range),
+                            );
+                        }
+                    });
+                },
+            );
+            if i >= 2 {
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "file rows 10k {mode}: p50={:.2}ms p95={:.2}ms",
+            samples[samples.len() / 2],
+            samples[samples.len() * 95 / 100]
+        );
+    }
 }

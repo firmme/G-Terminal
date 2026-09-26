@@ -48,6 +48,8 @@ impl vt100::Callbacks for TerminalCallbacks {
 pub struct Terminal {
     pub parser: vt100::Parser<TerminalCallbacks>,
     pub revision: u64,
+    /// Changes only when existing screen coordinates can no longer be trusted.
+    pub selection_epoch: u64,
     pub graphics: std::collections::VecDeque<crate::graphics::Graphic>,
     /// A ZMODEM offer from the server that nobody has answered yet. `Some(true)`
     /// means the server ran `rz` and is waiting to receive, i.e. an upload;
@@ -70,6 +72,7 @@ impl Terminal {
                 TerminalCallbacks::default(),
             ),
             revision: 0,
+            selection_epoch: 0,
             graphics: std::collections::VecDeque::new(),
             zmodem_offer: None,
             scanner: crate::graphics::OscScanner::default(),
@@ -157,6 +160,7 @@ impl Terminal {
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
         self.revision = self.revision.wrapping_add(1);
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
     }
 
     /// Prepares a screen that outlived its session for the next one. The
@@ -173,6 +177,7 @@ impl Terminal {
         self.parser.screen_mut().set_scrollback(0);
         self.zmodem_offer = None;
         self.revision = self.revision.wrapping_add(1);
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
     }
 
     /// Blank lines that keep a new run of diagnostics apart from older output.
@@ -203,6 +208,7 @@ impl Terminal {
     pub fn clear_screen(&mut self) {
         self.parser.process(b"\x1b[H\x1b[2J");
         self.revision = self.revision.wrapping_add(1);
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
     }
 
     /// Drops everything this screen has ever shown, scrollback included.
@@ -218,6 +224,7 @@ impl Terminal {
         self.zmodem_probe.clear();
         self.zmodem_offer = None;
         self.revision = self.revision.wrapping_add(1);
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
     }
 
     pub fn scroll(&mut self, lines: i32) {

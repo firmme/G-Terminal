@@ -5,6 +5,19 @@ use super::ssh::*;
 use super::*;
 
 #[test]
+fn serial_background_timeout_defaults_off_and_loads_old_settings() {
+    let settings = Settings::parse(br#"{"font_size":16}"#).unwrap();
+    assert!(!settings.serial_background_timeout_enabled);
+    assert_eq!(settings.serial_background_timeout_minutes, 5);
+    let settings = Settings::parse(
+        br#"{"serial_background_timeout_enabled":true,"serial_background_timeout_minutes":12}"#,
+    )
+    .unwrap();
+    assert!(settings.serial_background_timeout_enabled);
+    assert_eq!(settings.serial_background_timeout_minutes, 12);
+}
+
+#[test]
 fn old_config_migrates_and_default_label_is_host() {
     let s: Settings = serde_json::from_str(
         r#"{"profiles":[{"name":"","host":"10.0.0.8","user":"root","port":22,"identity":""}]}"#,

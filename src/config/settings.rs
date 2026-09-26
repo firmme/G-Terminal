@@ -15,10 +15,15 @@ pub struct Settings {
     pub profiles: Vec<RemoteProfile>,
     pub serial_profiles: Vec<SerialProfile>,
     pub groups: Vec<String>,
+    /// Most recently opened saved or imported connections, newest first.
+    pub recent_connections: Vec<String>,
     /// Tab tag colours by group name, `#rrggbb`. A connection's own colour wins
     /// over its group's; an empty entry means no colour.
     pub group_colors: std::collections::BTreeMap<String, String>,
     pub copy_on_select: bool,
+    /// Disconnect serial sessions after this many minutes in a hidden tab or unfocused window.
+    pub serial_background_timeout_enabled: bool,
+    pub serial_background_timeout_minutes: u32,
     pub hide_dotfiles: bool,
     /// Restore the tabs that were open when the program last closed, as
     /// disconnected panes: no shell is started and no host is contacted.
@@ -47,8 +52,11 @@ impl Default for Settings {
             profiles: Vec::new(),
             serial_profiles: Vec::new(),
             groups: Vec::new(),
+            recent_connections: Vec::new(),
             group_colors: std::collections::BTreeMap::new(),
             copy_on_select: false,
+            serial_background_timeout_enabled: false,
+            serial_background_timeout_minutes: 5,
             hide_dotfiles: true,
             restore_tabs: true,
             confirm_on_exit: true,
@@ -102,12 +110,23 @@ impl Settings {
         if let Some(v) = read_field(&value, "groups") {
             settings.groups = v;
         }
+        if let Some(v) = read_field(&value, "recent_connections") {
+            settings.recent_connections = v;
+        }
         if let Some(v) = read_field(&value, "group_colors") {
             settings.group_colors = v;
         }
         if let Some(v) = read_field(&value, "copy_on_select") {
             settings.copy_on_select = v;
         }
+        if let Some(v) = read_field(&value, "serial_background_timeout_enabled") {
+            settings.serial_background_timeout_enabled = v;
+        }
+        if let Some(v) = read_field(&value, "serial_background_timeout_minutes") {
+            settings.serial_background_timeout_minutes = v;
+        }
+        settings.serial_background_timeout_minutes =
+            settings.serial_background_timeout_minutes.clamp(1, 1440);
         if let Some(v) = read_field(&value, "hide_dotfiles") {
             settings.hide_dotfiles = v;
         }

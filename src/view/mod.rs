@@ -13,8 +13,9 @@ use std::time::Duration;
 pub struct Pane {
     pub id: u64,
     pub session: Session,
-    selection: Option<((u16, u16), (u16, u16))>,
-    revision: u64,
+    selection: Option<((i64, u16), (i64, u16))>,
+    pub background_since: Option<std::time::Instant>,
+    selection_epoch: u64,
     preedit: String,
     composing: bool,
     scroll_fraction: f32,
@@ -54,7 +55,8 @@ impl Pane {
             id,
             session,
             selection: None,
-            revision: 0,
+            background_since: None,
+            selection_epoch: 0,
             preedit: String::new(),
             composing: false,
             scroll_fraction: 0.0,
@@ -134,6 +136,10 @@ impl Pane {
         let mut copied = None;
         let mut notice = None;
         let mut terminal = self.session.terminal.lock().unwrap();
+        if self.selection_epoch != terminal.selection_epoch {
+            self.selection = None;
+            self.selection_epoch = terminal.selection_epoch;
+        }
         let mouse_mode = terminal.parser.screen().mouse_protocol_mode();
         let mouse_encoding = terminal.parser.screen().mouse_protocol_encoding();
         let mouse =
@@ -153,10 +159,6 @@ impl Pane {
             })
         };
         let mut link = None;
-        if self.revision != terminal.revision {
-            self.selection = None;
-            self.revision = terminal.revision;
-        }
         if response.hovered() {
             let delta = ui.input(|i| i.smooth_scroll_delta.y);
             self.scroll_fraction += delta / cell.y;
@@ -190,7 +192,9 @@ impl Pane {
                     terminal.scroll(lines);
                 }
                 self.scroll_fraction -= lines as f32;
-                self.selection = None;
+                if mouse || terminal.parser.screen().alternate_screen() {
+                    self.selection = None;
+                }
             }
             link = ui
                 .input(|i| i.pointer.hover_pos())
@@ -204,7 +208,8 @@ impl Pane {
         if response.drag_started() && !mouse {
             if let Some(pos) = ui.input(|i| i.pointer.press_origin()) {
                 let cell = pointer_cell(pos);
-                self.selection = Some((cell, cell));
+                let point = history_point(cell.0, cell.1, terminal.parser.screen().scrollback());
+                self.selection = Some((point, point));
             }
             // A drag is not part of a run of clicks.
             self.clicks = 0;
@@ -260,18 +265,33 @@ impl Pane {
                             while end + 1 < width && is_word(screen.cell(row, end + 1)) {
                                 end += 1;
                             }
-                            self.selection = Some(((row, start), (row, end)));
+                            let offset = terminal.parser.screen().scrollback();
+                            self.selection = Some((
+                                history_point(row, start, offset),
+                                history_point(row, end, offset),
+                            ));
                         } else {
                             // A word click on whitespace takes the whole line.
-                            self.selection = Some(((row, 0), (row, cols - 1)));
+                            let offset = terminal.parser.screen().scrollback();
+                            self.selection = Some((
+                                history_point(row, 0, offset),
+                                history_point(row, cols - 1, offset),
+                            ));
                         }
                     }
                     Gesture::Line => {
-                        self.selection = Some(((row, 0), (row, cols.saturating_sub(1))));
+                        let offset = terminal.parser.screen().scrollback();
+                        self.selection = Some((
+                            history_point(row, 0, offset),
+                            history_point(row, cols.saturating_sub(1), offset),
+                        ));
                     }
                     Gesture::Screen => {
-                        self.selection =
-                            Some(((0, 0), (rows.saturating_sub(1), cols.saturating_sub(1))));
+                        let offset = terminal.parser.screen().scrollback();
+                        self.selection = Some((
+                            history_point(0, 0, offset),
+                            history_point(rows.saturating_sub(1), cols.saturating_sub(1), offset),
+                        ));
                     }
                 }
             }
@@ -280,14 +300,29 @@ impl Pane {
             && !mouse
             && let (Some((start, _)), Some(pos)) = (self.selection, response.interact_pointer_pos())
         {
-            self.selection = Some((start, pointer_cell(pos)));
+            if !terminal.parser.screen().alternate_screen() {
+                let before = terminal.parser.screen().scrollback();
+                if pos.y <= content.top() + cell.y {
+                    terminal.scroll(2);
+                } else if pos.y >= content.bottom() - cell.y {
+                    terminal.scroll(-2);
+                }
+                if terminal.parser.screen().scrollback() != before {
+                    ui.ctx().request_repaint_after(Duration::from_millis(35));
+                }
+            }
+            let cell = pointer_cell(pos);
+            self.selection = Some((
+                start,
+                history_point(cell.0, cell.1, terminal.parser.screen().scrollback()),
+            ));
         }
         if copy_on_select
             && !mouse
             && (response.drag_stopped() || (response.clicked() && self.clicks >= 2))
             && let Some((a, b)) = self.selection
         {
-            let text = selection_text(terminal.parser.screen(), a, b);
+            let text = selection_text_history(terminal.parser.screen_mut(), a, b);
             if !text.is_empty() {
                 copied = Some(text);
             }
@@ -381,7 +416,11 @@ impl Pane {
                         let copy = cfg!(target_os = "macos") || ui.input(|i| i.modifiers.shift);
                         if copy {
                             if let Some((a, b)) = self.selection {
-                                copied = Some(selection_text(terminal.parser.screen(), a, b));
+                                copied = Some(selection_text_history(
+                                    terminal.parser.screen_mut(),
+                                    a,
+                                    b,
+                                ));
                             }
                         } else {
                             outgoing.push(vec![3]);
@@ -435,7 +474,11 @@ impl Pane {
                             // composition; it must not reach the shell too.
                         } else if modifiers.ctrl && modifiers.shift && key == Key::C {
                             if let Some((a, b)) = self.selection {
-                                copied = Some(selection_text(terminal.parser.screen(), a, b));
+                                copied = Some(selection_text_history(
+                                    terminal.parser.screen_mut(),
+                                    a,
+                                    b,
+                                ));
                             }
                         } else if modifiers.ctrl && modifiers.shift && key == Key::V {
                             match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
@@ -454,7 +497,6 @@ impl Pane {
                             } else {
                                 -(rows as i32)
                             });
-                            self.selection = None;
                         } else if let Some(bytes) = encode_key(
                             key,
                             modifiers,
@@ -528,9 +570,10 @@ impl Pane {
                     fg = Color32::WHITE;
                 }
                 byte += length;
-                if selection
-                    .is_some_and(|(a, b)| (row, col) <= b && (row, col + (wide as u16 - 1)) >= a)
-                {
+                let absolute_row = i64::from(row) - screen.scrollback() as i64;
+                if selection.is_some_and(|(a, b)| {
+                    (absolute_row, col) <= b && (absolute_row, col + (wide as u16 - 1)) >= a
+                }) {
                     bg = palette.accent.gamma_multiply(0.3);
                 }
                 if bg != palette.bg {
@@ -708,8 +751,8 @@ impl Pane {
                 {
                     if let Some((a, b)) = selection {
                         let text = {
-                            let terminal = self.session.terminal.lock().unwrap();
-                            selection_text(terminal.parser.screen(), a, b)
+                            let mut terminal = self.session.terminal.lock().unwrap();
+                            selection_text_history(terminal.parser.screen_mut(), a, b)
                         };
                         notice = Some(moved_message("复制", &text));
                         ui.ctx().copy_text(text);
@@ -756,8 +799,8 @@ impl Pane {
                 {
                     if let Some((a, b)) = selection {
                         let text = {
-                            let terminal = self.session.terminal.lock().unwrap();
-                            selection_text(terminal.parser.screen(), a, b)
+                            let mut terminal = self.session.terminal.lock().unwrap();
+                            selection_text_history(terminal.parser.screen_mut(), a, b)
                         };
                         let query = text.trim();
                         if query.is_empty() {

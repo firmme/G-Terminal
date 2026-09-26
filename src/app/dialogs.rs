@@ -15,15 +15,9 @@ impl App {
             .collapsible(false)
             .default_width(440.0)
             .show(ctx, |ui| {
+                ui.label(RichText::new("外观").strong().color(p.accent));
                 changed |= ui
                     .add(egui::Slider::new(&mut self.settings.font_size, 10.0..=28.0).text("字号"))
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.settings.scrollback, 100..=50_000)
-                            .logarithmic(true)
-                            .text("历史行数（新会话）"),
-                    )
                     .changed();
                 ui.horizontal(|ui| {
                     changed |= ui
@@ -32,40 +26,31 @@ impl App {
                     changed |= ui.checkbox(&mut self.settings.sidebar, "导航栏").changed();
                 });
                 changed |= ui
-                    .checkbox(&mut self.settings.copy_on_select, "选中文本后自动复制")
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.hide_dotfiles,
-                        "文件窗口默认隐藏 . 开头文件",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.restore_tabs,
-                        "启动时恢复上次关闭的标签（不重连）",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.confirm_on_exit,
-                        "关闭窗口时确认（有活动会话）",
-                    )
-                    .changed();
-                changed |= ui
                     .checkbox(
                         &mut self.settings.auto_hide_sidebar,
                         "自动隐藏导航栏（鼠标移到左侧时悬浮展开）",
                     )
                     .changed();
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(RichText::new("终端").strong().color(p.accent));
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.scrollback, 100..=50_000)
+                            .logarithmic(true)
+                            .text("历史行数（新会话）"),
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.settings.copy_on_select, "选中文本后自动复制")
+                    .changed();
                 ui.label(hint(
                     "鼠标中键：粘贴；Shift+鼠标：绕过应用鼠标协议选择文本。",
                     p,
                 ));
-                ui.label(hint(
-                    "恢复只还原标签，全部显示为断开；点「重新连接」后才连上。",
-                    p,
-                ));
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(RichText::new("连接与文件").strong().color(p.accent));
                 ui.horizontal(|ui| {
                     ui.label("默认 Shell");
                     egui::ComboBox::from_id_salt("default-shell")
@@ -82,6 +67,30 @@ impl App {
                             }
                         });
                 });
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.serial_background_timeout_enabled,
+                        "串口在后台超时后自动断开",
+                    )
+                    .changed();
+                ui.add_enabled_ui(self.settings.serial_background_timeout_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("后台超时");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(
+                                    &mut self.settings.serial_background_timeout_minutes,
+                                )
+                                .range(1..=1440)
+                                .suffix(" 分钟"),
+                            )
+                            .changed();
+                    });
+                });
+                ui.label(hint(
+                    "切到其他标签或窗口失焦时开始计时；回到前台重新计时。",
+                    p,
+                ));
                 ui.horizontal(|ui| {
                     ui.label("浏览器搜索");
                     egui::ComboBox::from_id_salt("search-engine")
@@ -98,6 +107,31 @@ impl App {
                             }
                         });
                 });
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.hide_dotfiles,
+                        "文件窗口默认隐藏 . 开头文件",
+                    )
+                    .changed();
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(RichText::new("启动行为").strong().color(p.accent));
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.restore_tabs,
+                        "启动时恢复上次关闭的标签（不重连）",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.confirm_on_exit,
+                        "关闭窗口时确认（有活动会话）",
+                    )
+                    .changed();
+                ui.label(hint(
+                    "恢复只还原标签，全部显示为断开；点「重新连接」后才连上。",
+                    p,
+                ));
                 ui.separator();
                 ui.label(hint(Settings::path().to_string_lossy().as_ref(), p));
             });
@@ -110,7 +144,7 @@ impl App {
         if changed {
             self.palette = Palette::new(self.settings.light_theme);
             self.palette.apply(ctx, self.settings.light_theme);
-            self.persist();
+            self.settings_dirty_at = Some(std::time::Instant::now());
         }
         let mut open = self.remote_open;
         let mut save = false;
@@ -119,13 +153,13 @@ impl App {
         egui::Window::new("连接配置")
             .open(&mut open)
             .collapsible(false)
-            .default_width(480.0)
+            .default_width(420.0)
             .show(ctx, |ui| {
                 // Rows come in two widths so the form reads as a grid rather
                 // than as a ragged column: long values span the form, short ones
                 // (ports, groups, rates) take half.
-                let full = 300.0;
-                let half = 150.0;
+                let full = 260.0;
+                let half = 130.0;
                 ui.horizontal(|ui| {
                     ui.label("类型");
                     ui.selectable_value(&mut self.profile_kind, ProfileKind::Ssh, "SSH");
@@ -134,13 +168,15 @@ impl App {
                 ui.separator();
                 match self.profile_kind {
                     ProfileKind::Ssh => {
+                        ui.label(RichText::new("连接信息").strong().color(p.accent));
                         egui::Grid::new("connection-form")
                             .spacing([12.0, 6.0])
                             .min_col_width(72.0)
                             .show(ui, |ui| {
                                 ui.label("主机 / IP");
                                 editing::field_with(ui, &mut self.remote.host, |edit| {
-                                    edit.desired_width(full)
+                                    edit.hint_text("example.com 或 192.168.1.10")
+                                        .desired_width(full)
                                 });
                                 ui.end_row();
                                 ui.label("端口");
@@ -151,7 +187,7 @@ impl App {
                                 ui.end_row();
                                 ui.label("连接名称");
                                 editing::field_with(ui, &mut self.remote.name, |edit| {
-                                    edit.desired_width(full)
+                                    edit.hint_text("留空时显示主机名").desired_width(full)
                                 });
                                 ui.end_row();
                                 ui.label("分组");
@@ -179,7 +215,7 @@ impl App {
                                 ui.end_row();
                                 ui.label("用户名");
                                 editing::field_with(ui, &mut self.remote.user, |edit| {
-                                    edit.desired_width(full)
+                                    edit.hint_text("留空时连接时输入").desired_width(full)
                                 });
                                 ui.end_row();
                                 ui.label("私钥路径");
@@ -193,6 +229,9 @@ impl App {
                                 });
                                 ui.end_row();
                             });
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.label(RichText::new("高级设置").strong().color(p.accent));
                         egui::CollapsingHeader::new("ProxyJump 跳板机").show(ui, |ui| {
                             let mut enabled = self.remote.jump.is_some();
                             if ui.checkbox(&mut enabled, "启用一级跳板机").changed() {
@@ -268,6 +307,7 @@ impl App {
                         ui.label(hint("认证在连接时进行，密码不写入配置。", p));
                     }
                     ProfileKind::Serial => {
+                        ui.label(RichText::new("串口连接").strong().color(p.accent));
                         egui::Grid::new("serial-form")
                             .spacing([12.0, 6.0])
                             .min_col_width(72.0)
@@ -371,7 +411,13 @@ impl App {
                     if ui.button("保存").clicked() {
                         save = true;
                     }
-                    if ui.button("保存并连接").clicked() {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("保存并连接").color(p.panel))
+                                .fill(p.accent),
+                        )
+                        .clicked()
+                    {
                         save = true;
                         connect = true;
                     }

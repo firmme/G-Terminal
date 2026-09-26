@@ -111,56 +111,45 @@ impl App {
                         ui.max_rect().right()
                     };
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        brand_menu_button(ui, p.accent, |ui| {
-                            for (icon, text, shortcut, a) in [
-                                (
-                                    icons::Icon::Terminal,
-                                    "新建终端",
-                                    Some(accel("Ctrl+Shift+T")),
-                                    Action::New(SessionKind::Local(
-                                        self.settings.default_shell.clone(),
-                                    )),
-                                ),
-                                (icons::Icon::Terminal, "新建窗口", None, Action::NewWindow),
-                                (icons::Icon::Host, "新建 SSH 连接", None, Action::Remote),
+                        let capture_menu = self.screenshot.is_some()
+                            && std::env::var("GTERMINAL_SCREENSHOT_VIEW").as_deref() == Ok("menu");
+                        brand_menu_button(ui, p.accent, capture_menu, |ui| {
+                            menu_heading(ui, "新建", p);
+                            if icons::icon_row_primary(
+                                ui,
+                                icons::Icon::Terminal,
+                                "新建终端",
+                                Some(accel("Ctrl+Shift+T").as_str()),
+                                p,
+                            )
+                            .clicked()
+                            {
+                                *action = Some(Action::New(SessionKind::Local(
+                                    self.settings.default_shell.clone(),
+                                )));
+                                ui.close();
+                            }
+                            for (icon, text, a) in [
+                                (icons::Icon::Host, "新建 SSH 连接", Action::Remote),
                                 (
                                     icons::Icon::Terminal,
                                     "连接串口",
-                                    None,
                                     Action::SerialPicker,
                                 ),
-                                (
-                                    icons::Icon::Host,
-                                    "串口占用排查",
-                                    None,
-                                    Action::FindPortOwner(self.port_owner_default()),
-                                ),
-                                (icons::Icon::File, "文件与传输队列", None, Action::Files),
-                                (
-                                    icons::Icon::SplitHorizontal,
-                                    "左右分屏",
-                                    Some(accel("Ctrl+Shift+D")),
-                                    Action::Split(Axis::Horizontal),
-                                ),
-                                (
-                                    icons::Icon::SplitVertical,
-                                    "上下分屏",
-                                    Some(accel("Ctrl+Shift+E")),
-                                    Action::Split(Axis::Vertical),
-                                ),
-                                (
-                                    icons::Icon::ClosePane,
-                                    "关闭窗格",
-                                    Some(accel("Ctrl+Shift+W")),
-                                    Action::ClosePane,
-                                ),
                             ] {
-                                if icons::icon_row(ui, icon, text, shortcut.as_deref(), p).clicked()
-                                {
+                                if icons::icon_row(ui, icon, text, None, p).clicked() {
                                     *action = Some(a);
                                     ui.close();
                                 }
                             }
+                            if icons::icon_row(ui, icons::Icon::Terminal, "新建窗口", None, p)
+                                .clicked()
+                            {
+                                *action = Some(Action::NewWindow);
+                                ui.close();
+                            }
+                            ui.separator();
+                            menu_heading(ui, "当前会话", p);
                             // Only what the current link state can do is shown:
                             // a connected session can be disconnected, a
                             // dropped one reconnected. A live *local* shell can
@@ -209,23 +198,66 @@ impl App {
                                 self.search_focus = true;
                                 ui.close();
                             }
+                            ui.menu_button("分屏与窗格", |ui| {
+                                for (icon, text, shortcut, a) in [
+                                    (
+                                        icons::Icon::SplitHorizontal,
+                                        "左右分屏",
+                                        Some(accel("Ctrl+Shift+D")),
+                                        Action::Split(Axis::Horizontal),
+                                    ),
+                                    (
+                                        icons::Icon::SplitVertical,
+                                        "上下分屏",
+                                        Some(accel("Ctrl+Shift+E")),
+                                        Action::Split(Axis::Vertical),
+                                    ),
+                                    (
+                                        icons::Icon::ClosePane,
+                                        "关闭窗格",
+                                        Some(accel("Ctrl+Shift+W")),
+                                        Action::ClosePane,
+                                    ),
+                                ] {
+                                    if icons::icon_row(ui, icon, text, shortcut.as_deref(), p)
+                                        .clicked()
+                                    {
+                                        *action = Some(a);
+                                        ui.close();
+                                    }
+                                }
+                            });
                             ui.separator();
-                            if ui
-                                .checkbox(&mut self.settings.sidebar, "显示导航栏")
-                                .changed()
-                            {
-                                ui.close();
-                            }
-                            if icons::icon_row(ui, icons::Icon::Group, "连接分组管理", None, p)
+                            menu_heading(ui, "文件与连接", p);
+                            if icons::icon_row(ui, icons::Icon::File, "文件与传输队列", None, p)
                                 .clicked()
                             {
-                                self.groups_open = true;
+                                *action = Some(Action::Files);
                                 ui.close();
                             }
-                            if icons::icon_row(ui, icons::Icon::Settings, "服务器工具箱", None, p)
-                                .clicked()
-                            {
-                                *action = Some(Action::Toolbox);
+                            ui.menu_button("连接管理与工具", |ui| {
+                                if icons::icon_row(ui, icons::Icon::Group, "连接分组管理", None, p)
+                                    .clicked()
+                                {
+                                    self.groups_open = true;
+                                    ui.close();
+                                }
+                                if icons::icon_row(ui, icons::Icon::Host, "串口占用排查", None, p)
+                                    .clicked()
+                                {
+                                    *action = Some(Action::FindPortOwner(self.port_owner_default()));
+                                    ui.close();
+                                }
+                                if icons::icon_row(ui, icons::Icon::Settings, "服务器工具箱", None, p)
+                                    .clicked()
+                                {
+                                    *action = Some(Action::Toolbox);
+                                    ui.close();
+                                }
+                            });
+                            ui.separator();
+                            menu_heading(ui, "应用", p);
+                            if ui.checkbox(&mut self.settings.sidebar, "显示导航栏").changed() {
                                 ui.close();
                             }
                             if icons::icon_row(
@@ -240,27 +272,22 @@ impl App {
                                 self.settings_open = true;
                                 ui.close();
                             }
-                            if icons::icon_row(ui, icons::Icon::Help, "快捷键 / 关于", None, p)
-                                .clicked()
-                            {
-                                self.help_open = true;
-                                ui.close();
-                            }
-                            if icons::icon_row(ui, icons::Icon::Refresh, "检查更新", None, p)
-                                .clicked()
-                            {
-                                *action = Some(Action::CheckUpdates);
-                                ui.close();
-                            }
+                            ui.menu_button("帮助与更新", |ui| {
+                                if icons::icon_row(ui, icons::Icon::Help, "快捷键 / 关于", None, p)
+                                    .clicked()
+                                {
+                                    self.help_open = true;
+                                    ui.close();
+                                }
+                                if icons::icon_row(ui, icons::Icon::Refresh, "检查更新", None, p)
+                                    .clicked()
+                                {
+                                    *action = Some(Action::CheckUpdates);
+                                    ui.close();
+                                }
+                            });
                             ui.separator();
-                            ui.label(hint(
-                                concat!(
-                                    "G-Terminal ",
-                                    env!("CARGO_PKG_VERSION"),
-                                    " · Native. Fast. Yours."
-                                ),
-                                p,
-                            ));
+                            ui.label(hint(concat!("G-Terminal ", env!("CARGO_PKG_VERSION")), p));
                         });
                         // In auto-hide mode the button no longer hides the bar
                         // outright: expanding pins it open, and hiding sends it
@@ -437,23 +464,13 @@ impl App {
                                                                 } else {
                                                                     p.muted
                                                                 };
-                                                                // The shell's own title (OSC 0/2) wins over the
-                                                                // session label once it has set one.
-                                                                let title = pane
-                                                                    .session
-                                                                    .terminal
-                                                                    .lock()
-                                                                    .unwrap_or_else(|e| e.into_inner())
-                                                                    .title()
-                                                                    .to_string();
-                                                                let text = if title.is_empty() {
-                                                                    pane.session.kind.label()
+                                                                let name = pane.session.kind.label();
+                                                                let text: String = name.chars().take(22).collect();
+                                                                let text = if name.chars().count() > 22 {
+                                                                    format!("{text}…")
                                                                 } else {
-                                                                    title
-                                                                }
-                                                                .chars()
-                                                                .take(18)
-                                                                .collect::<String>();
+                                                                    text
+                                                                };
                                                                 let label = RichText::new(text)
                                                                     .color(color);
                                                                 let label = if focused {
@@ -469,6 +486,20 @@ impl App {
                                                                 } else {
                                                                     label
                                                                 });
+                                                                if active && focused {
+                                                                    let state = if pane.session.pending() {
+                                                                        "连接中"
+                                                                    } else {
+                                                                        match pane.session.link() {
+                                                                            SessionStatus::Detached => "未连接",
+                                                                            SessionStatus::Lost => "已断开",
+                                                                            SessionStatus::Live => "",
+                                                                        }
+                                                                    };
+                                                                    if !state.is_empty() {
+                                                                        ui.label(RichText::new(state).small().color(p.muted));
+                                                                    }
+                                                                }
                                                             }
                                                             // A background tab whose session rang shows a
                                                             // bell until the tab is looked at.
@@ -518,14 +549,23 @@ impl App {
                                                             ));
                                                         });
                                                         let Some(rect) = hit else { return };
-                                                        let r = ui
-                                                            .interact(rect, hit_id, Sense::click())
-                                                            .on_hover_text(format!(
-                                                                "{} · {} 个窗格 · 中键关闭",
+                                                            let full_title = t.panes[t.focused]
+                                                                .session
+                                                                .terminal
+                                                                .lock()
+                                                                .unwrap_or_else(|e| e.into_inner())
+                                                                .title()
+                                                                .to_string();
+                                                            let r = ui
+                                                                .interact(rect, hit_id, Sense::click())
+                                                                .on_hover_text(format!(
+                                                                "{}{} · {} · {} 个窗格 · 中键关闭",
                                                                 t.panes[t.focused]
                                                                     .session
                                                                     .kind
                                                                     .label(),
+                                                                if full_title.is_empty() { String::new() } else { format!(" · {full_title}") },
+                                                                tab_link(t).describe(),
                                                                 t.panes.len()
                                                             ));
                                                         if r.clicked() {
@@ -557,6 +597,11 @@ impl App {
                                                                     "复制会话",
                                                                     true,
                                                                     Action::DuplicateSession(i),
+                                                                ),
+                                                                (
+                                                                    "复制选项卡信息",
+                                                                    true,
+                                                                    Action::CopyTabInfo(i),
                                                                 ),
                                                                 (
                                                                     "关闭标签",
@@ -696,9 +741,16 @@ pub(super) enum TitleButton {
 /// beside it, so it is drawn one size up and the two runs are lined up by their
 /// painted bounds instead of egui's galley centring, which leaves `G` small and
 /// low against 菜单.
+fn menu_heading(ui: &mut egui::Ui, title: &str, p: Palette) {
+    ui.add_space(3.0);
+    ui.label(egui::RichText::new(title).small().strong().color(p.muted));
+    ui.add_space(2.0);
+}
+
 pub(super) fn brand_menu_button(
     ui: &mut egui::Ui,
     color: egui::Color32,
+    capture_menu: bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> egui::Response {
     let first = ui.fonts_mut(|fonts| {
@@ -739,7 +791,13 @@ pub(super) fn brand_menu_button(
         painter.galley(first_pos, first, color);
         painter.galley(rest_pos, rest, color);
     }
-    egui::Popup::menu(&response).show(|ui| add_contents(ui));
+    let popup = egui::Popup::menu(&response);
+    let popup = if capture_menu {
+        popup.open(true)
+    } else {
+        popup
+    };
+    popup.show(|ui| add_contents(ui));
     response
 }
 

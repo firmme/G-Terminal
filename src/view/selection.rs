@@ -1,25 +1,53 @@
 //! Turning a screen selection into text and finding the link under the pointer.
 
-pub(super) fn selection_text(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -> String {
+/// Rows are addressed relative to the live screen: zero is its first row,
+/// negative rows are in scrollback. Changing the viewport does not move a
+/// selection. The alternate screen has no scrollback and uses the same logic.
+pub(super) fn history_point(row: u16, col: u16, scrollback: usize) -> (i64, u16) {
+    (i64::from(row) - scrollback as i64, col)
+}
+
+pub(super) fn selection_text_history(
+    screen: &mut vt100::Screen,
+    a: (i64, u16),
+    b: (i64, u16),
+) -> String {
     let (a, b) = if a <= b { (a, b) } else { (b, a) };
+    let original = screen.scrollback();
+    let (height, width) = screen.size();
     let mut result = String::new();
-    for row in a.0..=b.0.min(screen.size().0 - 1) {
-        let start = if row == a.0 { a.1 } else { 0 };
-        let end = if row == b.0 { b.1 } else { screen.size().1 - 1 };
+    let mut previous_wrapped = false;
+    let mut had_row = false;
+    for absolute_row in a.0..=b.0.min(i64::from(height) - 1) {
+        let requested = absolute_row.saturating_neg().max(0) as usize;
+        screen.set_scrollback(requested);
+        let row = absolute_row + screen.scrollback() as i64;
+        if !(0..i64::from(height)).contains(&row) {
+            continue; // Older history was evicted while the selection existed.
+        }
+        let row = row as u16;
+        if had_row && !previous_wrapped {
+            result.push('\n');
+        }
+        let start = if absolute_row == a.0 { a.1 } else { 0 };
+        let end = if absolute_row == b.0 { b.1 } else { width - 1 };
         let mut line = String::new();
-        for col in start..=end.min(screen.size().1 - 1) {
-            if let Some(c) = screen.cell(row, col)
-                && !c.is_wide_continuation()
+        for col in start..=end.min(width - 1) {
+            if let Some(cell) = screen.cell(row, col)
+                && !cell.is_wide_continuation()
             {
-                let text = c.contents();
-                line.push_str(if text.is_empty() { " " } else { text });
+                line.push_str(if cell.contents().is_empty() {
+                    " "
+                } else {
+                    cell.contents()
+                });
             }
         }
         result.push_str(line.trim_end());
-        if row < b.0 && !screen.row_wrapped(row) {
-            result.push('\n');
-        }
+        previous_wrapped = screen.row_wrapped(row);
+        had_row = true;
     }
+    screen.set_scrollback(original);
     result
 }
 

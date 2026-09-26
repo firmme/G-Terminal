@@ -112,131 +112,155 @@ impl Files {
         if let Some(e) = &local.error {
             ui.colored_label(p.danger, e);
         }
-        // The header lives inside the scroller, so it travels sideways with the
-        // rows instead of drifting out of alignment with them.
-        egui::ScrollArea::both()
+        // Keep header and rows in one horizontal scroller. The inner vertical
+        // scroller only creates widgets for rows in view.
+        let width = ui.available_width().max(MIN_TABLE_WIDTH);
+        let height = list_height(ui);
+        let visible: Vec<_> = local
+            .entries
+            .iter()
+            .filter(|entry| self.show_hidden || !entry.name.starts_with('.'))
+            .collect();
+        egui::ScrollArea::horizontal()
             .id_salt("local-files")
             .auto_shrink([false, false])
-            .max_height(list_height(ui))
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .show(ui, |ui| {
-                // Wider than the pane when the pane is narrow: the columns keep
-                // their widths and the overflow becomes a horizontal scrollbar,
-                // rather than every column being squeezed into a truncation.
-                let width = ui.available_width().max(MIN_TABLE_WIDTH);
+                ui.set_min_width(width);
                 table_header(ui, p, &LOCAL_COLUMNS, &LOCAL_HEADERS, width);
-                for entry in &local.entries {
-                    if !self.show_hidden && entry.name.starts_with('.') {
-                        continue;
-                    }
-                    let path = PathBuf::from(&self.local_path).join(&entry.name);
-                    // A set executable bit (any of the three) is what `ls`
-                    // highlights, and what makes the icon a script rather than a
-                    // document. A symlink's own mode says nothing about its
-                    // target, so links never count as executable here; Windows
-                    // reports no mode at all.
-                    let executable = !entry.symlink && entry.perms.is_some_and(|m| m & 0o111 != 0);
-                    let mut cells = vec![
-                        Cell {
-                            text: format!(
-                                "{}{}",
-                                entry.name,
-                                entry_suffix(entry.directory, entry.symlink)
-                            ),
-                            right: false,
-                            color: Self::entry_color(entry.directory, entry.symlink, executable, p),
-                            full: None,
-                            icon: Some(file_icon(&entry.name, entry.directory, executable)),
-                            link: entry.symlink,
-                        },
-                        Cell {
-                            // A directory has no meaningful size of its own.
-                            text: if entry.directory {
-                                String::new()
-                            } else {
-                                format_size(entry.size)
-                            },
-                            right: true,
-                            color: p.muted,
-                            full: None,
-                            icon: None,
-                            link: false,
-                        },
-                    ];
-                    #[cfg(unix)]
-                    cells.push(Cell {
-                        text: Self::perms_string(entry.perms),
-                        right: true,
-                        color: p.muted,
-                        full: None,
-                        icon: None,
-                        link: false,
-                    });
-                    cells.push(Cell {
-                        text: entry.mtime.map_or_else(String::new, format_time),
-                        right: true,
-                        color: p.muted,
-                        // The column shows a shortened form; hovering recovers
-                        // the exact timestamp.
-                        full: entry.mtime.map(format_time_full),
-                        icon: None,
-                        link: false,
-                    });
-                    let selected = self.selected_local.as_ref() == Some(&path);
-                    let (r, _) = table_row(ui, &cells, &LOCAL_COLUMNS, selected, width);
-                    // A right-click selects the row first, the way a file manager
-                    // does, so the menu always acts on the row under the cursor
-                    // rather than on whatever happened to be selected.
-                    if r.secondary_clicked() {
-                        self.selected_local = Some(path.clone());
-                    }
-                    if r.clicked() {
-                        self.selected_local = Some(path.clone());
-                    }
-                    if r.double_clicked() {
-                        if entry.directory {
-                            *next = Some(path.display().to_string());
-                        } else {
-                            // A file opens in whatever the OS associates with it,
-                            // the same as the menu's 打开.
-                            *menu = Some(MenuAction::OpenLocal(path.clone()));
+                egui::ScrollArea::vertical()
+                    .id_salt("local-file-rows")
+                    .auto_shrink([false, false])
+                    .max_height((height - 24.0).max(50.0))
+                    .show_rows(ui, ROW_HEIGHT, visible.len(), |ui, range| {
+                        for entry in visible[range].iter().copied() {
+                            let path = PathBuf::from(&self.local_path).join(&entry.name);
+                            // A set executable bit (any of the three) is what `ls`
+                            // highlights, and what makes the icon a script rather than a
+                            // document. A symlink's own mode says nothing about its
+                            // target, so links never count as executable here; Windows
+                            // reports no mode at all.
+                            let executable =
+                                !entry.symlink && entry.perms.is_some_and(|m| m & 0o111 != 0);
+                            let mut cells = vec![
+                                Cell {
+                                    text: format!(
+                                        "{}{}",
+                                        entry.name,
+                                        entry_suffix(entry.directory, entry.symlink)
+                                    ),
+                                    right: false,
+                                    color: Self::entry_color(
+                                        entry.directory,
+                                        entry.symlink,
+                                        executable,
+                                        p,
+                                    ),
+                                    full: None,
+                                    icon: Some(file_icon(&entry.name, entry.directory, executable)),
+                                    link: entry.symlink,
+                                },
+                                Cell {
+                                    // A directory has no meaningful size of its own.
+                                    text: if entry.directory {
+                                        String::new()
+                                    } else {
+                                        format_size(entry.size)
+                                    },
+                                    right: true,
+                                    color: p.muted,
+                                    full: None,
+                                    icon: None,
+                                    link: false,
+                                },
+                            ];
+                            #[cfg(unix)]
+                            cells.push(Cell {
+                                text: Self::perms_string(entry.perms),
+                                right: true,
+                                color: p.muted,
+                                full: None,
+                                icon: None,
+                                link: false,
+                            });
+                            cells.push(Cell {
+                                text: entry.mtime.map_or_else(String::new, format_time),
+                                right: true,
+                                color: p.muted,
+                                // The column shows a shortened form; hovering recovers
+                                // the exact timestamp.
+                                full: entry.mtime.map(format_time_full),
+                                icon: None,
+                                link: false,
+                            });
+                            let selected = self.selected_local.as_ref() == Some(&path);
+                            let (r, _) = table_row(ui, &cells, &LOCAL_COLUMNS, selected, width);
+                            // A right-click selects the row first, the way a file manager
+                            // does, so the menu always acts on the row under the cursor
+                            // rather than on whatever happened to be selected.
+                            if r.secondary_clicked() {
+                                self.selected_local = Some(path.clone());
+                            }
+                            if r.clicked() {
+                                self.selected_local = Some(path.clone());
+                            }
+                            if r.double_clicked() {
+                                if entry.directory {
+                                    *next = Some(path.display().to_string());
+                                } else {
+                                    // A file opens in whatever the OS associates with it,
+                                    // the same as the menu's 打开.
+                                    *menu = Some(MenuAction::OpenLocal(path.clone()));
+                                }
+                            }
+                            r.context_menu(|ui| {
+                                context_menu(
+                                    ui,
+                                    menu,
+                                    vec![
+                                        menu_item(
+                                            "打开",
+                                            true,
+                                            MenuAction::OpenLocal(path.clone()),
+                                        ),
+                                        menu_item(
+                                            "编辑",
+                                            !entry.directory,
+                                            MenuAction::EditLocal(path.clone()),
+                                        ),
+                                        separator(),
+                                        menu_item(
+                                            "上传 →",
+                                            !entry.directory,
+                                            MenuAction::Upload(path.clone()),
+                                        ),
+                                        separator(),
+                                        menu_item(
+                                            "重命名",
+                                            true,
+                                            MenuAction::RenameLocal(path.clone()),
+                                        ),
+                                        menu_item(
+                                            "删除",
+                                            true,
+                                            MenuAction::DeleteLocal(path.clone()),
+                                        ),
+                                        separator(),
+                                        menu_item(
+                                            "复制路径",
+                                            true,
+                                            MenuAction::CopyPath(path.display().to_string()),
+                                        ),
+                                        menu_item(
+                                            "属性",
+                                            true,
+                                            MenuAction::Properties(local_properties(entry, &path)),
+                                        ),
+                                    ],
+                                );
+                            });
                         }
-                    }
-                    r.context_menu(|ui| {
-                        context_menu(
-                            ui,
-                            menu,
-                            vec![
-                                menu_item("打开", true, MenuAction::OpenLocal(path.clone())),
-                                menu_item(
-                                    "编辑",
-                                    !entry.directory,
-                                    MenuAction::EditLocal(path.clone()),
-                                ),
-                                separator(),
-                                menu_item(
-                                    "上传 →",
-                                    !entry.directory,
-                                    MenuAction::Upload(path.clone()),
-                                ),
-                                separator(),
-                                menu_item("重命名", true, MenuAction::RenameLocal(path.clone())),
-                                menu_item("删除", true, MenuAction::DeleteLocal(path.clone())),
-                                separator(),
-                                menu_item(
-                                    "复制路径",
-                                    true,
-                                    MenuAction::CopyPath(path.display().to_string()),
-                                ),
-                                menu_item(
-                                    "属性",
-                                    true,
-                                    MenuAction::Properties(local_properties(entry, &path)),
-                                ),
-                            ],
-                        );
                     });
-                }
             });
     }
     pub(super) fn show_remote_pane(
@@ -323,15 +347,18 @@ impl Files {
         if let Some(e) = &error {
             ui.colored_label(p.danger, e);
         }
-        // The header lives inside the scroller, so it travels sideways with the
-        // rows instead of drifting out of alignment with them.
-        egui::ScrollArea::both()
+        let width = ui.available_width().max(MIN_TABLE_WIDTH);
+        let height = list_height(ui);
+        let visible: Vec<_> = entries
+            .iter()
+            .filter(|entry| self.show_hidden || !entry.name.starts_with('.'))
+            .collect();
+        egui::ScrollArea::horizontal()
             .id_salt("remote-files")
             .auto_shrink([false, false])
-            .max_height(list_height(ui))
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .show(ui, |ui| {
-                let width = ui.available_width().max(MIN_TABLE_WIDTH);
+                ui.set_min_width(width);
                 table_header(
                     ui,
                     p,
@@ -339,111 +366,127 @@ impl Files {
                     &["名称", "大小", "权限", "修改时间"],
                     width,
                 );
-                for entry in &entries {
-                    if !self.show_hidden && entry.name.starts_with('.') {
-                        continue;
-                    }
-                    let executable = entry.perms.is_some_and(|m| m & 0o111 != 0);
-                    let cells = [
-                        Cell {
-                            text: format!(
-                                "{}{}",
-                                entry.name,
-                                entry_suffix(entry.directory, entry.symlink)
-                            ),
-                            right: false,
-                            color: Self::entry_color(entry.directory, entry.symlink, executable, p),
-                            full: None,
-                            icon: Some(file_icon(&entry.name, entry.directory, executable)),
-                            link: entry.symlink,
-                        },
-                        Cell {
-                            text: if entry.directory {
-                                String::new()
-                            } else {
-                                format_size(entry.size)
-                            },
-                            right: true,
-                            color: p.muted,
-                            full: None,
-                            icon: None,
-                            link: false,
-                        },
-                        Cell {
-                            text: Self::perms_string(entry.perms),
-                            right: true,
-                            color: p.muted,
-                            full: None,
-                            icon: None,
-                            link: false,
-                        },
-                        Cell {
-                            text: entry
-                                .mtime
-                                .map_or_else(String::new, |t| format_time(u64::from(t))),
-                            right: true,
-                            color: p.muted,
-                            full: entry.mtime.map(|t| format_time_full(u64::from(t))),
-                            icon: None,
-                            link: false,
-                        },
-                    ];
-                    let selected = self
-                        .selected_remote
-                        .as_ref()
-                        .is_some_and(|e| e.name == entry.name);
-                    let (r, _) = table_row(ui, &cells, &REMOTE_COLUMNS, selected, width);
-                    if r.secondary_clicked() {
-                        self.selected_remote = Some(entry.clone());
-                    }
-                    if r.clicked() {
-                        self.selected_remote = Some(entry.clone());
-                        self.name = entry.name.clone();
-                    }
-                    if r.double_clicked() {
-                        if entry.directory {
-                            *next = Some(join_path(&path, &entry.name));
-                        } else {
-                            // A remote file is fetched to the scratch directory and
-                            // then opened, exactly as the menu's 打开 does.
-                            *menu = Some(MenuAction::OpenRemote(RemoteTarget {
-                                entry: entry.clone(),
-                                path: join_path(&path, &entry.name),
-                            }));
+                egui::ScrollArea::vertical()
+                    .id_salt("remote-file-rows")
+                    .auto_shrink([false, false])
+                    .max_height((height - 24.0).max(50.0))
+                    .show_rows(ui, ROW_HEIGHT, visible.len(), |ui, range| {
+                        for entry in visible[range].iter().copied() {
+                            let executable = entry.perms.is_some_and(|m| m & 0o111 != 0);
+                            let cells = [
+                                Cell {
+                                    text: format!(
+                                        "{}{}",
+                                        entry.name,
+                                        entry_suffix(entry.directory, entry.symlink)
+                                    ),
+                                    right: false,
+                                    color: Self::entry_color(
+                                        entry.directory,
+                                        entry.symlink,
+                                        executable,
+                                        p,
+                                    ),
+                                    full: None,
+                                    icon: Some(file_icon(&entry.name, entry.directory, executable)),
+                                    link: entry.symlink,
+                                },
+                                Cell {
+                                    text: if entry.directory {
+                                        String::new()
+                                    } else {
+                                        format_size(entry.size)
+                                    },
+                                    right: true,
+                                    color: p.muted,
+                                    full: None,
+                                    icon: None,
+                                    link: false,
+                                },
+                                Cell {
+                                    text: Self::perms_string(entry.perms),
+                                    right: true,
+                                    color: p.muted,
+                                    full: None,
+                                    icon: None,
+                                    link: false,
+                                },
+                                Cell {
+                                    text: entry
+                                        .mtime
+                                        .map_or_else(String::new, |t| format_time(u64::from(t))),
+                                    right: true,
+                                    color: p.muted,
+                                    full: entry.mtime.map(|t| format_time_full(u64::from(t))),
+                                    icon: None,
+                                    link: false,
+                                },
+                            ];
+                            let selected = self
+                                .selected_remote
+                                .as_ref()
+                                .is_some_and(|e| e.name == entry.name);
+                            let (r, _) = table_row(ui, &cells, &REMOTE_COLUMNS, selected, width);
+                            if r.secondary_clicked() {
+                                self.selected_remote = Some(entry.clone());
+                            }
+                            if r.clicked() {
+                                self.selected_remote = Some(entry.clone());
+                                self.name = entry.name.clone();
+                            }
+                            if r.double_clicked() {
+                                if entry.directory {
+                                    *next = Some(join_path(&path, &entry.name));
+                                } else {
+                                    // A remote file is fetched to the scratch directory and
+                                    // then opened, exactly as the menu's 打开 does.
+                                    *menu = Some(MenuAction::OpenRemote(RemoteTarget {
+                                        entry: entry.clone(),
+                                        path: join_path(&path, &entry.name),
+                                    }));
+                                }
+                            }
+                            r.context_menu(|ui| {
+                                let target = || RemoteTarget {
+                                    entry: entry.clone(),
+                                    path: join_path(&path, &entry.name),
+                                };
+                                // Everything but the metadata actions needs a regular file:
+                                // a directory is entered by double-clicking, not opened.
+                                let file = !entry.directory;
+                                context_menu(
+                                    ui,
+                                    menu,
+                                    vec![
+                                        menu_item("打开", file, MenuAction::OpenRemote(target())),
+                                        menu_item("编辑", file, MenuAction::EditRemote(target())),
+                                        menu_item("← 下载", file, MenuAction::Download(target())),
+                                        separator(),
+                                        menu_item(
+                                            "重命名",
+                                            true,
+                                            MenuAction::RenameRemote(target()),
+                                        ),
+                                        menu_item("删除", true, MenuAction::DeleteRemote(target())),
+                                        separator(),
+                                        menu_item(
+                                            "复制路径",
+                                            true,
+                                            MenuAction::CopyPath(target().path),
+                                        ),
+                                        menu_item(
+                                            "属性",
+                                            true,
+                                            MenuAction::Properties(remote_properties(
+                                                &target(),
+                                                Self::perms_string(entry.perms),
+                                            )),
+                                        ),
+                                    ],
+                                );
+                            });
                         }
-                    }
-                    r.context_menu(|ui| {
-                        let target = || RemoteTarget {
-                            entry: entry.clone(),
-                            path: join_path(&path, &entry.name),
-                        };
-                        // Everything but the metadata actions needs a regular file:
-                        // a directory is entered by double-clicking, not opened.
-                        let file = !entry.directory;
-                        context_menu(
-                            ui,
-                            menu,
-                            vec![
-                                menu_item("打开", file, MenuAction::OpenRemote(target())),
-                                menu_item("编辑", file, MenuAction::EditRemote(target())),
-                                menu_item("← 下载", file, MenuAction::Download(target())),
-                                separator(),
-                                menu_item("重命名", true, MenuAction::RenameRemote(target())),
-                                menu_item("删除", true, MenuAction::DeleteRemote(target())),
-                                separator(),
-                                menu_item("复制路径", true, MenuAction::CopyPath(target().path)),
-                                menu_item(
-                                    "属性",
-                                    true,
-                                    MenuAction::Properties(remote_properties(
-                                        &target(),
-                                        Self::perms_string(entry.perms),
-                                    )),
-                                ),
-                            ],
-                        );
                     });
-                }
             });
     }
 }

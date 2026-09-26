@@ -3,13 +3,36 @@
 
 use super::*;
 
+fn profile_matches(profile: &RemoteProfile, filter: &str) -> bool {
+    filter.is_empty()
+        || [
+            profile.label(),
+            profile.host.clone(),
+            profile.user.clone(),
+            profile.group.clone(),
+        ]
+        .iter()
+        .any(|value| value.to_lowercase().contains(filter))
+}
+
+fn serial_matches(profile: &SerialProfile, filter: &str) -> bool {
+    filter.is_empty()
+        || [profile.label(), profile.port.clone(), profile.group.clone()]
+            .iter()
+            .any(|value| value.to_lowercase().contains(filter))
+}
+
 impl App {
     pub(super) fn sidebar(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
         let p = self.palette;
         egui::SidePanel::left("navigation")
-            .default_width(185.0)
+            .default_width(210.0)
             .width_range(140.0..=320.0)
-            .frame(egui::Frame::new().fill(p.panel).inner_margin(5))
+            .frame(
+                egui::Frame::new()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(8, 7)),
+            )
             .show(ctx, |ui| self.sidebar_contents(ui, action));
     }
     /// The navigation bar's body, shared by the docked panel and the floating
@@ -17,8 +40,35 @@ impl App {
     pub(super) fn sidebar_contents(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
         let p = self.palette;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::CollapsingHeader::new(RichText::new("本地 Shell").color(p.muted))
-                .default_open(true)
+            ui.label(RichText::new("工作区").strong().color(p.text));
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("+ 新建终端").color(p.panel))
+                            .fill(p.accent),
+                    )
+                    .clicked()
+                {
+                    *action = Some(Action::New(SessionKind::Local(
+                        self.settings.default_shell.clone(),
+                    )));
+                }
+                if ui.button("+ 新建连接").clicked() {
+                    *action = Some(Action::Remote);
+                }
+            });
+            ui.add_space(6.0);
+            editing::field_with(ui, &mut self.connection_filter, |edit| {
+                edit.hint_text("查找连接、主机或分组")
+                    .desired_width(f32::INFINITY)
+            });
+            let filter = self.connection_filter.trim().to_lowercase();
+            if !filter.is_empty() {
+                ui.label(hint("筛选已保存连接和 SSH config", p));
+            }
+            ui.add_space(7.0);
+            egui::CollapsingHeader::new(RichText::new("本地 Shell").color(p.text))
+                .default_open(false)
                 .show(ui, |ui| {
                     for shell in local_shells() {
                         // Double-click, like every other row in the
@@ -35,17 +85,67 @@ impl App {
                             "双击打开".to_string()
                         });
                     }
-                    ui.separator();
                     let serial = icons::icon_row(ui, icons::Icon::Host, "连接串口…", None, p);
                     if serial.double_clicked() {
                         *action = Some(Action::SerialPicker);
                     }
                     serial.on_hover_text("双击打开串口选择");
                 });
+            if filter.is_empty() && !self.settings.recent_connections.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("最近连接").strong().color(p.text));
+                let candidates: Vec<_> = self
+                    .settings
+                    .profiles
+                    .iter()
+                    .chain(self.settings.ssh_config_profiles.iter())
+                    .cloned()
+                    .map(SessionKind::Ssh)
+                    .chain(
+                        self.settings
+                            .serial_profiles
+                            .iter()
+                            .cloned()
+                            .map(SessionKind::Serial),
+                    )
+                    .collect();
+                for key in self.settings.recent_connections.iter().take(5) {
+                    if let Some(kind) = candidates
+                        .iter()
+                        .find(|kind| recent_connection_key(kind).as_ref() == Some(key))
+                    {
+                        let label = kind.label();
+                        let row = icons::icon_row(ui, icons::Icon::Host, &label, None, p);
+                        if row.clicked() {
+                            *action = Some(Action::New(kind.clone()));
+                        }
+                        row.context_menu(|ui| {
+                            if ui.button("复制连接信息").clicked() {
+                                *action = Some(Action::CopyConnectionInfo(kind.clone()));
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+            }
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), Sense::hover());
                 icons::draw(ui.painter(), rect, icons::Icon::Host, p.muted, 1.2);
-                ui.label(hint("连接", p));
+                ui.label(RichText::new("所有连接").strong().color(p.text))
+                    .on_hover_text("右键复制完整连接列表")
+                    .context_menu(|ui| {
+                        let has_connections = !self.settings.profiles.is_empty()
+                            || !self.settings.serial_profiles.is_empty()
+                            || !self.settings.ssh_config_profiles.is_empty();
+                        if ui
+                            .add_enabled(has_connections, egui::Button::new("复制连接列表"))
+                            .clicked()
+                        {
+                            *action = Some(Action::CopyConnectionList);
+                            ui.close();
+                        }
+                    });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if icons::icon_button(ui, icons::Icon::Group, p, icons::Size::Row)
                         .on_hover_text("分组管理")
@@ -76,20 +176,40 @@ impl App {
             groups.insert(0, String::new());
             let any_profiles =
                 !self.settings.profiles.is_empty() || !self.settings.serial_profiles.is_empty();
+            if !any_profiles && filter.is_empty() {
+                ui.label(hint("还没有保存的连接", p));
+            }
+            let any_match = self
+                .settings
+                .profiles
+                .iter()
+                .chain(self.settings.ssh_config_profiles.iter())
+                .any(|profile| profile_matches(profile, &filter))
+                || self
+                    .settings
+                    .serial_profiles
+                    .iter()
+                    .any(|profile| serial_matches(profile, &filter));
+            if !filter.is_empty() && !any_match {
+                ui.label(hint("没有匹配的连接", p));
+            }
             for group in groups {
                 let count = self
                     .settings
                     .profiles
                     .iter()
-                    .filter(|p| p.group == group)
+                    .filter(|p| p.group == group && profile_matches(p, &filter))
                     .count()
                     + self
                         .settings
                         .serial_profiles
                         .iter()
-                        .filter(|p| p.group == group)
+                        .filter(|p| p.group == group && serial_matches(p, &filter))
                         .count();
-                if group.is_empty() && count == 0 && any_profiles {
+                if !filter.is_empty() && count == 0 {
+                    continue;
+                }
+                if group.is_empty() && count == 0 {
                     continue;
                 }
                 egui::CollapsingHeader::new(format!(
@@ -108,7 +228,7 @@ impl App {
                         .profiles
                         .iter()
                         .enumerate()
-                        .filter(|(_, p)| p.group == group)
+                        .filter(|(_, p)| p.group == group && profile_matches(p, &filter))
                     {
                         let r = icons::icon_row(ui, icons::Icon::Host, &profile.label(), None, p);
                         if r.double_clicked() {
@@ -123,7 +243,11 @@ impl App {
                             for (text, a) in [
                                 ("连接 SSH", Action::New(SessionKind::Ssh(profile.clone()))),
                                 ("编辑 / 跳板机 / 转发", Action::Edit(index)),
-                                ("复制连接", Action::Duplicate(index)),
+                                (
+                                    "复制连接信息",
+                                    Action::CopyConnectionInfo(SessionKind::Ssh(profile.clone())),
+                                ),
+                                ("复制连接配置", Action::Duplicate(index)),
                                 ("删除连接", Action::Remove(index)),
                             ] {
                                 if ui.button(text).clicked() {
@@ -138,7 +262,7 @@ impl App {
                         .serial_profiles
                         .iter()
                         .enumerate()
-                        .filter(|(_, p)| p.group == group)
+                        .filter(|(_, p)| p.group == group && serial_matches(p, &filter))
                     {
                         let r =
                             icons::icon_row(ui, icons::Icon::Terminal, &profile.label(), None, p);
@@ -161,7 +285,13 @@ impl App {
                                     Action::New(SessionKind::Serial(profile.clone())),
                                 ),
                                 ("编辑串口连接", Action::EditSerial(index)),
-                                ("复制连接", Action::DuplicateSerial(index)),
+                                (
+                                    "复制连接信息",
+                                    Action::CopyConnectionInfo(SessionKind::Serial(
+                                        profile.clone(),
+                                    )),
+                                ),
+                                ("复制连接配置", Action::DuplicateSerial(index)),
                                 ("删除连接", Action::RemoveSerial(index)),
                             ] {
                                 if ui.button(text).clicked() {
@@ -177,8 +307,17 @@ impl App {
             // saved groups because the file, not settings.json, owns
             // them; "保存到连接" copies one over when it is worth keeping.
             if !self.settings.ssh_config_profiles.is_empty() {
-                let imported = self.settings.ssh_config_profiles.clone();
+                let imported: Vec<_> = self
+                    .settings
+                    .ssh_config_profiles
+                    .iter()
+                    .filter(|profile| profile_matches(profile, &filter))
+                    .cloned()
+                    .collect();
                 let count = imported.len();
+                if count == 0 {
+                    return;
+                }
                 egui::CollapsingHeader::new(format!("SSH-CONFIG ({count})"))
                     .id_salt("ssh-config")
                     .default_open(true)
@@ -197,6 +336,12 @@ impl App {
                             .context_menu(|ui| {
                                 if ui.button("连接 SSH").clicked() {
                                     *action = Some(Action::New(SessionKind::Ssh(profile.clone())));
+                                    ui.close();
+                                }
+                                if ui.button("复制连接信息").clicked() {
+                                    *action = Some(Action::CopyConnectionInfo(SessionKind::Ssh(
+                                        profile.clone(),
+                                    )));
                                     ui.close();
                                 }
                                 if ui.button("保存到连接").clicked() {

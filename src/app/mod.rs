@@ -50,6 +50,90 @@ mod widgets;
 use status::*;
 use widgets::*;
 
+fn recent_connection_key(kind: &SessionKind) -> Option<String> {
+    match kind {
+        SessionKind::Ssh(p) | SessionKind::Sftp(p) => {
+            Some(format!("ssh:{}@{}:{}", p.user, p.host, p.port))
+        }
+        SessionKind::Serial(p) => Some(format!("serial:{}:{}", p.port, p.baud)),
+        SessionKind::Local(_) => None,
+    }
+}
+
+/// Plain text for sharing a connection without credentials or private key paths.
+fn connection_info(kind: &SessionKind) -> String {
+    match kind {
+        SessionKind::Ssh(profile) | SessionKind::Sftp(profile) => {
+            let protocol = if matches!(kind, SessionKind::Sftp(_)) {
+                "SFTP"
+            } else {
+                "SSH"
+            };
+            let mut info = format!(
+                "{protocol} | {} | {}:{}",
+                profile.label(),
+                profile.destination(),
+                profile.port
+            );
+            if !profile.group.is_empty() {
+                info.push_str(&format!(" | 分组: {}", profile.group));
+            }
+            info
+        }
+        SessionKind::Serial(profile) => {
+            let mut info = format!(
+                "串口 | {} | {} | {} bps",
+                profile.label(),
+                profile.port.trim(),
+                profile.baud
+            );
+            if !profile.group.is_empty() {
+                info.push_str(&format!(" | 分组: {}", profile.group));
+            }
+            info
+        }
+        SessionKind::Local(shell) => format!("本地 Shell | {}", shell_label(shell)),
+    }
+}
+
+fn connection_list_info(settings: &Settings) -> String {
+    let mut lines = Vec::new();
+    for profile in &settings.profiles {
+        lines.push(connection_info(&SessionKind::Ssh(profile.clone())));
+    }
+    for profile in &settings.serial_profiles {
+        lines.push(connection_info(&SessionKind::Serial(profile.clone())));
+    }
+    for profile in &settings.ssh_config_profiles {
+        lines.push(format!(
+            "SSH config | {}",
+            connection_info(&SessionKind::Ssh(profile.clone()))
+        ));
+    }
+    lines.join("\n")
+}
+
+fn tab_info(tab: &Tab) -> String {
+    let mut lines = vec![format!(
+        "选项卡 | {}",
+        tab.panes[tab.focused].session.kind.label()
+    )];
+    for (index, pane) in tab.panes.iter().enumerate() {
+        lines.push(format!(
+            "窗格 {}{} | {} | {}",
+            index + 1,
+            if index == tab.focused {
+                "（当前）"
+            } else {
+                ""
+            },
+            connection_info(&pane.session.kind),
+            pane.session.link().describe()
+        ));
+    }
+    lines.join("\n")
+}
+
 struct Tab {
     id: u64,
     panes: Vec<Pane>,
@@ -83,6 +167,9 @@ enum Action {
     NewWindow,
     /// Open a new tab with the same session as this tab's focused pane.
     DuplicateSession(usize),
+    CopyTabInfo(usize),
+    CopyConnectionInfo(SessionKind),
+    CopyConnectionList,
     Split(Axis),
     CloseTab(usize),
     /// Close every tab except this one.
@@ -183,6 +270,8 @@ pub struct App {
     editing_profile: Option<usize>,
     editing_serial: Option<usize>,
     new_group: String,
+    connection_filter: String,
+    settings_dirty_at: Option<std::time::Instant>,
     search_open: bool,
     search: String,
     search_focus: bool,
@@ -231,10 +320,19 @@ impl App {
     }
     fn from_settings(
         ctx: &egui::Context,
-        settings: Settings,
+        mut settings: Settings,
         error: Option<String>,
         screenshot: Option<std::path::PathBuf>,
     ) -> Self {
+        // Visual smoke captures may choose a dialog/theme without changing the
+        // saved preferences. These overrides apply only to --screenshot runs.
+        let capture_view = screenshot
+            .as_ref()
+            .and_then(|_| std::env::var("GTERMINAL_SCREENSHOT_VIEW").ok());
+        if screenshot.is_some() && std::env::var("GTERMINAL_SCREENSHOT_LIGHT").as_deref() == Ok("1")
+        {
+            settings.light_theme = true;
+        }
         let palette = Palette::new(settings.light_theme);
         load_fonts(ctx);
         palette.apply(ctx, settings.light_theme);
@@ -244,8 +342,8 @@ impl App {
             tabs: vec![],
             active: 0,
             next_id: 0,
-            settings_open: false,
-            remote_open: false,
+            settings_open: capture_view.as_deref() == Some("settings"),
+            remote_open: matches!(capture_view.as_deref(), Some("connection" | "serial")),
             help_open: false,
             groups_open: false,
             remote: RemoteProfile::default(),
@@ -255,10 +353,16 @@ impl App {
             port_owner: None,
             serial_probe: None,
             toolbox: None,
-            profile_kind: ProfileKind::Ssh,
+            profile_kind: if capture_view.as_deref() == Some("serial") {
+                ProfileKind::Serial
+            } else {
+                ProfileKind::Ssh
+            },
             editing_profile: None,
             editing_serial: None,
             new_group: String::new(),
+            connection_filter: String::new(),
+            settings_dirty_at: None,
             search_open: false,
             search: String::new(),
             search_focus: false,
@@ -600,6 +704,11 @@ impl App {
             .collect();
     }
     fn persist(&mut self) {
+        // Screenshot runs are disposable UI probes, including when a dialog is
+        // exercised; they must never write the user's real settings.
+        if self.screenshot.is_some() {
+            return;
+        }
         self.snapshot();
         // A test must never write the real settings file. An app test that adds
         // or removes a connection calls this, and without the guard it replaced
@@ -659,7 +768,32 @@ impl App {
                     self.execute(Action::New(kind), ctx);
                 }
             }
+            Action::CopyTabInfo(i) => {
+                if let Some(tab) = self.tabs.get(i) {
+                    ctx.copy_text(tab_info(tab));
+                    self.notify("已复制选项卡信息");
+                }
+            }
+            Action::CopyConnectionInfo(kind) => {
+                ctx.copy_text(connection_info(&kind));
+                self.notify("已复制连接信息");
+            }
+            Action::CopyConnectionList => {
+                let info = connection_list_info(&self.settings);
+                if !info.is_empty() {
+                    ctx.copy_text(info);
+                    self.notify("已复制连接列表");
+                }
+            }
             Action::New(kind) => {
+                if let Some(key) = recent_connection_key(&kind) {
+                    self.settings
+                        .recent_connections
+                        .retain(|saved| saved != &key);
+                    self.settings.recent_connections.insert(0, key);
+                    self.settings.recent_connections.truncate(8);
+                    self.persist();
+                }
                 // The tab exists before the connection does, so the connection's
                 // notices and failures land in its own console.
                 let (tab_id, pane_id) = self.open_connecting_tab(kind.clone());
@@ -714,25 +848,34 @@ impl App {
             }
             Action::CloseTab(i) => {
                 if i < self.tabs.len() {
+                    let label = self.tabs[i].panes[self.tabs[i].focused]
+                        .session
+                        .kind
+                        .label();
                     self.tabs.remove(i);
                     if self.active > i {
                         self.active -= 1;
                     }
                     self.active = self.active.min(self.tabs.len().saturating_sub(1));
+                    self.notify(format!("已关闭标签 {label}"));
                 }
             }
             Action::CloseOtherTabs(keep) => {
                 if keep < self.tabs.len() {
+                    let closed = self.tabs.len() - 1;
                     let kept = self.tabs.remove(keep);
                     self.tabs.clear();
                     self.tabs.push(kept);
                     self.active = 0;
+                    self.notify(format!("已关闭 {closed} 个其它标签"));
                 }
             }
             Action::CloseDisconnectedTabs => {
+                let before = self.tabs.len();
                 self.tabs
                     .retain(|tab| tab_link(tab) != SessionStatus::Detached);
                 self.active = self.active.min(self.tabs.len().saturating_sub(1));
+                self.notify(format!("已关闭 {} 个断开的标签", before - self.tabs.len()));
             }
             Action::CheckUpdates => self.check_updates(ctx),
             Action::ClosePane => {
@@ -1082,6 +1225,7 @@ impl App {
             self.resize_grips(ctx);
         }
         self.tick_status(ctx);
+        self.tick_serial_background_timeout(ctx);
         let mut action = self.shortcuts(ctx);
         self.topbar(ctx, &mut action);
         self.mark_active_seen();
@@ -1102,6 +1246,14 @@ impl App {
             self.notify(text);
         }
         self.dialogs(ctx, &mut action);
+        if let Some(at) = self.settings_dirty_at {
+            if at.elapsed() >= std::time::Duration::from_millis(400) {
+                self.settings_dirty_at = None;
+                self.persist();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(400));
+            }
+        }
         if let Some(files) = &mut self.files {
             files.show_question(ctx, p);
             if files.busy() || files.loading() {
@@ -1138,6 +1290,58 @@ impl App {
         // Last, so every Enter check above saw the composition state as it was
         // when the frame started rather than after this frame's commit.
         editing::track_ime(ctx);
+    }
+
+    /// A serial pane remains visible in a split active tab. Only a hidden tab
+    /// or an unfocused window counts as background time.
+    fn tick_serial_background_timeout(&mut self, ctx: &egui::Context) {
+        let enabled = self.settings.serial_background_timeout_enabled;
+        let timeout = std::time::Duration::from_secs(
+            u64::from(
+                self.settings
+                    .serial_background_timeout_minutes
+                    .clamp(1, 1440),
+            ) * 60,
+        );
+        let window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let now = std::time::Instant::now();
+        let mut expired = Vec::new();
+        let mut waiting = false;
+        for (tab_index, tab) in self.tabs.iter_mut().enumerate() {
+            for (pane_index, pane) in tab.panes.iter_mut().enumerate() {
+                if !enabled
+                    || (window_focused && tab_index == self.active)
+                    || !matches!(pane.session.kind, SessionKind::Serial(_))
+                    || pane.session.link() != SessionStatus::Live
+                    || pane.session.pending()
+                {
+                    pane.background_since = None;
+                    continue;
+                }
+                let since = pane.background_since.get_or_insert(now);
+                if now.duration_since(*since) >= timeout {
+                    expired.push((tab_index, pane_index));
+                } else {
+                    waiting = true;
+                }
+            }
+        }
+        if waiting {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        for (tab_index, pane_index) in expired {
+            let pane = &mut self.tabs[tab_index].panes[pane_index];
+            let kind = pane.session.kind.clone();
+            let terminal = pane.session.terminal.clone();
+            let pane_id = pane.id;
+            *pane = Pane::new(
+                pane_id,
+                Session::disconnected_reusing(kind, self.settings.scrollback, Some(terminal)),
+            );
+            pane.session
+                .note_error("串口后台超时，已自动断开（Alt+R 重连）");
+            self.notify("串口后台超时，已自动断开");
+        }
     }
 }
 impl eframe::App for App {

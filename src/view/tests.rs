@@ -88,8 +88,61 @@ fn true_options() -> ViewOptions<'static> {
 fn selection_copies_wide_cells_once_and_preserves_wrapping() {
     let mut p = vt100::Parser::new(3, 6, 0);
     p.process("你好abcdef".as_bytes());
-    assert_eq!(selection_text(p.screen(), (0, 0), (1, 3)), "你好abcdef");
-    assert_eq!(selection_text(p.screen(), (1, 3), (0, 0)), "你好abcdef");
+    assert_eq!(
+        selection_text_history(p.screen_mut(), (0, 0), (1, 3)),
+        "你好abcdef"
+    );
+    assert_eq!(
+        selection_text_history(p.screen_mut(), (1, 3), (0, 0)),
+        "你好abcdef"
+    );
+}
+
+#[test]
+fn selection_spans_scrollback_and_restores_the_view() {
+    let mut parser = vt100::Parser::new(3, 8, 20);
+    parser.process(b"one\r\ntwo\r\nthree\r\nfour");
+    let screen = parser.screen_mut();
+    screen.set_scrollback(1);
+    let start = history_point(1, 0, screen.scrollback());
+    screen.set_scrollback(0);
+    let end = history_point(2, 3, screen.scrollback());
+    screen.set_scrollback(1);
+    assert_eq!(
+        selection_text_history(screen, start, end),
+        "two\nthree\nfour"
+    );
+    assert_eq!(screen.scrollback(), 1);
+}
+
+#[test]
+fn selection_survives_output_and_viewport_scroll() {
+    let ctx = egui::Context::default();
+    let session = Session::disconnected(g_terminal::session::SessionKind::Local("cmd".into()), 100);
+    let mut pane = Pane::new(901, session);
+    {
+        let mut terminal = pane.session.terminal.lock().unwrap();
+        terminal.process(b"one\r\ntwo\r\nthree");
+        let screen = terminal.parser.screen();
+        pane.selection = Some((
+            history_point(0, 0, screen.scrollback()),
+            history_point(1, 2, screen.scrollback()),
+        ));
+        terminal.process(b"\r\nfour");
+        terminal.scroll(1);
+    }
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 300.0))),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                pane.show(ui, true_options());
+            });
+        },
+    );
+    assert!(pane.selection.is_some());
 }
 
 /// One click places the caret, two take a word, three take the line, four take

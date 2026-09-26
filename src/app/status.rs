@@ -54,15 +54,26 @@ impl App {
                 ui.horizontal(|ui| {
                     if let Some(t) = self.tabs.get(self.active) {
                         let s = &t.panes[t.focused].session;
+                        let link = s.link();
                         let state = s.status.lock().unwrap();
-                        ui.colored_label(
-                            p.accent,
-                            if let Some(code) = state.exit_code {
-                                format!("已退出 {code}")
-                            } else {
-                                "● 运行中".into()
-                            },
-                        );
+                        let (state_color, state_text) = if s.pending() {
+                            (p.warn, "连接中…".to_string())
+                        } else {
+                            match link {
+                                SessionStatus::Live => (p.ok, "● 运行中".to_string()),
+                                SessionStatus::Detached => (
+                                    p.muted,
+                                    state.exit_code.map_or_else(
+                                        || "未连接 · 可重新连接".to_string(),
+                                        |code| format!("已退出 {code} · 可重新连接"),
+                                    ),
+                                ),
+                                SessionStatus::Lost => {
+                                    (p.danger, "连接中断 · 可重新连接".to_string())
+                                }
+                            }
+                        };
+                        ui.colored_label(state_color, state_text);
                         ui.label(hint(
                             &format!(
                                 "{}×{} · {} · {}/{}",

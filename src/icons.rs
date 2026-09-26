@@ -427,40 +427,71 @@ pub fn icon_row(
     shortcut: Option<&str>,
     p: Palette,
 ) -> egui::Response {
-    const HEIGHT: f32 = 22.0;
+    icon_row_inner(ui, icon, label, shortcut, p, false)
+}
+
+pub fn icon_row_primary(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    shortcut: Option<&str>,
+    p: Palette,
+) -> egui::Response {
+    icon_row_inner(ui, icon, label, shortcut, p, true)
+}
+
+fn icon_row_inner(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    shortcut: Option<&str>,
+    p: Palette,
+    primary: bool,
+) -> egui::Response {
+    let height = if primary { 28.0 } else { 22.0 };
     // In a menu popup `available_width` is generous and the row would stretch the
     // menu across the screen, so the width is bounded rather than taken as-is.
     let width = (ui.available_width() - 8.0).clamp(180.0, 280.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, HEIGHT), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
-        if hovered {
+        if hovered || primary {
             let visuals = ui.style().interact_selectable(&response, false);
             ui.painter().rect_filled(
                 rect,
                 ui.style().visuals.widgets.inactive.corner_radius,
-                visuals.bg_fill,
+                if hovered {
+                    visuals.bg_fill
+                } else {
+                    p.accent.gamma_multiply(0.12)
+                },
             );
         }
         let icon_rect = Rect::from_center_size(
-            Pos2::new(rect.left() + HEIGHT * 0.5, rect.center().y),
-            Vec2::splat(HEIGHT - 6.0),
+            Pos2::new(rect.left() + height * 0.5, rect.center().y),
+            Vec2::splat(16.0),
         );
         draw(
             ui.painter(),
             icon_rect,
             icon,
-            if hovered { p.text } else { p.muted },
+            if primary {
+                p.accent
+            } else if hovered {
+                p.text
+            } else {
+                p.muted
+            },
             Size::Row.stroke(),
         );
         let font =
             egui::FontId::proportional(ui.style().text_styles[&egui::TextStyle::Button].size);
         ui.painter().text(
-            Pos2::new(rect.left() + HEIGHT + 4.0, rect.center().y),
+            Pos2::new(rect.left() + height + 4.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
             font.clone(),
-            p.text,
+            if primary { p.accent } else { p.text },
         );
         if let Some(shortcut) = shortcut {
             ui.painter().text(

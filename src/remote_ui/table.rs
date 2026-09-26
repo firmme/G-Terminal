@@ -123,6 +123,10 @@ pub(super) const MIN_TABLE_WIDTH: f32 = 420.0;
 /// width anyway would push the row outside its pane.
 pub(super) const MIN_FIELD_WIDTH: f32 = 90.0;
 
+/// File rows have fixed height, which lets the list build only the visible
+/// widgets even when a directory has thousands of entries.
+pub(super) const ROW_HEIGHT: f32 = 18.0;
+
 /// Draws one file-table row at `width`. Returns the response and the rect of every
 /// column, so the geometry is observable rather than implicit in the painting.
 pub(super) fn table_row(
@@ -132,7 +136,6 @@ pub(super) fn table_row(
     selected: bool,
     width: f32,
 ) -> (egui::Response, Vec<egui::Rect>) {
-    const ROW_HEIGHT: f32 = 18.0;
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
     let offsets = column_offsets(columns, rect.width());

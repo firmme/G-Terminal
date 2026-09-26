@@ -1,12 +1,16 @@
 param(
     [ValidateSet('check', 'test', 'build', 'run', 'clippy')][string]$Action = 'build',
     [switch]$Release,
+    [switch]$BenchUi,
     # Optional rustup toolchain name, e.g. 'stable-x86_64-pc-windows-gnu'. When omitted, the
     # active default toolchain decides which environment (MSVC or GNU) gets prepared.
     [string]$Toolchain = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
+if ($BenchUi -and $Action -ne 'test') {
+    throw '-BenchUi requires -Action test.'
+}
 
 function Get-RustHostTriple([string]$Toolchain) {
     $rustcArgs = @()
@@ -129,6 +133,7 @@ $cargoArgs = @()
 if ($Toolchain) { $cargoArgs += "+$Toolchain" }
 $cargoArgs += $Action, '--locked'
 if ($Release) { $cargoArgs += '--release' }
+if ($BenchUi) { $cargoArgs += @('benchmark_', '--', '--ignored', '--nocapture', '--test-threads=1') }
 if ($Action -eq 'clippy') { $cargoArgs += @('--all-targets', '--', '-D', 'warnings') }
 & cargo @cargoArgs
 exit $LASTEXITCODE

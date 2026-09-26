@@ -263,10 +263,12 @@ impl Files {
         use std::sync::atomic::Ordering;
         let mut local_dir = None;
         let mut remote_dir = None;
+        let mut settled_batches = std::collections::HashSet::new();
         for transfer in &self.transfers {
             if !transfer.settled.swap(false, Ordering::AcqRel) {
                 continue;
             }
+            settled_batches.insert(transfer.batch);
             match transfer.direction {
                 Direction::Upload => {
                     let dir = parent_path(&transfer.remote);
@@ -307,6 +309,40 @@ impl Files {
             && Path::new(&self.local_path) == dir.as_path()
         {
             self.refresh_local();
+        }
+        for batch_id in settled_batches {
+            let members: Vec<_> = self
+                .transfers
+                .iter()
+                .filter(|transfer| transfer.batch == batch_id)
+                .collect();
+            let states: Vec<_> = members
+                .iter()
+                .map(|transfer| transfer.state.lock().unwrap().clone())
+                .collect();
+            if !states.iter().all(|state| state.finished) {
+                continue;
+            }
+            let label = self
+                .batches
+                .iter()
+                .find(|batch| batch.id == batch_id)
+                .map_or("文件", |batch| batch.name.as_str());
+            let completed = states
+                .iter()
+                .filter(|state| state.message == "完成")
+                .count();
+            let skipped = states
+                .iter()
+                .filter(|state| matches!(state.message.as_str(), "已跳过" | "已取消"))
+                .count();
+            let failed = states.len() - completed - skipped;
+            let summary = format!("{label}：{completed} 完成，{skipped} 跳过/取消，{failed} 失败");
+            if failed == 0 {
+                self.notice = Some(summary);
+            } else {
+                self.error = Some(summary);
+            }
         }
         self.prune_queue();
         // A settled row disappears on a timer, so the frame that notices has to be

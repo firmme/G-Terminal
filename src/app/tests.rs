@@ -2,6 +2,45 @@ use super::*;
 use egui::{Event, Modifiers, RawInput, Rect, Vec2};
 
 #[test]
+fn copied_connection_text_contains_targets_but_no_key_paths() {
+    let remote = RemoteProfile {
+        name: "生产机".into(),
+        host: "example.org".into(),
+        user: "alice".into(),
+        port: 2222,
+        identity: "private/key/path".into(),
+        group: "服务器".into(),
+        ..RemoteProfile::default()
+    };
+    let serial = SerialProfile {
+        name: "设备".into(),
+        port: "COM9".into(),
+        baud: 57600,
+        ..SerialProfile::default()
+    };
+    let settings = Settings {
+        profiles: vec![remote.clone()],
+        serial_profiles: vec![serial],
+        ..Settings::default()
+    };
+    let list = connection_list_info(&settings);
+    assert!(list.contains("SSH | 生产机 | alice@example.org:2222"));
+    assert!(list.contains("串口 | 设备 | COM9 | 57600 bps"));
+    assert!(!list.contains("private/key/path"));
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, settings, None, None);
+    let tab = tab_info(&app.tabs[app.active]);
+    assert!(tab.contains("选项卡 |"));
+    assert!(tab.contains("窗格 1（当前） |"));
+    let output = ctx.run(RawInput::default(), |ctx| {
+        app.execute(Action::CopyConnectionList, ctx);
+    });
+    assert!(output.platform_output.commands.iter().any(|command| {
+        matches!(command, egui::OutputCommand::CopyText(text) if text == &list)
+    }));
+}
+
+#[test]
 fn nested_workspace_roundtrips_without_persisting_authentication() {
     let ctx = egui::Context::default();
     let mut app = App::from_settings(&ctx, Settings::default(), None, None);
@@ -29,6 +68,60 @@ fn frame(app: &mut App, ctx: &egui::Context, events: Vec<Event>, modifiers: Modi
         },
         |ctx| app.render(ctx),
     );
+}
+
+/// Opt-in timing probe. Run in a release test binary with --ignored --nocapture.
+/// It reports frame cost under repeatable output, history and multi-tab loads.
+#[test]
+#[ignore]
+fn benchmark_ui_frames() {
+    let ctx = egui::Context::default();
+    let settings = Settings {
+        scrollback: 50_000,
+        ..Settings::default()
+    };
+    let mut app = App::from_settings(&ctx, settings, None, None);
+    let size = Vec2::new(1280.0, 800.0);
+    frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+    let mut samples = Vec::new();
+    for scenario in ["idle", "output", "history", "four-tabs", "input"] {
+        if scenario == "four-tabs" {
+            for _ in 0..3 {
+                app.execute(
+                    Action::New(SessionKind::Local(app.settings.default_shell.clone())),
+                    &ctx,
+                );
+            }
+        }
+        for i in 0..40 {
+            let pane = &app.tabs[app.active].panes[0];
+            if scenario == "output" || scenario == "history" {
+                let mut terminal = pane.session.terminal.lock().unwrap();
+                terminal
+                    .process(format!("{i:04} sample output {}\r\n", "x".repeat(120)).as_bytes());
+                if scenario == "history" {
+                    terminal.scroll(3);
+                }
+            }
+            let events = if scenario == "input" {
+                vec![Event::Text("x".into())]
+            } else {
+                Vec::new()
+            };
+            let start = std::time::Instant::now();
+            frame(&mut app, &ctx, events, Modifiers::NONE, size);
+            if i >= 5 {
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "UI {scenario}: p50={:.2}ms p95={:.2}ms",
+            samples[samples.len() / 2],
+            samples[samples.len() * 95 / 100]
+        );
+        samples.clear();
+    }
 }
 
 /// Pumps frames until a pending serial owner check has answered and the connect
