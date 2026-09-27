@@ -151,11 +151,18 @@ pub fn kill(pid: u32) -> Result<String, String> {
     if pid == std::process::id() {
         return Err("那是本程序自己，不能结束".into());
     }
-    unsafe { c::kill(pid as i32, SIGTERM) };
+    // A signal that cannot be delivered means the pid is already gone, or
+    // belongs to someone this process cannot signal; there is nothing to wait
+    // for, and reporting success would be a lie.
+    if unsafe { c::kill(pid as i32, SIGTERM) } != 0 {
+        return Err(format!("无法结束进程 {pid}（进程不存在或需要更高权限）"));
+    }
     if wait_gone(pid, Duration::from_millis(1500)) {
         return Ok("已发送 SIGTERM，进程已退出".into());
     }
-    unsafe { c::kill(pid as i32, SIGKILL) };
+    if unsafe { c::kill(pid as i32, SIGKILL) } != 0 {
+        return Err(format!("无法结束进程 {pid}（进程不存在或需要更高权限）"));
+    }
     if wait_gone(pid, Duration::from_millis(1000)) {
         Ok("进程忽略 SIGTERM，已用 SIGKILL 强制结束".into())
     } else {
