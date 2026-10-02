@@ -193,42 +193,47 @@ impl Toolbox {
             .default_width(540.0)
             .show(ctx, |ui| {
                 ui.label(RichText::new(format!("目标：{target}")).color(p.accent));
-                ui.label(hint(
-                    "以下命令以当前登录用户的身份在该会话中执行；未勾选的项不会运行。",
-                    p,
-                ));
+                ui.label(hint("仅执行已勾选的项目，使用当前登录用户权限。", p));
                 ui.separator();
-                ui.label(RichText::new("初始化服务器").strong());
-                ui.checkbox(&mut self.aliases, "配置常用命令别名");
-                ui.horizontal(|ui| {
-                    let has_key = self.key.is_some();
-                    ui.add_enabled_ui(has_key, |ui| {
-                        ui.checkbox(&mut self.key_login, "免密登录（写入本机公钥）");
+                egui::CollapsingHeader::new("初始化服务器")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.checkbox(&mut self.aliases, "配置常用命令别名");
+                        ui.horizontal(|ui| {
+                            let has_key = self.key.is_some();
+                            ui.add_enabled_ui(has_key, |ui| {
+                                ui.checkbox(&mut self.key_login, "免密登录（写入本机公钥）");
+                            });
+                            if !has_key {
+                                ui.label(hint("未找到本机公钥（~/.ssh/id_ed25519.pub 等）", p));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("命令提示符");
+                            ui.selectable_value(&mut self.prompt, Prompt::Keep, "不修改");
+                            ui.selectable_value(&mut self.prompt, Prompt::Full, "完整");
+                            ui.selectable_value(&mut self.prompt, Prompt::Minimal, "精简");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.timezone_on, "设置时区");
+                            editing::field_enabled_with(
+                                ui,
+                                self.timezone_on,
+                                &mut self.timezone,
+                                |edit| edit.desired_width(160.0),
+                            );
+                        });
+                        ui.checkbox(&mut self.ipv6, "关闭 IPv6");
                     });
-                    if !has_key {
-                        ui.label(hint("未找到本机公钥（~/.ssh/id_ed25519.pub 等）", p));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("命令提示符");
-                    ui.selectable_value(&mut self.prompt, Prompt::Keep, "不修改");
-                    ui.selectable_value(&mut self.prompt, Prompt::Full, "完整");
-                    ui.selectable_value(&mut self.prompt, Prompt::Minimal, "精简");
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.timezone_on, "设置时区");
-                    editing::field_enabled_with(ui, self.timezone_on, &mut self.timezone, |edit| {
-                        edit.desired_width(160.0)
+                egui::CollapsingHeader::new("安装常用工具")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (tool, checked) in &mut self.tools {
+                                ui.checkbox(checked, tool.label());
+                            }
+                        });
                     });
-                });
-                ui.checkbox(&mut self.ipv6, "关闭 IPv6");
-                ui.separator();
-                ui.label(RichText::new("安装常用工具").strong());
-                ui.horizontal_wrapped(|ui| {
-                    for (tool, checked) in &mut self.tools {
-                        ui.checkbox(checked, tool.label());
-                    }
-                });
                 if self.timezone_on && !self.timezone_ok() {
                     ui.colored_label(p.danger, "时区格式不合法，示例：Asia/Shanghai");
                 }
@@ -240,10 +245,7 @@ impl Toolbox {
                             ui.monospace(self.script());
                         });
                     });
-                ui.label(hint(
-                    "命令会写入远端临时文件后执行，可直接复制到别处复核。",
-                    p,
-                ));
+                ui.label(hint("可复制命令预览进行复核。", p));
                 ui.horizontal(|ui| {
                     let ready =
                         self.anything_selected() && !(self.timezone_on && !self.timezone_ok());

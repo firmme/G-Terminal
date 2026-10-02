@@ -41,23 +41,6 @@ impl App {
         let p = self.palette;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.label(RichText::new("工作区").strong().color(p.text));
-            ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("+ 新建终端").color(p.panel))
-                            .fill(p.accent),
-                    )
-                    .clicked()
-                {
-                    *action = Some(Action::New(SessionKind::Local(
-                        self.settings.default_shell.clone(),
-                    )));
-                }
-                if ui.button("+ 新建连接").clicked() {
-                    *action = Some(Action::Remote);
-                }
-            });
-            ui.add_space(6.0);
             editing::field_with(ui, &mut self.connection_filter, |edit| {
                 edit.hint_text("查找连接、主机或分组")
                     .desired_width(f32::INFINITY)

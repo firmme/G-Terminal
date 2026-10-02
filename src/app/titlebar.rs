@@ -3,12 +3,6 @@
 use super::*;
 
 impl App {
-    /// Claims the window's outer few pixels for resizing.
-    ///
-    /// A frameless window gets no resize border from the OS, and winit does not add
-    /// one — so without this the window simply cannot be resized by dragging, which
-    /// is what it did before. The edges are detected here and handed to the
-    /// platform, which then runs its own resize loop.
     pub(super) fn resize_grips(&self, ctx: &egui::Context) {
         use egui::viewport::ResizeDirection;
         const GRIP: f32 = 5.0;
@@ -35,16 +29,12 @@ impl App {
         let Some(direction) = direction else {
             return;
         };
-        // The cursor is the whole affordance: nothing is drawn, so without it the
-        // edge looks inert.
         ctx.set_cursor_icon(match direction {
             ResizeDirection::North | ResizeDirection::South => egui::CursorIcon::ResizeVertical,
             ResizeDirection::East | ResizeDirection::West => egui::CursorIcon::ResizeHorizontal,
             ResizeDirection::NorthWest | ResizeDirection::SouthEast => egui::CursorIcon::ResizeNwSe,
             ResizeDirection::NorthEast | ResizeDirection::SouthWest => egui::CursorIcon::ResizeNeSw,
         });
-        // Only a press that starts on the edge begins a resize; otherwise every
-        // click near a border would jump into one.
         if ctx.input(|i| i.pointer.primary_pressed()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
         }
@@ -61,15 +51,8 @@ impl App {
             .show(ctx, |ui| {
                 let mut close = false;
                 let mut toggle = false;
-                // Read maximized fresh every frame: the window can also be maximized
-                // by the OS (snap, Win+Up, taskbar) without going through a button.
                 let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                // The Windows and Linux windows are frameless, so they draw their
-                // own buttons and resize grips. macOS hides the native titlebar
-                // but keeps its buttons and edge resizing, so it draws neither.
                 let custom_chrome = !cfg!(target_os = "macos");
-                // The tab row and the window buttons share one bar, so the frameless
-                // chrome costs a single row of height instead of two.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let buttons_left = if custom_chrome {
                         let close_button =
@@ -95,10 +78,7 @@ impl App {
                         if minimize_button.clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
-                        // Derive the edge from the buttons themselves; `min_rect()` would
-                        // also fold in unrelated widgets. The drag strip below is
-                        // registered later and would win any overlap, so this boundary
-                        // has to be exact.
+                        // The drag region must stop before the window buttons.
                         close_button
                             .rect
                             .union(toggle_button.rect)
@@ -106,8 +86,6 @@ impl App {
                             .left()
                             - 4.0
                     } else {
-                        // macOS: no custom buttons, but the drag strip still runs
-                        // to the right edge of the bar.
                         ui.max_rect().right()
                     };
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -150,15 +128,11 @@ impl App {
                             }
                             ui.separator();
                             menu_heading(ui, "当前会话", p);
-                            // Only what the current link state can do is shown:
-                            // a connected session can be disconnected, a
-                            // dropped one reconnected. A live *local* shell can
-                            // still be restarted, so it keeps that entry.
                             let live = self.active_link() == Some(SessionStatus::Live);
                             if live
                                 && icons::icon_row(
                                     ui,
-                                    icons::Icon::ClosePane,
+                                    icons::Icon::Restart,
                                     "断开当前连接",
                                     Some(alt_accel("C").as_str()),
                                     p,
@@ -171,7 +145,7 @@ impl App {
                             if (!live || !self.active_is_remote())
                                 && icons::icon_row(
                                     ui,
-                                    icons::Icon::Restart,
+                                    icons::Icon::Refresh,
                                     if live {
                                         "重新连接 / 重启"
                                     } else {
@@ -248,7 +222,7 @@ impl App {
                                     *action = Some(Action::FindPortOwner(self.port_owner_default()));
                                     ui.close();
                                 }
-                                if icons::icon_row(ui, icons::Icon::Settings, "服务器工具箱", None, p)
+                                if icons::icon_row(ui, icons::Icon::Toolbox, "服务器工具箱", None, p)
                                     .clicked()
                                 {
                                     *action = Some(Action::Toolbox);
@@ -289,10 +263,6 @@ impl App {
                             ui.separator();
                             ui.label(hint(concat!("G-Terminal ", env!("CARGO_PKG_VERSION")), p));
                         });
-                        // In auto-hide mode the button no longer hides the bar
-                        // outright: expanding pins it open, and hiding sends it
-                        // back to hovering. Outside that mode it stays a plain
-                        // show/hide toggle.
                         let auto_hide = self.settings.auto_hide_sidebar;
                         let docked = self.settings.sidebar && (!auto_hide || self.sidebar_pinned);
                         let (icon, hover) = if auto_hide {
@@ -322,28 +292,21 @@ impl App {
                             }
                         }
                         ui.separator();
-                        // Bound the strip so a stretch of empty bar always remains for
-                        // dragging the window by.
                         const DRAG_GAP: f32 = 60.0;
                         let strip_max = (buttons_left - ui.cursor().min.x - DRAG_GAP).max(120.0);
-                        // A horizontal strip ignores the wheel, and every mouse has
-                        // one. The vertical delta is fed in as horizontal, but only
-                        // while the pointer is over the strip — otherwise the
-                        // terminal below would stop scrolling.
                         let cursor = ui.cursor().min;
                         let strip_rect = egui::Rect::from_min_max(
                             cursor,
                             egui::pos2(cursor.x + strip_max, cursor.y + 24.0),
                         );
                         if ui.rect_contains_pointer(strip_rect) {
+                            // Convert wheel movement only while hovering the tab strip.
                             ui.ctx().input_mut(|input| {
                                 let wheel = input.smooth_scroll_delta.y;
                                 input.smooth_scroll_delta.x += wheel;
                                 input.smooth_scroll_delta.y = 0.0;
                             });
                         }
-                        // A hairline bar, shown only when the tabs actually
-                        // overflow: it reads as an indicator, not as chrome.
                         ui.scope(|ui| {
                             let scroll = &mut ui.style_mut().spacing.scroll;
                             scroll.bar_width = 3.0;
@@ -358,32 +321,15 @@ impl App {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         for (i, t) in self.tabs.iter().enumerate() {
-                                            // A background tab that has received
-                                            // more than it had when it was last
-                                            // looked at is underlined.
                                             let updated = tab_updated(t, i == self.active);
                                             ui.push_id(t.id, |ui| {
-                                                // The hover state comes from the
-                                                // previous frame's response, which
-                                                // is what lets the background be
-                                                // painted before the labels; the
-                                                // tab is interactive, so moving
-                                                // onto it already schedules the
-                                                // repaint that shows the highlight.
                                                 let hit_id = ui.id().with("tab-hit");
                                                 let hovered = ui
                                                     .ctx()
                                                     .read_response(hit_id)
                                                     .is_some_and(|r| r.hovered());
-                                                // A connection or group colour
-                                                // tints the whole label; the
-                                                // connection's own colour wins.
                                                 let active = i == self.active;
                                                 let base = if active { p.raised } else { p.panel };
-                                                // Just enough tint to tell the three states
-                                                // apart: the active tab is a touch brighter with
-                                                // a soft outline, hover a touch brighter still
-                                                // than the plain panel — no shouting.
                                                 let (fill, stroke) = match connection_color(
                                                     &t.panes[t.focused].session.kind,
                                                     &self.settings.group_colors,
@@ -429,7 +375,6 @@ impl App {
                                                     .show(ui, |ui| {
                                                         let mut hit = None;
                                                         ui.horizontal(|ui| {
-                                                            // Connection state of the whole tab, worst pane wins.
                                                             let (dot, _) = ui.allocate_exact_size(
                                                                 egui::vec2(7.0, 7.0),
                                                                 Sense::hover(),
@@ -478,9 +423,6 @@ impl App {
                                                                 } else {
                                                                     label
                                                                 };
-                                                                // Underlined while the
-                                                                // tab holds output the
-                                                                // user has not seen.
                                                                 ui.label(if updated {
                                                                     label.underline()
                                                                 } else {
@@ -501,8 +443,6 @@ impl App {
                                                                     }
                                                                 }
                                                             }
-                                                            // A background tab whose session rang shows a
-                                                            // bell until the tab is looked at.
                                                             if i != self.active
                                                                 && t.panes.iter().any(|pane| {
                                                                     pane.session.traffic.bell.load(
@@ -523,9 +463,6 @@ impl App {
                                                                     1.2,
                                                                 );
                                                             }
-                                                            // Inside the label row, so it hugs the
-                                                            // text instead of floating at the tab's
-                                                            // far edge.
                                                             let close = icons::glyph_button(
                                                                 ui,
                                                                 "×",
@@ -535,10 +472,6 @@ impl App {
                                                             if close.clicked() {
                                                                 *action = Some(Action::CloseTab(i));
                                                             }
-                                                            // The whole tab activates on click, but the
-                                                            // hit rect has to stop where the close button
-                                                            // begins — it is registered first, so anything
-                                                            // overlapping it would win.
                                                             let label_rect = ui.min_rect();
                                                             hit = Some(egui::Rect::from_min_max(
                                                                 label_rect.min,
@@ -646,9 +579,6 @@ impl App {
                                 self.settings.default_shell.clone(),
                             )));
                         }
-                        // Whatever the tabs left over, up to the buttons, drags the
-                        // frameless window. Spanning the full bar height keeps the
-                        // top and bottom rows of pixels draggable too.
                         let cursor = ui.cursor().min;
                         if cursor.x < buttons_left {
                             let drag_rect = Rect::from_min_max(
@@ -678,8 +608,6 @@ impl App {
             });
     }
 
-    /// Keeps the OS window title on the focused shell's own title (OSC 0/2),
-    /// falling back to its session label. Sent only when it changes.
     pub(super) fn update_window_title(&mut self, ctx: &egui::Context) {
         if self.screenshot.is_some() {
             return;
@@ -709,14 +637,9 @@ impl App {
         }
     }
 
-    /// Looking at a tab clears its new-output mark and its bell; the tab strip
-    /// has already been drawn this frame.
     pub(super) fn mark_active_seen(&mut self) {
-        // Looking at a tab clears its new-output mark, which is why this lands
-        // after the strip has been drawn.
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.seen_output = tab_output(tab);
-            // The active tab's bell has been seen; clear it.
             for pane in &tab.panes {
                 pane.session
                     .traffic
@@ -727,8 +650,6 @@ impl App {
     }
 }
 
-/// Which frame icon a titlebar button paints. `Restore` and `Maximize` are the
-/// same button in two states.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum TitleButton {
     Close,
@@ -737,10 +658,6 @@ pub(super) enum TitleButton {
     Minimize,
 }
 
-/// The menu button. `G` is a Latin capital, which is shorter than the CJK glyphs
-/// beside it, so it is drawn one size up and the two runs are lined up by their
-/// painted bounds instead of egui's galley centring, which leaves `G` small and
-/// low against 菜单.
 fn menu_heading(ui: &mut egui::Ui, title: &str, p: Palette) {
     ui.add_space(3.0);
     ui.label(egui::RichText::new(title).small().strong().color(p.muted));
@@ -776,9 +693,6 @@ pub(super) fn brand_menu_button(
             egui::StrokeKind::Inside,
         );
 
-        // Painted bounds, not font metrics: the glyphs' visual centres are what
-        // has to agree, and a CJK run's metrics say little about where its ink
-        // sits. `mesh_bounds` is each run's ink.
         let ink_centre = |galley: &egui::Galley| {
             galley.rows.first().map_or(galley.size().y / 2.0, |row| {
                 row.visuals.mesh_bounds.center().y
@@ -801,9 +715,6 @@ pub(super) fn brand_menu_button(
     response
 }
 
-/// The topbar's inner margin. macOS runs the content under a hidden native
-/// titlebar, so the left side has to clear the traffic lights; every other
-/// platform owns the whole row.
 pub(super) fn topbar_margin() -> egui::Margin {
     if cfg!(target_os = "macos") {
         egui::Margin {
@@ -817,9 +728,6 @@ pub(super) fn topbar_margin() -> egui::Margin {
     }
 }
 
-/// The window-chrome buttons. Painted through the shared icon set, for the same
-/// reason every other glyph is: no font in the loaded chain carries these
-/// codepoints, so the text versions rendered as tofu boxes.
 pub(super) fn title_button(ui: &mut egui::Ui, kind: TitleButton, p: Palette) -> egui::Response {
     let icon = match kind {
         TitleButton::Close => icons::Icon::Close,

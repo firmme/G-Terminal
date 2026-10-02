@@ -1,6 +1,10 @@
 param(
     # Delete for real. Without this the script only reports what it would do.
     [switch]$Apply,
+    # Keep the artifacts of other installed Rust toolchains (for example the GNU
+    # fallback). They can never be reused by the active toolchain, but dropping
+    # them costs a full rebuild if that toolchain is used later.
+    [switch]$KeepOtherToolchains,
     # Incremental sessions untouched for this long are from a build
     # configuration the current one no longer uses. Everything the recent
     # builds compiled stays, so the next build keeps its speed.
@@ -15,8 +19,10 @@ if (-not (Test-Path -LiteralPath $target)) {
 }
 
 function Get-DirectorySize($path) {
-    (Get-ChildItem -LiteralPath $path -Recurse -Force -File -ErrorAction SilentlyContinue |
+    $sum = (Get-ChildItem -LiteralPath $path -Recurse -Force -File -ErrorAction SilentlyContinue |
         Measure-Object -Property Length -Sum).Sum
+    if ($null -eq $sum) { return 0 }
+    return $sum
 }
 
 $freed = [long]0
@@ -27,16 +33,37 @@ foreach ($profile in Get-ChildItem -LiteralPath $target -Directory) {
     $fingerprints = Join-Path $profile.FullName '.fingerprint'
     if (-not (Test-Path -LiteralPath $fingerprints)) { continue }
 
-    # The hash in an artifact's name is the metadata hash in the name of the
-    # fingerprint directory that still refers to it, so a fingerprint that
-    # exists means cargo can reuse the artifact, and one that does not means it
-    # never will again.
+    # Each fingerprint directory records the rustc that produced it. A unit
+    # built by another rustc can never match again, so those directories — and
+    # the artifacts named after them — are dead weight for this toolchain.
+    $units = foreach ($dir in Get-ChildItem -LiteralPath $fingerprints -Directory) {
+        $rustc = @(Get-ChildItem -LiteralPath $dir.FullName -Filter *.json -ErrorAction SilentlyContinue |
+            ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).rustc } |
+            Select-Object -Unique)
+        [pscustomobject]@{
+            Dir   = $dir
+            Hash  = ($dir.Name -split '-')[-1]
+            Rustc = $rustc
+            When  = $dir.LastWriteTime
+        }
+    }
+    $newest = $units | Sort-Object When -Descending | Select-Object -First 1
+    $activeRustc = if ($newest) { ($newest.Rustc -join ',') } else { '' }
+
+    $stale = @()
+    if (-not $KeepOtherToolchains -and $activeRustc) {
+        # Directories with no fingerprint at all are left alone: they are not
+        # provably dead.
+        $stale = $units | Where-Object {
+            $_.Rustc.Count -gt 0 -and (($_.Rustc -join ',') -ne $activeRustc)
+        }
+    }
     $live = @{}
-    foreach ($unit in Get-ChildItem -LiteralPath $fingerprints -Directory) {
-        $hash = ($unit.Name -split '-')[-1]
-        if ($hash -match '^[0-9a-f]{16}$') { $live[$hash] = $true }
+    foreach ($unit in $units) {
+        if ($stale -notcontains $unit) { $live[$unit.Hash] = $true }
     }
 
+    # An artifact whose hash no longer has a fingerprint will never be reused.
     $deps = Join-Path $profile.FullName 'deps'
     if (Test-Path -LiteralPath $deps) {
         foreach ($file in Get-ChildItem -LiteralPath $deps -File) {
@@ -60,6 +87,12 @@ foreach ($profile in Get-ChildItem -LiteralPath $target -Directory) {
         }
     }
 
+    foreach ($unit in $stale) {
+        $freed += Get-DirectorySize $unit.Dir.FullName
+        $removed++
+        if ($Apply) { Remove-Item -LiteralPath $unit.Dir.FullName -Recurse -Force }
+    }
+
     # Incremental sessions cannot be matched by hash (cargo spells them in
     # another base), and an unused one is only recognisable by age: the units a
     # build reuses were all compiled by a recent build.
@@ -77,4 +110,5 @@ foreach ($profile in Get-ChildItem -LiteralPath $target -Directory) {
 
 $action = if ($Apply) { 'Removed' } else { 'Would remove' }
 Write-Output ('{0} {1} entries, {2:N1} MB. {3}' -f $action, $removed, ($freed / 1MB),
-    $(if ($Apply) { 'The next build reuses everything recent.' } else { 'Run with -Apply to delete.' }))
+    $(if ($Apply) { 'The next build of the active toolchain reuses everything it needs.' }
+      else { 'Run with -Apply to delete.' }))

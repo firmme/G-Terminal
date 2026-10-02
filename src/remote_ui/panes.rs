@@ -1,5 +1,4 @@
-//! The two file panes: the local listing and the remote one, drawn from the
-//! same table helpers.
+//! Local and remote file panes.
 
 use super::*;
 
@@ -10,9 +9,6 @@ impl Files {
         executable: bool,
         p: Palette,
     ) -> eframe::egui::Color32 {
-        // Blue, cyan, green — the `ls` convention, and the terminal's own colours,
-        // so the list and `ls` agree. Directories used to be the accent green,
-        // which reads as "executable" to anyone who has used `ls --color`.
         if symlink {
             p.symlink
         } else if directory {
@@ -48,21 +44,12 @@ impl Files {
         menu: &mut Option<MenuAction>,
     ) {
         ui.horizontal(|ui| {
-            // Laid out from the right so the field takes exactly what is left.
-            // Sizing it from the left pushed 刷新 past the pane edge, where the
-            // divider or the window edge cut it off.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let refresh =
                     crate::icons::icon_label_button(ui, crate::icons::Icon::Refresh, "刷新", p);
-                // The two icons come after the field in this right-to-left layout,
-                // so their room has to be held back: otherwise the field takes the
-                // lot and they land at negative x, over the pane to the left.
                 let icons =
                     crate::icons::Size::Button.button().x * 2.0 + ui.spacing().item_spacing.x * 2.0;
                 let room = ui.available_width();
-                // They are shortcuts; the field is not. In a pane too narrow for
-                // both, the shortcuts go, so that nothing is ever pushed outside —
-                // a floor on the field's width would guarantee that it was.
                 let shortcuts = room - icons >= MIN_FIELD_WIDTH;
                 let edit = editing::field_with(ui, &mut self.local_path, |edit| {
                     edit.desired_width(if shortcuts { room - icons } else { room })
@@ -102,8 +89,6 @@ impl Files {
                 }
             });
         });
-        // Holding the Arc rather than borrowing `self`, so the row handlers below
-        // stay free to write `selected_local`.
         let local = self.local.clone();
         let local = local.lock().unwrap();
         if local.loading {
@@ -112,8 +97,6 @@ impl Files {
         if let Some(e) = &local.error {
             ui.colored_label(p.danger, e);
         }
-        // Keep header and rows in one horizontal scroller. The inner vertical
-        // scroller only creates widgets for rows in view.
         let width = ui.available_width().max(MIN_TABLE_WIDTH);
         let height = list_height(ui);
         let visible: Vec<_> = local
@@ -135,11 +118,6 @@ impl Files {
                     .show_rows(ui, ROW_HEIGHT, visible.len(), |ui, range| {
                         for entry in visible[range].iter().copied() {
                             let path = PathBuf::from(&self.local_path).join(&entry.name);
-                            // A set executable bit (any of the three) is what `ls`
-                            // highlights, and what makes the icon a script rather than a
-                            // document. A symlink's own mode says nothing about its
-                            // target, so links never count as executable here; Windows
-                            // reports no mode at all.
                             let executable =
                                 !entry.symlink && entry.perms.is_some_and(|m| m & 0o111 != 0);
                             let mut cells = vec![
@@ -161,7 +139,6 @@ impl Files {
                                     link: entry.symlink,
                                 },
                                 Cell {
-                                    // A directory has no meaningful size of its own.
                                     text: if entry.directory {
                                         String::new()
                                     } else {
@@ -187,17 +164,12 @@ impl Files {
                                 text: entry.mtime.map_or_else(String::new, format_time),
                                 right: true,
                                 color: p.muted,
-                                // The column shows a shortened form; hovering recovers
-                                // the exact timestamp.
                                 full: entry.mtime.map(format_time_full),
                                 icon: None,
                                 link: false,
                             });
                             let selected = self.selected_local.as_ref() == Some(&path);
                             let (r, _) = table_row(ui, &cells, &LOCAL_COLUMNS, selected, width);
-                            // A right-click selects the row first, the way a file manager
-                            // does, so the menu always acts on the row under the cursor
-                            // rather than on whatever happened to be selected.
                             if r.secondary_clicked() {
                                 self.selected_local = Some(path.clone());
                             }
@@ -208,8 +180,6 @@ impl Files {
                                 if entry.directory {
                                     *next = Some(path.display().to_string());
                                 } else {
-                                    // A file opens in whatever the OS associates with it,
-                                    // the same as the menu's 打开.
                                     *menu = Some(MenuAction::OpenLocal(path.clone()));
                                 }
                             }
@@ -270,8 +240,6 @@ impl Files {
         next: &mut Option<String>,
         menu: &mut Option<MenuAction>,
     ) {
-        // Snapshot under the lock, then release it before the row handlers below
-        // start mutating other `self` fields.
         let (path, loading, error, entries) = {
             let state = self.directory.lock().unwrap();
             (
@@ -281,19 +249,13 @@ impl Files {
                 state.entries.clone(),
             )
         };
-        // The first listing resolves `.` to the server's home directory, which is
-        // what the home button jumps back to.
         if self.remote_home.is_none() && !loading && !path.is_empty() {
             self.remote_home = Some(path.clone());
         }
         ui.horizontal(|ui| {
-            // Right to left, same as the local pane: the field takes what is left
-            // and the buttons cannot be pushed out of the pane.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let refresh =
                     crate::icons::icon_label_button(ui, crate::icons::Icon::Refresh, "刷新", p);
-                // Same reservation as the local pane: the icons follow the field,
-                // and they are dropped rather than the field overflowing.
                 let icons =
                     crate::icons::Size::Button.button().x * 2.0 + ui.spacing().item_spacing.x * 2.0;
                 let room = ui.available_width();
@@ -327,8 +289,6 @@ impl Files {
                         *next = Some(parent_path(&path));
                     }
                 }
-                // Show the path the server actually resolved, but never overwrite
-                // what the user is in the middle of typing.
                 if !loading && !path.is_empty() && !edit.has_focus() {
                     self.remote_path.clone_from(&path);
                 }
@@ -438,8 +398,6 @@ impl Files {
                                 if entry.directory {
                                     *next = Some(join_path(&path, &entry.name));
                                 } else {
-                                    // A remote file is fetched to the scratch directory and
-                                    // then opened, exactly as the menu's 打开 does.
                                     *menu = Some(MenuAction::OpenRemote(RemoteTarget {
                                         entry: entry.clone(),
                                         path: join_path(&path, &entry.name),
@@ -451,8 +409,6 @@ impl Files {
                                     entry: entry.clone(),
                                     path: join_path(&path, &entry.name),
                                 };
-                                // Everything but the metadata actions needs a regular file:
-                                // a directory is entered by double-clicking, not opened.
                                 let file = !entry.directory;
                                 context_menu(
                                     ui,

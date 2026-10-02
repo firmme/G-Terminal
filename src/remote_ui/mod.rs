@@ -537,11 +537,7 @@ impl Files {
                 let mut menu = None;
                 let available = ui.available_width();
                 let area = ui.available_rect_before_wrap();
-                // The panes take whatever the footer left last frame — measured,
-                // not guessed. Without this the content would be taller than the
-                // window, and egui's `Resize` refuses to shrink a window below its
-                // content (`resize.rs`: `desired_size.max(last_content_size)`), so
-                // dragging the window shorter would spring straight back.
+                // Reserve the measured footer height so the window can shrink.
                 let panes = egui::Rect::from_min_max(
                     area.min,
                     egui::pos2(
@@ -549,8 +545,6 @@ impl Files {
                         (area.bottom() - self.footer_height).max(area.top() + 80.0),
                     ),
                 );
-                // Side by side needs room for two readable columns; a narrow
-                // window stacks them instead so it stays usable when shrunk.
                 let stacked = available < 520.0;
                 let pane = egui::Layout::top_down(egui::Align::LEFT);
                 let (local_rect, remote_rect, divider) = if stacked {
@@ -567,10 +561,6 @@ impl Files {
                 } else {
                     let left =
                         panes.left() + (available * self.split_ratio.clamp(0.25, 0.75)).round();
-                    // A gap rather than a hairline butt-joint: with nothing drawn
-                    // between them the two tables read as one continuous band of
-                    // text, and the remote names look like they are sitting on the
-                    // local timestamps.
                     const GAP: f32 = 7.0;
                     (
                         egui::Rect::from_min_max(panes.min, egui::pos2(left - GAP, panes.bottom())),
@@ -602,7 +592,6 @@ impl Files {
                 } else {
                     egui::CursorIcon::ResizeHorizontal
                 });
-                // A visible seam. Painted after the panes so it lands on top.
                 let seam = egui::Stroke::new(1.0_f32, p.line);
                 if stacked {
                     ui.painter()
@@ -625,9 +614,6 @@ impl Files {
                 }
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
-                    // Plain labels rather than painted glyphs: the arrow already
-                    // says which way the file goes, and at this size a drawn icon
-                    // competes with the text instead of helping it.
                     if ui
                         .add(egui::Button::new("上传 →").min_size(egui::vec2(80.0, 0.0)))
                         .clicked()
@@ -774,19 +760,12 @@ impl Files {
                                 transfer_row(ui, first, p, ctx, false);
                                 continue;
                             }
-                            // A directory batch shows its own aggregate, then only
-                            // the file actually moving. Queued and finished files
-                            // are deliberately absent: a long tree would otherwise
-                            // bury the live one.
                             let planned: u64 = members.iter().map(|t| t.planned).sum();
                             let settled: u64 = members
                                 .iter()
                                 .map(|t| {
                                     let s = t.state.lock().unwrap();
-                                    // A settled entry counts its planned bytes,
-                                    // whether it moved them or was skipped, so the
-                                    // bar reads "how much of this batch is done
-                                    // with" and still reaches the end.
+                                    // Count skipped files as settled too.
                                     if s.finished { t.planned } else { s.done }
                                 })
                                 .sum();
@@ -830,20 +809,13 @@ impl Files {
                             }
                         }
                     });
-                // Measured, not guessed. The panes above reserved exactly
-                // `area − footer_height`, so the two together add up to the
-                // window's own content box and `Resize` is free to shrink it.
                 self.footer_height = (ui.min_rect().bottom() - panes.bottom()).max(0.0);
             });
         // Outside the window closure, where `self` is free to move again.
         self.dialogs(ctx, p);
     }
 }
-/// The body of the overwrite conflict dialog.
-///
-/// A header, the file it is about, the sizes, then the choices — laid out like
-/// a dialog rather than a list of sentences, because this one blocks a transfer
-/// until it is answered.
+/// The overwrite conflict dialog.
 pub(crate) fn conflict_body(
     ui: &mut egui::Ui,
     name: &str,
@@ -854,8 +826,6 @@ pub(crate) fn conflict_body(
 ) -> Option<remote::ConflictChoice> {
     let mut answer = None;
     ui.set_width(470.0);
-    // A tinted header band, so the dialog announces itself before anything else
-    // is read — the same size for every line is what made it look like a list.
     egui::Frame::new()
         .fill(p.warn.gamma_multiply(0.18))
         .inner_margin(egui::Margin::symmetric(12, 9))
@@ -881,12 +851,8 @@ pub(crate) fn conflict_body(
         .color(p.muted),
     );
     ui.add_space(14.0);
-    // The 全部 buttons only mean something when the batch holds more than the
-    // file that asked.
     let more = batch_size > 1;
     ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-    // The choices are grouped by what they affect: this file, the whole batch,
-    // then the one that stops everything.
     ui.horizontal(|ui| {
         if ui.button("覆盖").clicked() {
             answer = Some(remote::ConflictChoice::Overwrite);

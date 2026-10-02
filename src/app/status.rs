@@ -1,14 +1,9 @@
-//! The status bar: what the focused session is doing, the traffic meters, the
-//! connecting spinner and the frameless window's resize grip.
+//! Status bar and traffic meters.
 
 use super::*;
 
 impl App {
-    /// Turns the byte counters into rates once a frame, keeps the spinner
-    /// and the settling rates repainting, and lets a toast expire.
     pub(super) fn tick_status(&mut self, ctx: &egui::Context) {
-        // The counters become rates here, once per frame. Both the spinner and
-        // a settling rate need more frames than an idle app would ask for.
         let rates_animating = self.sample_rates();
         let connecting = self.connecting();
         if connecting {
@@ -25,8 +20,6 @@ impl App {
         }
     }
 
-    /// The bottom strip: session state on the left, meters and the resize
-    /// grip on the right.
     pub(super) fn status_bar(
         &mut self,
         ctx: &egui::Context,
@@ -119,9 +112,6 @@ impl App {
                         ui.colored_label(p.accent, text);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // A frameless window has no OS grip, so the corner is
-                        // drawn and made draggable here. macOS resizes through
-                        // its native border instead.
                         if !cfg!(target_os = "macos") {
                             let grip = resize_grip(ui, p);
                             if grip.hovered() || grip.dragged() {
@@ -139,10 +129,6 @@ impl App {
                         if connecting {
                             connecting_spinner(ui, p);
                         }
-                        // Two arrows rather than a number: they are always
-                        // there, so the corner does not jump around, and the
-                        // colour says whether anything is moving. Down is green
-                        // and up is red; the exact figures are on hover.
                         let rates = format!(
                             "下行 {}\n上行 {}",
                             format_bitrate(down_rate),
@@ -167,11 +153,38 @@ impl App {
                             self.search_open = true;
                             self.search_focus = true;
                         }
+                        if icons::icon_button(ui, icons::Icon::Info, p, icons::Size::Row)
+                            .on_hover_text("当前终端快捷键帮助")
+                            .clicked()
+                        {
+                            self.help_open = true;
+                        }
+                        if let Some(link) = self.active_link() {
+                            let (icon, label, next) = if link == SessionStatus::Live {
+                                (icons::Icon::Restart, "断开当前连接", Action::Disconnect)
+                            } else {
+                                (icons::Icon::Refresh, "重新连接当前会话", Action::Restart)
+                            };
+                            if ui
+                                .add_enabled_ui(!connecting, |ui| {
+                                    icons::icon_button(ui, icon, p, icons::Size::Row)
+                                        .on_hover_text(label)
+                                })
+                                .inner
+                                .clicked()
+                            {
+                                *action = Some(next);
+                            }
+                        }
+                        if icons::icon_button(ui, icons::Icon::Settings, p, icons::Size::Row)
+                            .on_hover_text("偏好设置")
+                            .clicked()
+                        {
+                            self.settings_open = true;
+                        }
                         ui.label(hint("UTF-8", p));
                     });
                 });
-                // A terminal-initiated transfer runs behind the terminal, so its
-                // progress has to be visible without the file window.
                 if let Some(state) = self.files.as_ref().and_then(Files::operation_state)
                     && self.files.as_ref().is_some_and(Files::busy)
                 {
@@ -207,11 +220,8 @@ impl App {
     }
 }
 
-/// How long a status-bar message stays on screen.
 pub(super) const TOAST_LIFETIME: std::time::Duration = std::time::Duration::from_millis(2500);
 
-/// Turns a pane's byte counters into a smoothed per-second rate. The counters
-/// are cumulative, so a rate is the difference since the last sample.
 #[derive(Default)]
 pub(super) struct RateMeter {
     pane: Option<u64>,
@@ -222,15 +232,9 @@ pub(super) struct RateMeter {
     pub(super) down_per_sec: f64,
 }
 
-/// Traffic this quiet counts as idle, so the arrows settle back to grey.
 pub(super) const TRAFFIC_IDLE: f64 = 1.0;
 
 impl RateMeter {
-    /// Samples a pane, returning whether the rates are still worth animating.
-    ///
-    /// Every frame samples, rather than waiting for a fixed interval: a short
-    /// burst has to light the arrows on the frames it causes, and those are the
-    /// only frames guaranteed to happen.
     pub(super) fn sample(&mut self, pane: u64, up: u64, down: u64) -> bool {
         let now = std::time::Instant::now();
         if self.pane == Some(pane) {
@@ -241,8 +245,6 @@ impl RateMeter {
                 .max(0.001);
             let up_rate = up.saturating_sub(self.up) as f64 / seconds;
             let down_rate = down.saturating_sub(self.down) as f64 / seconds;
-            // Averaging over the last few samples keeps the arrows from
-            // flickering while still falling back to idle when traffic stops.
             self.up_per_sec = self.up_per_sec * 0.5 + up_rate * 0.5;
             self.down_per_sec = self.down_per_sec * 0.5 + down_rate * 0.5;
         } else {
@@ -265,7 +267,6 @@ impl RateMeter {
     }
 }
 
-/// Bytes per second as an adaptive bit rate, which is how a link is described.
 pub(super) fn format_bitrate(bytes_per_sec: f64) -> String {
     const UNITS: [&str; 4] = ["bps", "Kbps", "Mbps", "Gbps"];
     let mut value = (bytes_per_sec * 8.0).max(0.0);
@@ -281,8 +282,6 @@ pub(super) fn format_bitrate(bytes_per_sec: f64) -> String {
     }
 }
 
-/// Eight small squares in a 3x3 ring, chasing each other round while a
-/// connection is being made.
 pub(super) fn connecting_spinner(ui: &mut egui::Ui, p: Palette) {
     const RING: [(f32, f32); 8] = [
         (0.0, -1.0),
@@ -300,7 +299,6 @@ pub(super) fn connecting_spinner(ui: &mut egui::Ui, p: Palette) {
     let painter = ui.painter();
     for (index, (x, y)) in RING.iter().enumerate() {
         let angle = index as f32 / RING.len() as f32 * tau;
-        // How far behind the head this square is, 0 at the head.
         let behind = (head - angle).rem_euclid(tau) / tau;
         let lit = (1.0 - behind).powi(2);
         painter.rect_filled(
@@ -314,8 +312,6 @@ pub(super) fn connecting_spinner(ui: &mut egui::Ui, p: Palette) {
     }
 }
 
-/// The corner grip a frameless window would otherwise have to answer for with a
-/// few invisible pixels. Three diagonal ticks, brighter under the pointer.
 pub(super) fn resize_grip(ui: &mut egui::Ui, p: Palette) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::drag());
     let color = if response.hovered() || response.dragged() {

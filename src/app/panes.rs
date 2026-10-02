@@ -162,15 +162,6 @@ impl App {
                             egui::UiBuilder::new().id_salt((t.id, index)).max_rect(rect),
                             |ui| {
                                 let pane = &mut t.panes[index];
-                                if pane.session.status.lock().unwrap().exit_code.is_some() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(hint("会话已结束", p));
-                                        if ui.small_button("重连 / 重启").clicked() {
-                                            focus = index;
-                                            *action = Some(Action::Restart);
-                                        }
-                                    });
-                                }
                                 let (clicked, error) = pane.show(
                                     ui,
                                     crate::view::ViewOptions {
