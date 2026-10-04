@@ -146,15 +146,31 @@ impl Terminal {
             self.zmodem_probe.extend_from_slice(bytes);
             return;
         }
-        let mut window = std::mem::take(&mut self.zmodem_probe);
-        window.extend_from_slice(bytes);
-        if window.windows(ZRQINIT.len()).any(|w| w == ZRQINIT) {
+        // Only a header crossing the read boundary needs a combined buffer.
+        // Scan the incoming slice directly instead of copying every PTY read.
+        let mut boundary = [0u8; TAIL * 2];
+        let old_len = self.zmodem_probe.len();
+        let prefix_len = bytes.len().min(TAIL);
+        boundary[..old_len].copy_from_slice(&self.zmodem_probe);
+        boundary[old_len..old_len + prefix_len].copy_from_slice(&bytes[..prefix_len]);
+        let boundary = &boundary[..old_len + prefix_len];
+        let contains = |header: &[u8]| {
+            boundary.windows(header.len()).any(|w| w == header)
+                || bytes.windows(header.len()).any(|w| w == header)
+        };
+        if contains(ZRQINIT) {
             self.zmodem_offer = Some(false);
-        } else if window.windows(ZRINIT.len()).any(|w| w == ZRINIT) {
+        } else if contains(ZRINIT) {
             self.zmodem_offer = Some(true);
         }
-        let keep = window.len().saturating_sub(TAIL);
-        self.zmodem_probe = window[keep..].to_vec();
+        if bytes.len() >= TAIL {
+            self.zmodem_probe.clear();
+            self.zmodem_probe
+                .extend_from_slice(&bytes[bytes.len() - TAIL..]);
+        } else {
+            self.zmodem_probe.extend_from_slice(bytes);
+            self.zmodem_probe.drain(..searched.saturating_sub(TAIL));
+        }
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -176,6 +192,8 @@ impl Terminal {
         self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
         self.parser.screen_mut().set_scrollback(0);
         self.zmodem_offer = None;
+        self.zmodem_probe.clear();
+        self.scanner = crate::graphics::OscScanner::default();
         self.revision = self.revision.wrapping_add(1);
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
     }
@@ -302,6 +320,39 @@ mod tests {
         assert!(hits[0].0 > 3);
         assert_eq!(t.parser.screen().scrollback(), before);
         assert_eq!(t.find_all("jklmnop").len(), 1);
+    }
+
+    #[test]
+    fn reconnect_discards_an_incomplete_protocol_header() {
+        let mut t = Terminal::new(10, 40, 100);
+        t.process(b"**\x18B");
+        t.recycle(10, 40);
+        t.process(b"00");
+        assert_eq!(t.zmodem_offer, None);
+        t.process(b"\x1b]2;unfinished");
+        t.recycle(10, 40);
+        t.process(b"fresh output");
+        assert!(t.parser.screen().contents().contains("fresh output"));
+    }
+
+    #[test]
+    fn zmodem_headers_survive_every_read_boundary() {
+        for (header, upload) in [
+            (b"**\x18B00".as_slice(), false),
+            (b"**\x18B01".as_slice(), true),
+        ] {
+            for split in 0..=header.len() {
+                let mut t = Terminal::new(10, 40, 100);
+                t.process(&header[..split]);
+                t.process(&header[split..]);
+                assert_eq!(t.zmodem_offer, Some(upload), "split={split}");
+            }
+            let mut t = Terminal::new(10, 40, 100);
+            for byte in header {
+                t.process(&[*byte]);
+            }
+            assert_eq!(t.zmodem_offer, Some(upload));
+        }
     }
 
     #[test]
