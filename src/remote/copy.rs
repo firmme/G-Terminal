@@ -225,6 +225,67 @@ pub(super) fn parent_remote(path: &str) -> String {
     }
 }
 
+/// Keep the previous remote file recoverable until the new file is committed.
+pub(super) async fn commit_upload(
+    sftp: &Arc<russh_sftp::client::SftpSession>,
+    partial: &str,
+    target: &str,
+    replacing: bool,
+) -> Result<()> {
+    if !replacing {
+        ensure!(
+            !sftp.try_exists(target).await?,
+            "目标在传输期间已出现，保留临时文件"
+        );
+        sftp.rename(partial, target).await?;
+        return Ok(());
+    }
+    // Never reuse a recovery file from an earlier failed operation.
+    let base = format!("{target}.gterminal.backup");
+    let mut backup = base.clone();
+    let mut index = 0u64;
+    while sftp.try_exists(&backup).await? {
+        index += 1;
+        backup = format!("{base}.{index}");
+    }
+    let had_target = sftp.try_exists(target).await?;
+    if had_target {
+        sftp.rename(target, &backup)
+            .await
+            .context("保存原文件失败，保留断点文件")?;
+    }
+    if let Err(error) = sftp.rename(partial, target).await {
+        if had_target && let Err(restore) = sftp.rename(&backup, target).await {
+            bail!(
+                "提交上传失败：{error}；恢复原文件失败：{restore}；原文件保留在 {backup}，新文件保留在 {partial}"
+            );
+        }
+        return Err(error).context("提交上传失败，原文件已保留，保留断点文件");
+    }
+    if had_target {
+        sftp.remove_file(&backup)
+            .await
+            .context("上传已提交，清理原文件备份失败")?;
+    }
+    Ok(())
+}
+
+pub(super) async fn commit_download(partial: &Path, target: &Path, replacing: bool) -> Result<()> {
+    if replacing {
+        // Both paths are siblings. rename replaces atomically on Windows and
+        // Unix, so a locked target or failed commit leaves the old file intact.
+        tokio::fs::rename(partial, target)
+            .await
+            .context("提交下载失败，保留原文件和断点文件")?;
+    } else {
+        tokio::fs::hard_link(partial, target)
+            .await
+            .context("提交下载失败，保留断点文件（目标必须不存在且文件系统支持硬链接）")?;
+        tokio::fs::remove_file(partial).await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn transfer_file(
     sftp: &Arc<russh_sftp::client::SftpSession>,
     local: &Path,
@@ -333,28 +394,10 @@ pub(super) async fn transfer_file(
     drop(source);
     match direction {
         Direction::Upload => {
-            if decided.replacing {
-                // Some servers refuse to rename onto an existing path, which is
-                // exactly the case here, so clear the target explicitly.
-                let _ = sftp.remove_file(remote).await;
-            } else {
-                ensure!(
-                    !sftp.try_exists(remote).await?,
-                    "目标在传输期间已出现，保留临时文件"
-                );
-            }
-            sftp.rename(partial_remote, remote).await?;
+            commit_upload(sftp, &partial_remote, remote, decided.replacing).await?;
         }
         Direction::Download => {
-            if decided.replacing {
-                // `hard_link` refuses an existing target, so clear the one the user
-                // agreed to replace before committing.
-                let _ = tokio::fs::remove_file(local).await;
-            }
-            tokio::fs::hard_link(&partial_local, local)
-                .await
-                .context("提交下载失败，保留断点文件（目标必须不存在且文件系统支持硬链接）")?;
-            tokio::fs::remove_file(partial_local).await?;
+            commit_download(&partial_local, local, decided.replacing).await?;
         }
     }
     Ok(())

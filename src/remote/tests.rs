@@ -428,6 +428,14 @@ impl russh_sftp::server::Handler for TestSftp {
         old: String,
         new: String,
     ) -> std::result::Result<Status, StatusCode> {
+        // Fault injection for the commit/rollback regression tests.
+        let nodes = self.nodes.lock().unwrap();
+        if (old.ends_with(".gterminal.part") && nodes.contains_key("/.fail-commit"))
+            || (old.contains(".gterminal.backup") && nodes.contains_key("/.fail-restore"))
+        {
+            return Err(StatusCode::Failure);
+        }
+        drop(nodes);
         let mut s = self.store.lock().unwrap();
         if s.contains_key(&new) {
             return Err(StatusCode::Failure);
@@ -436,6 +444,96 @@ impl russh_sftp::server::Handler for TestSftp {
         s.insert(new, data);
         Ok(ok(id))
     }
+}
+
+#[test]
+fn failed_upload_commit_restores_original_or_retains_recovery_copies() {
+    runtime().block_on(async {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for rollback_fails in [false, true] {
+                let store = empty_store();
+                let nodes = empty_nodes();
+                {
+                    let mut files = store.lock().unwrap();
+                    files.insert("/file.txt".into(), b"original".to_vec());
+                    files.insert("/file.txt.gterminal.part".into(), b"incoming".to_vec());
+                    files.insert(
+                        "/file.txt.gterminal.backup".into(),
+                        b"earlier recovery".to_vec(),
+                    );
+                    let mut fault = nodes.lock().unwrap();
+                    fault.insert("/.fail-commit".into(), Node::Dir);
+                    if rollback_fails {
+                        fault.insert("/.fail-restore".into(), Node::Dir);
+                    }
+                }
+                let (connection, dir, server) = connected(
+                    if rollback_fails {
+                        "gterminal-rollback-fails"
+                    } else {
+                        "gterminal-commit-fails"
+                    },
+                    store.clone(),
+                    nodes,
+                )
+                .await;
+                let sftp = connection.sftp("测试").await.unwrap();
+                let error = commit_upload(&sftp, "/file.txt.gterminal.part", "/file.txt", true)
+                    .await
+                    .unwrap_err();
+                let files = store.lock().unwrap();
+                assert_eq!(files["/file.txt.gterminal.part"], b"incoming");
+                assert_eq!(files["/file.txt.gterminal.backup"], b"earlier recovery");
+                if rollback_fails {
+                    assert_eq!(files["/file.txt.gterminal.backup.1"], b"original");
+                    assert!(error.to_string().contains("/file.txt.gterminal.backup.1"));
+                } else {
+                    assert_eq!(files["/file.txt"], b"original");
+                    assert!(!files.contains_key("/file.txt.gterminal.backup.1"));
+                }
+                drop(files);
+                drop(sftp);
+                drop(connection);
+                server.abort();
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
+fn download_commit_preserves_original_on_failure_and_replaces_on_success() {
+    runtime().block_on(async {
+        let dir = auth_fixture("gterminal-download-commit");
+        let target = dir.join("file.txt");
+        let partial = dir.join("file.txt.gterminal.part");
+        std::fs::write(&target, b"original").unwrap();
+        assert!(commit_download(&partial, &target, true).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        std::fs::write(&partial, b"incoming").unwrap();
+        assert!(commit_download(&partial, &target, false).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"incoming");
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let locked = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&target)
+                .unwrap();
+            assert!(commit_download(&partial, &target, true).await.is_err());
+            drop(locked);
+            assert_eq!(std::fs::read(&target).unwrap(), b"original");
+            assert_eq!(std::fs::read(&partial).unwrap(), b"incoming");
+        }
+        commit_download(&partial, &target, true).await.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"incoming");
+        assert!(!partial.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    });
 }
 
 async fn test_server(
