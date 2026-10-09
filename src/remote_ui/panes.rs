@@ -239,6 +239,7 @@ impl Files {
         p: Palette,
         next: &mut Option<String>,
         menu: &mut Option<MenuAction>,
+        focus: editing::InitialFocus,
     ) {
         let (path, loading, error, entries) = {
             let state = self.directory.lock().unwrap();
@@ -263,6 +264,7 @@ impl Files {
                 let edit = editing::field_with(ui, &mut self.remote_path, |edit| {
                     edit.desired_width(if shortcuts { room - icons } else { room })
                 });
+                focus.request(ui, &edit);
                 let home = self.remote_home.clone();
                 if shortcuts {
                     let home_button = crate::icons::icon_button(

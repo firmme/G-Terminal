@@ -2,6 +2,164 @@ use super::*;
 use egui::{Event, Modifiers, RawInput, Rect, Vec2};
 
 #[test]
+fn connection_dialog_keeps_fields_and_footer_visible() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    app.remote_open = true;
+    let input = || RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(1280.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    for _ in 0..12 {
+        let _ = ctx.run(input(), |ctx| app.render(ctx));
+    }
+    let output = ctx.run(input(), |ctx| app.render(ctx));
+    let bounds = egui::AreaState::load(&ctx, egui::Id::new("连接配置"))
+        .unwrap()
+        .rect();
+    assert!(
+        bounds.width() <= 500.0 && bounds.height() <= 600.0,
+        "the connection form should stay compact: {bounds:?}"
+    );
+    for expected in ["主机 / IP", "用户名", "保存并连接", "取消"] {
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == expected && shape.clip_rect.contains(text.pos))
+        }), "{expected} is clipped: {:?}", output.shapes.iter().filter_map(|shape| if let egui::Shape::Text(text) = &shape.shape { Some((text.galley.text(), text.pos, shape.clip_rect)) } else { None }).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn settings_and_confirmation_fit_their_content() {
+    for (title, confirmation, max_width, max_height) in [
+        ("偏好设置", false, 640.0, 600.0),
+        ("确认退出", true, 380.0, 200.0),
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        app.settings_open = !confirmation;
+        app.confirm_exit = confirmation;
+        for _ in 0..12 {
+            frame(
+                &mut app,
+                &ctx,
+                vec![],
+                Modifiers::NONE,
+                Vec2::new(1280.0, 800.0),
+            );
+        }
+        let bounds = egui::AreaState::load(&ctx, egui::Id::new(title))
+            .unwrap()
+            .rect();
+        assert!(
+            bounds.width() <= max_width && bounds.height() <= max_height,
+            "{title} is oversized: {bounds:?}"
+        );
+    }
+}
+
+#[test]
+fn login_opens_on_username_and_allows_tabbing_to_password() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    let size = Vec2::new(1280.0, 800.0);
+    app.execute(
+        Action::QuickConnect(quick_connect::parse("192.0.2.1").unwrap()),
+        &ctx,
+    );
+    for _ in 0..3 {
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+    }
+    let username = ctx.memory(|memory| memory.focused()).unwrap();
+    frame(
+        &mut app,
+        &ctx,
+        vec![Event::Text("alice".into())],
+        Modifiers::NONE,
+        size,
+    );
+    assert!(app.login.as_ref().unwrap().profile.user.ends_with("alice"));
+    frame(
+        &mut app,
+        &ctx,
+        vec![Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+        Modifiers::NONE,
+        size,
+    );
+    let password = ctx.memory(|memory| memory.focused()).unwrap();
+    assert_ne!(username, password);
+    let user = app.login.as_ref().unwrap().profile.user.clone();
+    for _ in 0..3 {
+        frame(
+            &mut app,
+            &ctx,
+            vec![Event::Text("secret".into())],
+            Modifiers::NONE,
+            size,
+        );
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(password));
+        assert_eq!(app.login.as_ref().unwrap().profile.user, user);
+    }
+}
+
+#[test]
+fn connection_forms_choose_required_fields_and_refocus_on_reopen() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    let size = Vec2::new(1280.0, 800.0);
+    app.remote_open = true;
+    app.remote.host.clear();
+    for _ in 0..3 {
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+    }
+    frame(
+        &mut app,
+        &ctx,
+        vec![Event::Text("example.org".into())],
+        Modifiers::NONE,
+        size,
+    );
+    assert_eq!(app.remote.host, "example.org");
+    app.remote_open = false;
+    frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+    app.remote_open = true;
+    for _ in 0..3 {
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+    }
+    frame(
+        &mut app,
+        &ctx,
+        vec![Event::Text("alice".into())],
+        Modifiers::NONE,
+        size,
+    );
+    assert!(app.remote.user.ends_with("alice"));
+    assert_eq!(app.remote.host, "example.org");
+    app.remote_open = false;
+    app.execute(Action::SerialPicker, &ctx);
+    app.serial_picker.as_mut().unwrap().port.clear();
+    for _ in 0..3 {
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+    }
+    frame(
+        &mut app,
+        &ctx,
+        vec![Event::Text("COM42".into())],
+        Modifiers::NONE,
+        size,
+    );
+    assert_eq!(app.serial_picker.as_ref().unwrap().port, "COM42");
+}
+
+#[test]
 fn copied_connection_text_contains_targets_but_no_key_paths() {
     let remote = RemoteProfile {
         name: "生产机".into(),
@@ -67,6 +225,610 @@ fn frame(app: &mut App, ctx: &egui::Context, events: Vec<Event>, modifiers: Modi
             ..Default::default()
         },
         |ctx| app.render(ctx),
+    );
+}
+
+#[test]
+fn hovering_inactive_tabs_keeps_the_strip_geometry_stable() {
+    for light_theme in [false, true] {
+        for tagged in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = App::from_settings(
+                &ctx,
+                Settings {
+                    light_theme,
+                    ..Settings::default()
+                },
+                None,
+                None,
+            );
+            app.execute(
+                Action::New(SessionKind::Local(app.settings.default_shell.clone())),
+                &ctx,
+            );
+            if tagged {
+                app.tabs[0].panes[0].session.kind = SessionKind::Ssh(RemoteProfile {
+                    host: "example.org".into(),
+                    color: "#e7a45e".into(),
+                    ..Default::default()
+                });
+            }
+            let mut render = |events| {
+                let output = ctx.run(
+                    RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(1280.0, 800.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.topbar(ctx, &mut None),
+                );
+                output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        if let egui::epaint::Shape::Rect(rect) = &shape.shape
+                            && rect.corner_radius.nw == 7
+                            && rect.corner_radius.sw == 0
+                        {
+                            Some(rect.rect)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for _ in 0..3 {
+                render(vec![]);
+            }
+            let baseline = render(vec![]);
+            assert_eq!(baseline.len(), 2);
+            let pointer = baseline[0].center();
+            // Hover feedback reads the prior frame's response, so check several frames.
+            for _ in 0..4 {
+                assert_eq!(
+                    render(vec![Event::PointerMoved(pointer)]),
+                    baseline,
+                    "hover moved tabs (light={light_theme}, tagged={tagged})"
+                );
+            }
+            for _ in 0..3 {
+                assert_eq!(render(vec![Event::PointerGone]), baseline);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_single_navigation_click_selects_without_opening_a_connection() {
+    let ctx = egui::Context::default();
+    let profile = RemoteProfile {
+        name: "selection-test".into(),
+        host: "example.org".into(),
+        user: "root".into(),
+        ..Default::default()
+    };
+    let mut app = App::from_settings(
+        &ctx,
+        Settings {
+            profiles: vec![profile],
+            ..Default::default()
+        },
+        None,
+        None,
+    );
+    let mut render = |events| {
+        ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1280.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.sidebar(ctx, &mut None),
+        )
+    };
+    for _ in 0..3 {
+        render(vec![]);
+    }
+    let output = render(vec![]);
+    let pos = output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::epaint::Shape::Text(text) = &shape.shape
+                && text.galley.job.text == "selection-test"
+            {
+                Some(text.pos + text.galley.rect.center().to_vec2())
+            } else {
+                None
+            }
+        })
+        .expect("saved connection row");
+    render(vec![Event::PointerMoved(pos)]);
+    render(vec![press(pos, true)]);
+    render(vec![press(pos, false)]);
+    render(vec![Event::PointerGone]);
+    assert_eq!(
+        app.navigation_selection,
+        Some(egui::Id::new(("navigation-ssh", 0usize)))
+    );
+    assert_eq!(app.tabs.len(), 1);
+    assert!(app.login.is_none());
+}
+
+#[test]
+fn recent_connections_select_on_single_click_and_connect_on_double_click() {
+    fn render(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        time: f64,
+    ) -> (egui::FullOutput, Option<Action>) {
+        let mut action = None;
+        let output = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1280.0, 800.0),
+                )),
+                events,
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| app.sidebar(ctx, &mut action),
+        );
+        (output, action)
+    }
+    let ctx = egui::Context::default();
+    let recent_key = "ssh:root@recent.invalid:22".to_string();
+    let mut app = App::from_settings(
+        &ctx,
+        Settings {
+            profiles: vec![RemoteProfile {
+                name: "recent-double-click".into(),
+                host: "recent.invalid".into(),
+                user: "root".into(),
+                ..Default::default()
+            }],
+            recent_connections: vec![recent_key.clone()],
+            ..Default::default()
+        },
+        None,
+        None,
+    );
+    for i in 0..3 {
+        render(&mut app, &ctx, vec![], i as f64 * 0.1);
+    }
+    let (output, _) = render(&mut app, &ctx, vec![], 0.3);
+    let pos = output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape
+                && text.galley.text() == "recent-double-click"
+            {
+                Some(text.pos + text.galley.rect.center().to_vec2())
+            } else {
+                None
+            }
+        })
+        .expect("recent connection row");
+    render(
+        &mut app,
+        &ctx,
+        vec![Event::PointerMoved(pos), press(pos, true)],
+        0.4,
+    );
+    let (_, action) = render(&mut app, &ctx, vec![press(pos, false)], 0.45);
+    assert!(
+        action.is_none(),
+        "a single click must only select the recent row"
+    );
+    assert_eq!(
+        app.navigation_selection,
+        Some(egui::Id::new(("navigation-recent", &recent_key)))
+    );
+    assert!(app.login.is_none());
+    render(&mut app, &ctx, vec![press(pos, true)], 0.5);
+    let (_, action) = render(&mut app, &ctx, vec![press(pos, false)], 0.55);
+    assert!(
+        matches!(action, Some(Action::New(SessionKind::Ssh(profile)))
+        if profile.host == "recent.invalid" && profile.user == "root")
+    );
+}
+
+#[test]
+fn a_background_reconnect_indicator_reconnects_and_activates_its_tab() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    let kind = app.tabs[0].panes[0].session.kind.clone();
+    app.tabs[0].panes[0].session = Session::disconnected(kind.clone(), app.settings.scrollback);
+    let previous = app.tabs[0].panes[0].session.terminal.clone();
+    app.execute(Action::New(kind), &ctx);
+    assert_eq!(app.active, 1);
+    let other_session = app.tabs[1].panes[0].session.terminal.clone();
+    let mut render = |events| {
+        let mut action = None;
+        let output = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1280.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.topbar(ctx, &mut action),
+        );
+        (output, action)
+    };
+    for _ in 0..3 {
+        render(vec![]);
+    }
+    let (output, _) = render(vec![]);
+    let pos = output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::epaint::Shape::Circle(circle) = &shape.shape
+                && circle.radius == 4.5
+                && circle.fill == Palette::new(false).muted
+            {
+                Some(circle.center)
+            } else {
+                None
+            }
+        })
+        .expect("disconnected status dot");
+    assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+        egui::epaint::Shape::Text(text) if text.galley.job.text == "未连接")));
+    let (hover, _) = render(vec![Event::PointerMoved(pos)]);
+    assert!(!hover.shapes.iter().any(|shape| matches!(&shape.shape,
+        egui::epaint::Shape::Circle(circle) if circle.center == pos && circle.radius == 4.5)));
+    render(vec![press(pos, true)]);
+    let (_, action) = render(vec![press(pos, false)]);
+    assert!(matches!(action, Some(Action::ReconnectTab(0))));
+    app.execute(action.unwrap(), &ctx);
+    assert_eq!(app.active, 0);
+    assert_ne!(app.tabs[0].panes[0].session.link(), SessionStatus::Detached);
+    assert!(Arc::ptr_eq(
+        &previous,
+        &app.tabs[0].panes[0].session.terminal
+    ));
+    assert!(Arc::ptr_eq(
+        &other_session,
+        &app.tabs[1].panes[0].session.terminal
+    ));
+    assert_eq!(app.tabs[1].panes[0].session.link(), SessionStatus::Live);
+}
+
+#[test]
+fn navigation_selection_is_one_clicked_row_and_survives_tab_changes() {
+    fn render(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        time: f64,
+    ) -> egui::FullOutput {
+        ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1280.0, 800.0),
+                )),
+                events,
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| app.sidebar(ctx, &mut None),
+        )
+    }
+    fn selected_rows(output: &egui::FullOutput) -> Vec<Rect> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Rect(rect) = &shape.shape
+                    && rect.fill == Palette::new(false).accent
+                    && rect.rect.width() == 3.0
+                    && (20.0..=28.0).contains(&rect.rect.height())
+                {
+                    Some(rect.rect)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(
+        &ctx,
+        Settings {
+            profiles: vec![
+                RemoteProfile {
+                    name: "other-copy".into(),
+                    user: "root".into(),
+                    host: "same.example".into(),
+                    ..Default::default()
+                },
+                RemoteProfile {
+                    name: "selected-copy".into(),
+                    user: "root".into(),
+                    host: "same.example".into(),
+                    ..Default::default()
+                },
+            ],
+            recent_connections: vec!["ssh:root@same.example:22".into()],
+            ..Default::default()
+        },
+        None,
+        None,
+    );
+    for i in 0..3 {
+        render(&mut app, &ctx, vec![], i as f64 * 0.1);
+    }
+    let output = render(&mut app, &ctx, vec![], 0.3);
+    assert!(
+        selected_rows(&output).is_empty(),
+        "active shell must not select a row"
+    );
+    let pos = output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::epaint::Shape::Text(text) = &shape.shape
+                && text.galley.job.text == "selected-copy"
+            {
+                Some(text.pos + text.galley.rect.center().to_vec2())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    render(
+        &mut app,
+        &ctx,
+        vec![Event::PointerMoved(pos), press(pos, true)],
+        0.4,
+    );
+    render(&mut app, &ctx, vec![press(pos, false)], 0.5);
+    render(&mut app, &ctx, vec![Event::PointerGone], 0.6);
+    let output = render(&mut app, &ctx, vec![], 0.9);
+    assert_eq!(
+        app.navigation_selection,
+        Some(egui::Id::new(("navigation-ssh", 1usize)))
+    );
+    let selected = selected_rows(&output);
+    assert_eq!(
+        selected.len(),
+        1,
+        "same-address rows must not share selection"
+    );
+    assert!(selected[0].y_range().contains(pos.y));
+    app.execute(
+        Action::New(SessionKind::Local(app.settings.default_shell.clone())),
+        &ctx,
+    );
+    let output = render(&mut app, &ctx, vec![], 1.0);
+    assert_eq!(
+        selected_rows(&output),
+        selected,
+        "opening a tab changed mouse selection"
+    );
+    app.execute(Action::ActivateTab(0), &ctx);
+    let output = render(&mut app, &ctx, vec![], 1.1);
+    assert_eq!(
+        selected_rows(&output),
+        selected,
+        "activating a tab changed mouse selection"
+    );
+}
+
+#[test]
+fn the_status_button_enters_and_leaves_fullscreen() {
+    for fullscreen in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        let size = Vec2::new(1280.0, 800.0);
+        let mut render = |events| {
+            let mut raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            };
+            raw.viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .fullscreen = Some(fullscreen);
+            ctx.run(raw, |ctx| app.status_bar(ctx, &mut None, app.palette))
+        };
+        for _ in 0..3 {
+            render(vec![]);
+        }
+        // The rightmost status control has a 20pt hit region inside the 12pt margin.
+        let pos = egui::pos2(size.x - 22.0, size.y - 14.0);
+        render(vec![Event::PointerMoved(pos)]);
+        render(vec![press(pos, true)]);
+        let output = render(vec![press(pos, false)]);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Fullscreen(!fullscreen))
+        );
+    }
+}
+
+#[test]
+fn navigation_search_keeps_focus_and_arrows_choose_a_saved_connection() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(
+        &ctx,
+        Settings {
+            profiles: vec![
+                RemoteProfile {
+                    name: "prod-a".into(),
+                    host: "a.invalid".into(),
+                    ..Default::default()
+                },
+                RemoteProfile {
+                    name: "prod-b".into(),
+                    host: "b.invalid".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        None,
+        None,
+    );
+    let size = Vec2::new(1280.0, 800.0);
+    for _ in 0..3 {
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+    }
+    let id = sidebar::connection_search_id();
+    let pos = ctx.read_response(id).expect("search field").rect.center();
+    frame(
+        &mut app,
+        &ctx,
+        vec![Event::PointerMoved(pos), press(pos, true)],
+        Modifiers::NONE,
+        size,
+    );
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(pos, false)],
+        Modifiers::NONE,
+        size,
+    );
+    frame(
+        &mut app,
+        &ctx,
+        vec![Event::Text("prod".into())],
+        Modifiers::NONE,
+        size,
+    );
+    assert_eq!(app.connection_filter, "prod");
+    assert!(
+        ctx.memory(|memory| memory.has_focus(id)),
+        "terminal stole search focus"
+    );
+    let key = |key| Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    frame(
+        &mut app,
+        &ctx,
+        vec![key(Key::ArrowDown)],
+        Modifiers::NONE,
+        size,
+    );
+    assert_eq!(app.connection_candidate, Some(0));
+    frame(
+        &mut app,
+        &ctx,
+        vec![key(Key::ArrowDown)],
+        Modifiers::NONE,
+        size,
+    );
+    assert_eq!(app.connection_candidate, Some(1));
+    frame(&mut app, &ctx, vec![key(Key::Enter)], Modifiers::NONE, size);
+    assert_eq!(app.login.as_ref().unwrap().profile.host, "b.invalid");
+    assert!(app.connection_filter.is_empty());
+}
+
+#[test]
+fn quick_credentials_never_enter_recent_or_saved_profiles() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    app.connection_filter = "alice:private-secret@example.org:2222".into();
+    let target = quick_connect::parse(&app.connection_filter).unwrap();
+    app.execute(Action::QuickConnect(target), &ctx);
+    assert!(app.connection_filter.is_empty());
+    assert_eq!(
+        app.settings.recent_connections,
+        vec!["ssh:alice@example.org:2222"]
+    );
+    let kind = app.recent_profiles[0].clone();
+    app.execute(Action::SaveConnection(kind.clone()), &ctx);
+    app.execute(Action::SaveConnection(kind), &ctx);
+    assert_eq!(
+        app.settings.profiles.len(),
+        1,
+        "saving twice duplicated a connection"
+    );
+    app.snapshot();
+    assert!(
+        !serde_json::to_string(&app.settings)
+            .unwrap()
+            .contains("private-secret")
+    );
+}
+
+#[test]
+fn a_bare_ip_opens_credentials_without_starting_a_connection() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    app.execute(
+        Action::QuickConnect(quick_connect::parse("192.0.2.1").unwrap()),
+        &ctx,
+    );
+    let mut login = app.login.take().unwrap();
+    let mut open = true;
+    for _ in 0..3 {
+        let _ = ctx.run(Default::default(), |ctx| {
+            login.show(ctx, &mut open, app.palette);
+        });
+    }
+    let output = ctx.run(Default::default(), |ctx| {
+        login.show(ctx, &mut open, app.palette);
+    });
+    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+        egui::epaint::Shape::Text(text) if text.galley.job.text == "密码")));
+    assert_eq!(app.settings.recent_connections, vec!["ssh:@192.0.2.1:22"]);
+}
+
+#[test]
+fn activating_an_inactive_ssh_tab_does_not_reconnect_it() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    let remote = SessionKind::Ssh(RemoteProfile {
+        host: "example.org".into(),
+        ..Default::default()
+    });
+    app.tabs[0].panes[0].session = Session::disconnected(remote, app.settings.scrollback);
+    app.execute(
+        Action::New(SessionKind::Local(app.settings.default_shell.clone())),
+        &ctx,
+    );
+    app.execute(Action::ActivateTab(0), &ctx);
+    assert_eq!(app.active, 0);
+    assert!(app.login.is_none());
+    assert_eq!(app.tabs[0].panes[0].session.link(), SessionStatus::Detached);
+}
+
+#[test]
+fn menu_exit_uses_the_existing_live_session_confirmation() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    app.execute(Action::Exit, &ctx);
+    assert!(app.confirm_exit);
+    assert!(!app.exit_confirmed);
+    app.settings.confirm_on_exit = false;
+    let output = ctx.run(RawInput::default(), |ctx| app.execute(Action::Exit, ctx));
+    assert!(
+        output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Close)
     );
 }
 
@@ -176,6 +938,11 @@ fn workspace_routes_keyboard_splits_and_dialogs_without_leaking_commands() {
         Modifiers::NONE,
         Vec2::new(760.0, 480.0),
     );
+    // The chooser owns the keyboard until it closes; keep the new session
+    // before exercising terminal input.
+    assert!(app.split_chooser.is_some());
+    app.split_chooser = None;
+    frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
     let start = std::time::Instant::now();
     while !app.tabs[1].panes[1]
         .session

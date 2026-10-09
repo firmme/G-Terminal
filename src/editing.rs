@@ -5,6 +5,53 @@
 
 use eframe::egui;
 
+#[derive(Clone, Copy, Default)]
+struct FocusState {
+    open: bool,
+    pending: bool,
+}
+
+/// Retains an opening focus request across egui's invisible sizing pass.
+#[derive(Clone, Copy)]
+pub(crate) struct InitialFocus(egui::Id);
+
+pub(crate) fn window_focus(
+    ctx: &egui::Context,
+    name: impl std::hash::Hash,
+    open: bool,
+) -> InitialFocus {
+    let id = egui::Id::new(("initial-window-focus", name));
+    ctx.data_mut(|data| {
+        let mut state = data.get_temp::<FocusState>(id).unwrap_or_default();
+        if open && !state.open {
+            state.pending = true;
+        }
+        if !open {
+            state.pending = false;
+        }
+        state.open = open;
+        data.insert_temp(id, state);
+    });
+    InitialFocus(id)
+}
+
+impl InitialFocus {
+    pub(crate) fn request(self, ui: &egui::Ui, response: &egui::Response) {
+        let mut state = ui
+            .ctx()
+            .data(|data| data.get_temp::<FocusState>(self.0).unwrap_or_default());
+        focus_once(ui, response, &mut state.pending);
+        ui.ctx().data_mut(|data| data.insert_temp(self.0, state));
+    }
+}
+
+pub(crate) fn focus_once(ui: &egui::Ui, response: &egui::Response, pending: &mut bool) {
+    if *pending && ui.is_visible() && response.enabled() {
+        response.request_focus();
+        *pending = false;
+    }
+}
+
 fn ime_key() -> egui::Id {
     egui::Id::new("g-terminal-ime-composing")
 }
@@ -78,7 +125,13 @@ pub(crate) fn field_with(
     text: &mut String,
     customize: impl FnOnce(egui::TextEdit<'_>) -> egui::TextEdit<'_>,
 ) -> egui::Response {
-    let response = ui.add(customize(egui::TextEdit::singleline(text)));
+    let edit = egui::TextEdit::singleline(text);
+    let edit = if ui.spacing().interact_size.y >= 28.0 {
+        edit.margin(egui::Margin::symmetric(8, 5))
+    } else {
+        edit
+    };
+    let response = ui.add(customize(edit));
     context_menu(&response, text);
     response
 }
@@ -90,7 +143,13 @@ pub(crate) fn field_enabled_with(
     text: &mut String,
     customize: impl FnOnce(egui::TextEdit<'_>) -> egui::TextEdit<'_>,
 ) -> egui::Response {
-    let response = ui.add_enabled(enabled, customize(egui::TextEdit::singleline(text)));
+    let edit = egui::TextEdit::singleline(text);
+    let edit = if ui.spacing().interact_size.y >= 28.0 {
+        edit.margin(egui::Margin::symmetric(8, 5))
+    } else {
+        edit
+    };
+    let response = ui.add_enabled(enabled, customize(edit));
     context_menu(&response, text);
     response
 }
@@ -199,6 +258,42 @@ fn byte_index(text: &str, char_index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_focus_survives_sizing_allows_switching_and_resets_on_reopen() {
+        let ctx = egui::Context::default();
+        let mut open = true;
+        let first = egui::Id::new("initial-focus-first");
+        let second = egui::Id::new("initial-focus-second");
+        let mut first_text = String::new();
+        let mut second_text = String::new();
+        let mut render = |open: &mut bool| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let focus = window_focus(ctx, "focus-test", *open);
+                egui::Window::new("Focus test").open(open).show(ctx, |ui| {
+                    let response = ui.add(egui::TextEdit::singleline(&mut first_text).id(first));
+                    focus.request(ui, &response);
+                    ui.add(egui::TextEdit::singleline(&mut second_text).id(second));
+                });
+            });
+        };
+        for _ in 0..3 {
+            render(&mut open);
+        }
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first));
+        ctx.memory_mut(|memory| memory.request_focus(second));
+        for _ in 0..3 {
+            render(&mut open);
+        }
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(second));
+        open = false;
+        render(&mut open);
+        open = true;
+        for _ in 0..3 {
+            render(&mut open);
+        }
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first));
+    }
 
     /// Enter belongs to the candidate list while it is open; the text of the
     /// composition must be left alone.

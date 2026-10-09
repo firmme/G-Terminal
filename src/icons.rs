@@ -8,6 +8,9 @@ use crate::theme::Palette;
 pub enum Icon {
     Terminal,
     Host,
+    Connect,
+    Reconnect,
+    Disconnect,
     FolderUp,
     Home,
     Refresh,
@@ -16,6 +19,7 @@ pub enum Icon {
     Toolbox,
     Help,
     Info,
+    Warning,
     SplitHorizontal,
     SplitVertical,
     ClosePane,
@@ -31,6 +35,8 @@ pub enum Icon {
     Maximize,
     Restore,
     Minimize,
+    Fullscreen,
+    ExitFullscreen,
     Folder,
     FileText,
     FileCode,
@@ -66,12 +72,16 @@ impl Size {
         match self {
             Size::Row => Vec2::new(20.0, 18.0),
             Size::Button => Vec2::new(24.0, 20.0),
-            Size::Title => Vec2::new(32.0, 20.0),
+            Size::Title => Vec2::new(40.0, 30.0),
         }
     }
 }
 
 pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, width: f32) {
+    if matches!(icon, Icon::Reconnect | Icon::Disconnect) {
+        connection_glyph(painter, rect, icon, color, width);
+        return;
+    }
     let stroke = Stroke::new(width, color);
     let c = rect.center();
     let r = rect.width().min(rect.height()) * 0.5;
@@ -100,6 +110,7 @@ pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, wid
         }
     };
     match icon {
+        Icon::Reconnect | Icon::Disconnect => unreachable!(),
         Icon::Terminal => {
             boxed(-1.0, -0.85, 1.0, 0.85);
             seg((-0.55, -0.25), (-0.1, 0.05));
@@ -136,10 +147,17 @@ pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, wid
             boxed(-0.2, 0.18, 0.2, 0.85);
         }
         Icon::Refresh => {
-            ring(0.8, -2.4, 1.9);
-            let tip = p(0.8 * 1.9f32.cos(), 0.8 * 1.9f32.sin());
-            painter.line_segment([tip, tip + Vec2::new(-0.34 * r, -0.24 * r)], stroke);
-            painter.line_segment([tip, tip + Vec2::new(0.06 * r, -0.42 * r)], stroke);
+            ring(0.78, -std::f32::consts::FRAC_PI_2, std::f32::consts::PI);
+            seg((-0.78, 0.0), (-1.05, 0.32));
+            seg((-0.78, 0.0), (-0.44, 0.28));
+        }
+        Icon::Connect => {
+            boxed(-0.95, -0.85, 0.95, 0.30);
+            seg((0.0, 0.30), (0.0, 0.72));
+            seg((-0.40, 0.82), (0.40, 0.82));
+            seg((-0.65, -0.28), (0.55, -0.28));
+            seg((0.55, -0.28), (0.15, -0.60));
+            seg((0.55, -0.28), (0.15, 0.04));
         }
         Icon::Group => {
             boxed(-1.0, -0.75, 0.45, 0.75);
@@ -176,6 +194,16 @@ pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, wid
             seg((0.38, -0.34), (0.3, -0.08));
             seg((0.3, -0.08), (0.0, 0.16));
             painter.circle_filled(p(0.0, 0.48), (width * 0.9).max(1.0), color);
+        }
+        Icon::Warning => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![p(0.0, -1.0), p(1.0, 0.85), p(-1.0, 0.85)],
+                color,
+                Stroke::NONE,
+            ));
+            let ink = Color32::from_rgb(18, 29, 40);
+            painter.line_segment([p(0.0, -0.4), p(0.0, 0.22)], Stroke::new(width * 1.35, ink));
+            painter.circle_filled(p(0.0, 0.52), width, ink);
         }
         Icon::Info => {
             painter.circle_stroke(c, r * 0.88, stroke);
@@ -228,6 +256,17 @@ pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, wid
             seg((-0.05, -0.35), (1.0, -0.35));
             seg((1.0, -0.35), (1.0, 0.7));
             seg((-1.0, 0.7), (1.0, 0.7));
+        }
+        Icon::Fullscreen | Icon::ExitFullscreen => {
+            for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let (corner, end) = if icon == Icon::Fullscreen {
+                    (0.85, 0.35)
+                } else {
+                    (0.35, 0.85)
+                };
+                seg((x * corner, y * end), (x * corner, y * corner));
+                seg((x * corner, y * corner), (x * end, y * corner));
+            }
         }
         Icon::File
         | Icon::FileText
@@ -297,6 +336,70 @@ pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, wid
             seg((-0.5, -0.5), (-0.5, 0.05));
             boxed(-0.05, -0.05, 0.5, 0.5);
         }
+    }
+}
+
+/// Native, rounded chain strokes with padding for the small status/tab buttons.
+fn connection_glyph(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, width: f32) {
+    let extent = rect.width().min(rect.height());
+    let stroke = Stroke::new(
+        (width * 1.25).min(extent * 0.12),
+        if icon == Icon::Disconnect {
+            Color32::from_rgb(252, 49, 49)
+        } else {
+            color
+        },
+    );
+    let radius = (extent * 0.5 - stroke.width).max(0.0);
+    let point = |x, y| rect.center() + Vec2::new(x, y) * radius;
+    let arc = |points: &mut Vec<Pos2>, x: f32, y: f32, r: f32, start: f32| {
+        for step in 0..=16 {
+            let angle = start + std::f32::consts::PI * step as f32 / 16.0;
+            points.push(point(x + r * angle.cos(), y + r * angle.sin()));
+        }
+    };
+    let rounded_path = |points: Vec<Pos2>| {
+        if let (Some(first), Some(last)) = (points.first(), points.last()) {
+            painter.circle_filled(*first, stroke.width * 0.5, stroke.color);
+            painter.circle_filled(*last, stroke.width * 0.5, stroke.color);
+        }
+        painter.add(egui::Shape::line(points, stroke));
+    };
+    let half_pi = std::f32::consts::FRAC_PI_2;
+    if icon == Icon::Reconnect {
+        // Offset horizontal links, open at their overlap to keep them legible at 14 px.
+        let mut upper = vec![point(-0.22, 0.20)];
+        arc(&mut upper, -0.48, -0.22, 0.42, half_pi);
+        arc(&mut upper, 0.16, -0.22, 0.42, -half_pi);
+        upper.push(point(0.02, 0.20));
+        rounded_path(upper);
+
+        let mut lower = vec![point(0.22, -0.20)];
+        arc(&mut lower, 0.48, 0.22, 0.42, -half_pi);
+        arc(&mut lower, -0.16, 0.22, 0.42, half_pi);
+        lower.push(point(-0.02, -0.20));
+        rounded_path(lower);
+    } else {
+        // Two separated diagonal links crossed by a single, rounded slash.
+        let rotate = |points: Vec<Pos2>| {
+            points
+                .into_iter()
+                .map(|p| {
+                    let v = p - rect.center();
+                    rect.center()
+                        + Vec2::new(v.x + v.y, v.y - v.x) * std::f32::consts::FRAC_1_SQRT_2
+                })
+                .collect()
+        };
+        let mut left = vec![point(-0.15, 0.27)];
+        arc(&mut left, -0.48, 0.0, 0.27, half_pi);
+        left.push(point(-0.15, -0.27));
+        rounded_path(rotate(left));
+        let mut right = vec![point(0.15, -0.27)];
+        arc(&mut right, 0.48, 0.0, 0.27, -half_pi);
+        right.push(point(0.15, 0.27));
+        rounded_path(rotate(right));
+        rounded_path(vec![point(-0.65, -0.65), point(0.65, 0.65)]);
     }
 }
 
@@ -389,6 +492,68 @@ pub fn icon_row(
     p: Palette,
 ) -> egui::Response {
     icon_row_inner(ui, icon, label, shortcut, p, false)
+}
+
+/// Full-width navigation row; selection follows the clicked list entry.
+pub fn navigation_row(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    selected: bool,
+    p: Palette,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 24.0),
+        Sense::click_and_drag(),
+    );
+    if ui.is_rect_visible(rect) {
+        let selected_fade =
+            ui.ctx()
+                .animate_bool_with_time(response.id.with("selected"), selected, 0.12);
+        let hover_fade =
+            ui.ctx()
+                .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.10);
+        if selected_fade > 0.0 || hover_fade > 0.0 {
+            ui.painter().rect_filled(
+                rect,
+                5,
+                p.panel
+                    .lerp_to_gamma(p.raised, selected_fade.max(hover_fade * 0.55)),
+            );
+        }
+        if selected_fade > 0.0 {
+            ui.painter().rect_filled(
+                Rect::from_min_max(rect.left_top(), Pos2::new(rect.left() + 3.0, rect.bottom())),
+                2,
+                p.accent.gamma_multiply(selected_fade),
+            );
+        }
+        draw(
+            ui.painter(),
+            Rect::from_center_size(
+                Pos2::new(rect.left() + 13.0, rect.center().y),
+                Vec2::splat(15.0),
+            ),
+            icon,
+            if selected { p.text } else { p.muted },
+            1.3,
+        );
+        let mut job = egui::text::LayoutJob::simple(
+            label.to_owned(),
+            egui::FontId::proportional(14.0),
+            p.text,
+            (rect.width() - 34.0).max(0.0),
+        );
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = ui.painter().layout_job(job);
+        ui.painter().with_clip_rect(rect).galley(
+            Pos2::new(rect.left() + 30.0, rect.center().y - galley.size().y * 0.5),
+            galley,
+            p.text,
+        );
+    }
+    response
 }
 
 pub fn icon_row_primary(
@@ -526,10 +691,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connection_icons_use_native_shapes_within_their_buttons() {
+        for icon in [Icon::Reconnect, Icon::Disconnect] {
+            for size in [Vec2::splat(14.0), Size::Row.button(), Size::Button.button()] {
+                let ctx = egui::Context::default();
+                let rect = Rect::from_min_size(Pos2::new(20.0, 20.0), size);
+                let output = ctx.run(egui::RawInput::default(), |ctx| {
+                    let painter =
+                        egui::Painter::new(ctx.clone(), egui::LayerId::debug(), Rect::EVERYTHING);
+                    draw(&painter, rect, icon, Color32::GRAY, Size::Row.stroke());
+                });
+                assert!(!output.shapes.is_empty());
+                for clipped in output.shapes {
+                    assert!(
+                        matches!(clipped.shape, egui::Shape::Path(_) | egui::Shape::Circle(_)),
+                        "{icon:?} must render without an image texture"
+                    );
+                    assert!(
+                        rect.contains_rect(clipped.shape.visual_bounding_rect()),
+                        "{icon:?} draws outside its button at {size:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_icon_paints_something_at_every_size() {
-        const ALL: [Icon; 32] = [
+        const ALL: [Icon; 38] = [
             Icon::Terminal,
             Icon::Host,
+            Icon::Connect,
+            Icon::Reconnect,
+            Icon::Disconnect,
             Icon::FolderUp,
             Icon::Home,
             Icon::Refresh,
@@ -538,6 +732,7 @@ mod tests {
             Icon::Toolbox,
             Icon::Help,
             Icon::Info,
+            Icon::Warning,
             Icon::SplitHorizontal,
             Icon::SplitVertical,
             Icon::ClosePane,
@@ -560,6 +755,8 @@ mod tests {
             Icon::Maximize,
             Icon::Restore,
             Icon::Minimize,
+            Icon::Fullscreen,
+            Icon::ExitFullscreen,
         ];
         for size in [Size::Row, Size::Button, Size::Title] {
             for icon in ALL {

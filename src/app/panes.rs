@@ -2,11 +2,13 @@
 //! asks which session a fresh split should hold.
 
 use super::*;
+use crate::icons::Icon;
 
 impl App {
     /// The little window a fresh split raises while it asks which session to
     /// put there; closing it keeps the auto-spawned one.
     pub(super) fn split_chooser(&mut self, ctx: &egui::Context, p: Palette) {
+        let focus = editing::window_focus(ctx, "split-chooser", self.split_chooser.is_some());
         if let Some((tab_id, pane_id)) = self.split_chooser {
             let exists = self
                 .tabs
@@ -18,18 +20,20 @@ impl App {
                 let mut open = true;
                 let mut chosen: Option<SessionKind> = None;
                 let mut keep = false;
-                egui::Window::new("选择新窗格会话")
+                crate::dialog::Dialog::new("选择新窗格会话", Icon::SplitHorizontal, p)
                     .open(&mut open)
                     .collapsible(false)
                     .resizable(false)
-                    .default_width(260.0)
+                    .default_width(360.0)
                     .show(ctx, |ui| {
                         ui.label(hint(
                             "已自动开启一个相同类型的会话，可选择其他会话替换。",
                             p,
                         ));
                         for shell in local_shells() {
-                            if ui.button(format!("本地 {}", shell.label)).clicked() {
+                            let button = ui.button(format!("本地 {}", shell.label));
+                            focus.request(ui, &button);
+                            if button.clicked() {
                                 chosen = Some(SessionKind::Local(shell.value.clone()));
                             }
                         }
@@ -142,16 +146,25 @@ impl App {
                         }
                     });
                 }
-                let keyboard = !self.settings_open
+                let workspace_available = !self.settings_open
                     && !self.remote_open
                     && !self.groups_open
                     && !self.help_open
                     && !self.update_open
-                    && !self.search_open
                     && self.login.is_none()
                     && !self.files_open
+                    && !self.files.as_ref().is_some_and(Files::has_modal_dialog)
                     && self.toolbox.is_none()
+                    && self.serial_picker.is_none()
+                    && self.port_owner.is_none()
+                    && self.split_chooser.is_none()
+                    && !self.confirm_exit
                     && !egui::Popup::is_any_open(ctx);
+                let keyboard = workspace_available
+                    && !self.search_open
+                    && !ctx.memory(|memory| memory.has_focus(sidebar::connection_search_id()))
+                    && !egui::DragAndDrop::has_payload_of_type::<sidebar::ConnectionDrag>(ctx);
+                let console_rect = ui.available_rect_before_wrap();
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     let mut rects = vec![];
                     let rect = ui.available_rect_before_wrap();
@@ -198,6 +211,9 @@ impl App {
                             )));
                         }
                     });
+                }
+                if workspace_available {
+                    sidebar::console_drop_target(ui, console_rect, action, p);
                 }
             });
         notice

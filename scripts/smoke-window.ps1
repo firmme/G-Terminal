@@ -19,13 +19,16 @@ public static class GTerminalWindowSmoke {
             if (owner == pid) {
                 var title = new System.Text.StringBuilder(256);
                 GetWindowText(hwnd, title, title.Capacity);
-                if (title.ToString() == "G-Terminal") { found = hwnd; return false; }
+                // Initialization creates a hidden HWND before showing it.
+                // Acting on it early races the app's initial ShowWindow.
+                if (title.ToString() == "G-Terminal" && IsWindowVisible(hwnd)) { found = hwnd; return false; }
             }
             return true;
         }, IntPtr.Zero);
         return found;
     }
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int mode);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int w, int h, uint flags);
 }

@@ -49,30 +49,36 @@ pub(super) fn connection_color(
 /// changed; `selected` is the stored `#rrggbb`, empty for none.
 pub(super) fn color_picker(ui: &mut egui::Ui, selected: &mut String, p: Palette) -> bool {
     let mut changed = false;
+    let extent = if ui.spacing().interact_size.y >= 28.0 {
+        18.0
+    } else {
+        16.0
+    };
+    let radius = extent / 2.0 - 2.0;
     for hex in std::iter::once("").chain(TAG_COLORS.iter().copied()) {
         let (rect, response) =
-            ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::click());
+            ui.allocate_exact_size(egui::Vec2::splat(extent), egui::Sense::click());
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
             let centre = rect.center();
             match parse_tag_color(hex) {
                 Some(color) => {
-                    painter.circle_filled(centre, 6.0, color);
+                    painter.circle_filled(centre, radius, color);
                 }
                 None => {
                     let stroke = egui::Stroke::new(1.0_f32, p.muted);
-                    painter.circle_stroke(centre, 6.0, stroke);
+                    painter.circle_stroke(centre, radius, stroke);
                     painter.line_segment(
                         [
-                            centre + egui::vec2(-4.0, 4.0),
-                            centre + egui::vec2(4.0, -4.0),
+                            centre + egui::vec2(-radius * 0.7, radius * 0.7),
+                            centre + egui::vec2(radius * 0.7, -radius * 0.7),
                         ],
                         stroke,
                     );
                 }
             }
             if *selected == hex {
-                painter.circle_stroke(centre, 8.0, egui::Stroke::new(1.5_f32, p.text));
+                painter.circle_stroke(centre, radius + 2.0, egui::Stroke::new(1.5_f32, p.text));
             }
         }
         if response

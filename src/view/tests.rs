@@ -84,6 +84,58 @@ fn true_options() -> ViewOptions<'static> {
         search_engine: "google",
     }
 }
+
+#[test]
+fn terminal_caret_and_ime_follow_input_focus() {
+    let ctx = egui::Context::default();
+    let session = Session::disconnected(g_terminal::session::SessionKind::Local("cmd".into()), 100);
+    let mut pane = Pane::new(901, session);
+    for (active, keyboard_enabled, window_focused) in [
+        (true, true, true),
+        (true, false, true),
+        (false, true, true),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let owns_input = active && keyboard_enabled && window_focused;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 300.0))),
+                time: Some(0.1), // Sample the visible half of the caret blink.
+                focused: window_focused,
+                events: if owns_input {
+                    vec![Event::Ime(ImeEvent::Preedit("终端预编辑".into()))]
+                } else {
+                    vec![Event::Text("dialog input".into())]
+                },
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut options = true_options();
+                    options.active = active;
+                    options.keyboard_enabled = keyboard_enabled;
+                    let (_, error) = pane.show(ui, options);
+                    assert!(
+                        error.is_none(),
+                        "input leaked into the disconnected terminal: {error:?}"
+                    );
+                });
+            },
+        );
+        let caret = output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Rect(rect)
+                if rect.fill == Palette::new(false).accent && rect.rect.width() == 2.0)
+        });
+        assert_eq!(caret, owns_input, "caret disagrees with input ownership");
+        assert_eq!(output.platform_output.ime.is_some(), owns_input);
+        let preedit = output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "终端预编辑")
+        });
+        assert_eq!(preedit, owns_input);
+        assert_eq!(pane.composing, owns_input);
+    }
+}
 #[test]
 fn selection_copies_wide_cells_once_and_preserves_wrapping() {
     let mut p = vt100::Parser::new(3, 6, 0);

@@ -12,6 +12,7 @@ pub(super) struct PortOwnerWindow {
     /// so it can offer to reconnect once the port is free. A window opened from
     /// the menu has no failed connect to retry.
     retry: bool,
+    focus_port: bool,
     state: Arc<Mutex<OwnerState>>,
 }
 
@@ -182,6 +183,7 @@ impl PortOwnerWindow {
         let window = Self {
             port,
             retry,
+            focus_port: true,
             state: Arc::new(Mutex::new(OwnerState {
                 phase: Phase::Scanning,
                 note: None,
@@ -347,17 +349,18 @@ impl PortOwnerWindow {
             Err(_) => (Phase::Scanning, None, true, Vec::new()),
         };
 
-        egui::Window::new("串口占用排查")
+        crate::dialog::Dialog::new("串口占用排查", crate::icons::Icon::Search, p)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(400.0)
+            .default_width(440.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("端口");
-                    editing::field_with(ui, &mut self.port, |edit| {
+                    let port = editing::field_with(ui, &mut self.port, |edit| {
                         edit.desired_width(170.0).hint_text("端口或 auto")
                     });
+                    editing::focus_once(ui, &port, &mut self.focus_port);
                     if ui.button("查找").clicked() {
                         rescan = true;
                     }
@@ -529,6 +532,7 @@ impl PortOwnerWindow {
         Self {
             port: port.into(),
             retry: true,
+            focus_port: true,
             state: Arc::new(Mutex::new(OwnerState {
                 phase,
                 note: Some("已结束进程（PID 4242）".into()),

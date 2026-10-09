@@ -102,6 +102,7 @@ pub struct Toolbox {
     timezone: String,
     ipv6: bool,
     tools: Vec<(Tool, bool)>,
+    focus_first: bool,
 }
 
 impl Toolbox {
@@ -115,6 +116,7 @@ impl Toolbox {
             timezone: DEFAULT_TIMEZONE.into(),
             ipv6: false,
             tools: Tool::ALL.iter().map(|tool| (*tool, false)).collect(),
+            focus_first: true,
             // Nothing ticked yet, so nothing to preview.
         }
     }
@@ -187,10 +189,10 @@ impl Toolbox {
         let mut run = false;
         let mut cancel = false;
         let mut copy = false;
-        egui::Window::new("服务器工具箱")
+        crate::dialog::Dialog::new("服务器工具箱", crate::icons::Icon::Toolbox, p)
             .open(open)
             .collapsible(false)
-            .default_width(540.0)
+            .default_width(480.0)
             .show(ctx, |ui| {
                 ui.label(RichText::new(format!("目标：{target}")).color(p.accent));
                 ui.label(hint("仅执行已勾选的项目，使用当前登录用户权限。", p));
@@ -198,7 +200,8 @@ impl Toolbox {
                 egui::CollapsingHeader::new("初始化服务器")
                     .default_open(true)
                     .show(ui, |ui| {
-                        ui.checkbox(&mut self.aliases, "配置常用命令别名");
+                        let aliases = ui.checkbox(&mut self.aliases, "配置常用命令别名");
+                        editing::focus_once(ui, &aliases, &mut self.focus_first);
                         ui.horizontal(|ui| {
                             let has_key = self.key.is_some();
                             ui.add_enabled_ui(has_key, |ui| {
@@ -246,19 +249,19 @@ impl Toolbox {
                         });
                     });
                 ui.label(hint("可复制命令预览进行复核。", p));
-                ui.horizontal(|ui| {
+                crate::dialog::footer(ui, |ui| {
                     let ready =
                         self.anything_selected() && !(self.timezone_on && !self.timezone_ok());
+                    if crate::dialog::secondary(ui, "取消").clicked() {
+                        cancel = true;
+                    }
                     ui.add_enabled_ui(ready, |ui| {
-                        if ui.button("执行").clicked() {
+                        if crate::dialog::primary(ui, "执行", p).clicked() {
                             run = true;
                         }
                     });
-                    if ui.button("复制命令").clicked() {
+                    if crate::dialog::secondary(ui, "复制命令").clicked() {
                         copy = true;
-                    }
-                    if ui.button("取消").clicked() {
-                        cancel = true;
                     }
                 });
             });
@@ -443,6 +446,7 @@ mod tests {
 
     fn toolbox() -> Toolbox {
         Toolbox {
+            focus_first: true,
             aliases: false,
             key_login: false,
             key: Some("ssh-ed25519 AAAA test@host".into()),

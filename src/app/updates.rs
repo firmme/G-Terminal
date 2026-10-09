@@ -1,6 +1,7 @@
 //! The updater UI: the window that reports a check, download and restart.
 
 use super::*;
+use crate::icons::Icon;
 
 impl App {
     /// Kicks off a background check and leaves the result in `update_status`.
@@ -53,11 +54,11 @@ impl App {
         let mut open = true;
         let mut retry = false;
         let mut start = None;
-        egui::Window::new("检查更新")
+        crate::dialog::Dialog::new("检查更新", Icon::Refresh, p)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(440.0)
+            .default_width(400.0)
             .show(ctx, |ui| match &status {
                 update::Status::Checking => {
                     ui.horizontal(|ui| {
@@ -70,7 +71,7 @@ impl App {
                 }
                 update::Status::Failed(error) => {
                     ui.colored_label(p.danger, error);
-                    if ui.button("重试").clicked() {
+                    if crate::dialog::primary(ui, "重试", p).clicked() {
                         retry = true;
                     }
                 }
@@ -89,15 +90,15 @@ impl App {
                             });
                     }
                     ui.separator();
-                    ui.horizontal(|ui| {
+                    crate::dialog::footer(ui, |ui| {
                         if release.asset.is_some() {
-                            if ui.button("下载并更新").clicked() {
+                            if crate::dialog::primary(ui, "下载并更新", p).clicked() {
                                 start = Some(release.clone());
                             }
                         } else {
                             ui.label(hint("当前平台没有预编译包，请打开发布页手动下载。", p));
                         }
-                        if ui.button("打开发布页").clicked() {
+                        if crate::dialog::secondary(ui, "打开发布页").clicked() {
                             let _ = crate::remote_ui::open_url(&release.url);
                         }
                     });

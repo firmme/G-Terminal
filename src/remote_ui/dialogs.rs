@@ -4,15 +4,17 @@
 use super::*;
 
 /// A checkbox for one permission bit.
-pub(super) fn bit_box(ui: &mut egui::Ui, mode: &mut u32, label: &str, mask: u32) {
+pub(super) fn bit_box(ui: &mut egui::Ui, mode: &mut u32, label: &str, mask: u32) -> egui::Response {
     let mut on = *mode & mask != 0;
-    if ui.checkbox(&mut on, label).changed() {
+    let response = ui.checkbox(&mut on, label);
+    if response.changed() {
         if on {
             *mode |= mask;
         } else {
             *mode &= !mask;
         }
     }
+    response
 }
 
 /// The permission editor, drawn inside the 属性 window.
@@ -24,6 +26,7 @@ pub(super) fn permission_editor(
     ui: &mut egui::Ui,
     edit: &mut PermissionEdit,
     p: Palette,
+    focus: editing::InitialFocus,
 ) -> (bool, bool) {
     let mut apply = false;
     let mut count = false;
@@ -50,7 +53,8 @@ pub(super) fn permission_editor(
                 for (bit, mask) in [("读", read), ("写", write), ("执行", execute)] {
                     // Scoped, so three boxes labelled 读 in one grid stay distinct.
                     ui.push_id((row, bit), |ui| {
-                        bit_box(ui, &mut edit.mode, bit, mask);
+                        let response = bit_box(ui, &mut edit.mode, bit, mask);
+                        focus.request(ui, &response);
                     });
                 }
                 ui.end_row();
@@ -120,14 +124,17 @@ impl Files {
     /// Draws the overwrite / rename / resume prompt for an incoming file.
     pub fn show_question(&mut self, ctx: &egui::Context, p: Palette) {
         self.poll_question();
+        let focus = editing::window_focus(ctx, "zmodem-conflict", self.question.is_some());
         let Some(question) = self.question.clone() else {
             return;
         };
         let mut answer = None;
-        egui::Window::new("ZMODEM 文件冲突")
+        let mut open = true;
+        crate::dialog::Dialog::new("ZMODEM 文件冲突", crate::icons::Icon::Warning, p)
+            .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(400.0)
+            .default_width(360.0)
             // A prompt the transfer is waiting on must never end up behind the
             // file window, which is an ordinary window and can be raised.
             .order(egui::Order::Foreground)
@@ -162,7 +169,9 @@ impl Files {
                     {
                         answer = Some(ztransfer::Decision::Overwrite);
                     }
-                    editing::field_with(ui, &mut self.rename, |edit| edit.desired_width(150.0));
+                    let rename =
+                        editing::field_with(ui, &mut self.rename, |edit| edit.desired_width(150.0));
+                    focus.request(ui, &rename);
                     if ui.button("重命名").clicked() {
                         answer = Some(ztransfer::Decision::Rename(self.rename.clone()));
                     }
@@ -171,6 +180,9 @@ impl Files {
                     }
                 });
             });
+        if !open {
+            answer = Some(ztransfer::Decision::Cancel);
+        }
         if let Some(answer) = answer
             && let Some(answers) = &self.answers
         {
@@ -417,6 +429,11 @@ impl Files {
 
     /// The 属性 / 确认删除 / 重命名 / 覆盖冲突 windows.
     pub(super) fn dialogs(&mut self, ctx: &egui::Context, p: Palette) {
+        let rename_focus = editing::window_focus(ctx, "file-rename", self.renaming.is_some());
+        let delete_focus =
+            editing::window_focus(ctx, "file-delete-confirm", self.confirm.is_some());
+        let properties_focus =
+            editing::window_focus(ctx, "file-properties", self.properties.is_some());
         self.show_conflict(ctx, p);
         // Taken out of `self` rather than cloned, so the permission editor can
         // write back what the user typed, and put back unless the window closed.
@@ -424,10 +441,10 @@ impl Files {
             let mut open = true;
             let mut apply = false;
             let mut count = false;
-            egui::Window::new("属性")
+            crate::dialog::Dialog::new("属性", crate::icons::Icon::Info, p)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(460.0)
+                .default_width(420.0)
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
@@ -439,7 +456,7 @@ impl Files {
                         // Cap the value column: without it the grid sizes to the
                         // longest value, so a deep path makes the window as wide as
                         // the path is long.
-                        .max_col_width(320.0)
+                        .max_col_width(280.0)
                         .show(ui, |ui| {
                             for (label, value) in [
                                 ("名称", properties.name.clone()),
@@ -462,7 +479,8 @@ impl Files {
                         });
                     if let Some(edit) = &mut properties.editable {
                         ui.separator();
-                        let (asked_apply, asked_count) = permission_editor(ui, edit, p);
+                        let (asked_apply, asked_count) =
+                            permission_editor(ui, edit, p, properties_focus);
                         apply |= asked_apply;
                         count |= asked_count;
                     } else if let Some(perms) = &properties.perms {
@@ -484,25 +502,34 @@ impl Files {
 
         if let Some(rename) = &mut self.renaming {
             let mut open = true;
+            let mut window_open = true;
             let mut submit = false;
-            egui::Window::new("重命名")
+            crate::dialog::Dialog::new("重命名", crate::icons::Icon::FileText, p)
+                .open(&mut window_open)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(360.0)
+                .default_width(320.0)
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
+                    let width = (ui.available_width() - 16.0).max(100.0);
                     let edit =
-                        editing::field_with(ui, &mut rename.name, |edit| edit.desired_width(320.0));
-                    edit.request_focus();
+                        editing::field_with(ui, &mut rename.name, |edit| edit.desired_width(width));
+                    rename_focus.request(ui, &edit);
                     let valid = !rename.name.is_empty()
                         && !rename.name.contains(['/', '\\'])
                         && rename.name != "..";
                     if !valid {
                         ui.colored_label(p.danger, "名称不能为空，也不能包含斜杠或 ..");
                     }
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(valid, egui::Button::new("确定")).clicked()
+                    crate::dialog::footer(ui, |ui| {
+                        if crate::dialog::secondary(ui, "取消").clicked() {
+                            open = false;
+                        }
+                        if ui
+                            .add_enabled_ui(valid, |ui| crate::dialog::primary(ui, "确定", p))
+                            .inner
+                            .clicked()
                             || (valid
                                 && edit.lost_focus()
                                 && !editing::ime_composing(ui.ctx())
@@ -510,11 +537,11 @@ impl Files {
                         {
                             submit = true;
                         }
-                        if ui.button("取消").clicked() {
-                            open = false;
-                        }
                     });
                 });
+            if !window_open {
+                open = false;
+            }
             if submit {
                 let taken = self.renaming.take();
                 if let Some(mut rename) = taken {
@@ -537,24 +564,31 @@ impl Files {
         if let Some(confirm) = &self.confirm {
             let message = confirm.message.clone();
             let mut answer = None;
-            egui::Window::new("确认删除")
+            let mut open = true;
+            crate::dialog::Dialog::new("确认删除", crate::icons::Icon::Warning, p)
+                .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(400.0)
+                .default_width(360.0)
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.add(egui::Label::new(RichText::new(message).color(p.warn)).wrap());
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("删除").clicked() {
+                    crate::dialog::footer(ui, |ui| {
+                        if crate::dialog::primary(ui, "删除", p).clicked() {
                             answer = Some(true);
                         }
-                        if ui.button("取消").clicked() {
+                        let cancel = crate::dialog::secondary(ui, "取消");
+                        delete_focus.request(ui, &cancel);
+                        if cancel.clicked() {
                             answer = Some(false);
                         }
                     });
                 });
+            if !open {
+                answer = Some(false);
+            }
             match answer {
                 Some(true) => {
                     let action = self.confirm.take().map(|c| c.action);

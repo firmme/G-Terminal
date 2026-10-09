@@ -39,17 +39,17 @@ impl Palette {
             }
         } else {
             Self {
-                bg: Color32::from_rgb(13, 18, 26),
-                panel: Color32::from_rgb(21, 29, 40),
-                raised: Color32::from_rgb(30, 40, 54),
-                line: Color32::from_rgb(43, 58, 75),
-                text: Color32::from_rgb(218, 227, 238),
-                muted: Color32::from_rgb(138, 155, 176),
-                accent: Color32::from_rgb(79, 209, 165),
+                bg: Color32::from_rgb(13, 20, 29),
+                panel: Color32::from_rgb(21, 33, 46),
+                raised: Color32::from_rgb(31, 49, 67),
+                line: Color32::from_rgb(39, 58, 76),
+                text: Color32::from_rgb(222, 232, 245),
+                muted: Color32::from_rgb(151, 171, 195),
+                accent: Color32::from_rgb(0, 220, 207),
                 field: Color32::from_rgb(11, 16, 23),
                 danger: Color32::from_rgb(229, 72, 77),
                 warn: Color32::from_rgb(217, 164, 65),
-                ok: Color32::from_rgb(78, 190, 110),
+                ok: Color32::from_rgb(32, 221, 137),
                 directory: Color32::from_rgb(121, 171, 245),
                 symlink: Color32::from_rgb(103, 205, 218),
                 executable: Color32::from_rgb(117, 212, 153),
@@ -98,10 +98,10 @@ impl Palette {
             &mut visuals.widgets.open,
         ] {
             widget.fg_stroke.color = self.text;
-            widget.corner_radius = egui::CornerRadius::same(4);
+            widget.corner_radius = egui::CornerRadius::same(6);
         }
-        visuals.window_corner_radius = egui::CornerRadius::same(6);
-        visuals.menu_corner_radius = egui::CornerRadius::same(4);
+        visuals.window_corner_radius = egui::CornerRadius::same(10);
+        visuals.menu_corner_radius = egui::CornerRadius::same(8);
         visuals.selection.bg_fill = self.accent.gamma_multiply(0.3);
         visuals.selection.stroke = Stroke::new(1.0_f32, self.accent);
         visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.line);

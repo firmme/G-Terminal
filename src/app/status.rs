@@ -33,7 +33,7 @@ impl App {
             .frame(
                 egui::Frame::new()
                     .fill(p.panel)
-                    .inner_margin(egui::Margin::symmetric(6, 2)),
+                    .inner_margin(egui::Margin::symmetric(12, 5)),
             )
             .show(ctx, |ui| {
                 if let Some(error) = self.error.clone() {
@@ -45,6 +45,7 @@ impl App {
                     });
                 }
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
                     if let Some(t) = self.tabs.get(self.active) {
                         let s = &t.panes[t.focused].session;
                         let link = s.link();
@@ -53,7 +54,7 @@ impl App {
                             (p.warn, "连接中…".to_string())
                         } else {
                             match link {
-                                SessionStatus::Live => (p.ok, "● 运行中".to_string()),
+                                SessionStatus::Live => (p.ok, "运行中".to_string()),
                                 SessionStatus::Detached => (
                                     p.muted,
                                     state.exit_code.map_or_else(
@@ -66,7 +67,10 @@ impl App {
                                 }
                             }
                         };
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 4.0, state_color);
                         ui.colored_label(state_color, state_text);
+                        ui.separator();
                         ui.label(hint(
                             &format!(
                                 "{}×{} · {} · {}/{}",
@@ -112,7 +116,27 @@ impl App {
                         ui.colored_label(p.accent, text);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if !cfg!(target_os = "macos") {
+                        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                        if icons::icon_button(
+                            ui,
+                            if fullscreen {
+                                icons::Icon::ExitFullscreen
+                            } else {
+                                icons::Icon::Fullscreen
+                            },
+                            p,
+                            icons::Size::Row,
+                        )
+                        .on_hover_text(if fullscreen {
+                            "退出全屏"
+                        } else {
+                            "全屏显示"
+                        })
+                        .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+                        }
+                        if !cfg!(target_os = "macos") && !fullscreen {
                             let grip = resize_grip(ui, p);
                             if grip.hovered() || grip.dragged() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
@@ -130,9 +154,9 @@ impl App {
                             connecting_spinner(ui, p);
                         }
                         let rates = format!(
-                            "下行 {}\n上行 {}",
-                            format_bitrate(down_rate),
-                            format_bitrate(up_rate)
+                            "上行 {}\n下行 {}",
+                            format_bitrate(up_rate),
+                            format_bitrate(down_rate)
                         );
                         ui.label(RichText::new("↓").color(if down_rate > TRAFFIC_IDLE {
                             p.ok
@@ -161,9 +185,9 @@ impl App {
                         }
                         if let Some(link) = self.active_link() {
                             let (icon, label, next) = if link == SessionStatus::Live {
-                                (icons::Icon::Restart, "断开当前连接", Action::Disconnect)
+                                (icons::Icon::Disconnect, "断开当前连接", Action::Disconnect)
                             } else {
-                                (icons::Icon::Refresh, "重新连接当前会话", Action::Restart)
+                                (icons::Icon::Reconnect, "重新连接当前会话", Action::Restart)
                             };
                             if ui
                                 .add_enabled_ui(!connecting, |ui| {

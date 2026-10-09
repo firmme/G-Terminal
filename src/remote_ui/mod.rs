@@ -366,6 +366,14 @@ impl Files {
     pub fn busy(&self) -> bool {
         self.operation.as_ref().is_some_and(Operation::running)
     }
+
+    pub(crate) fn has_modal_dialog(&self) -> bool {
+        self.question.is_some()
+            || self.conflict.is_some()
+            || self.renaming.is_some()
+            || self.confirm.is_some()
+            || self.properties.is_some()
+    }
     /// True while a directory listing is in flight. Opening the window on a server
     /// without SFTP waits out the subsystem probe here, and the spinner needs
     /// repaints to keep turning for that whole time.
@@ -512,305 +520,308 @@ impl Files {
     }
 
     pub fn show(&mut self, ctx: &egui::Context, open: &mut bool, p: Palette, hide_dotfiles: bool) {
+        let focus = editing::window_focus(ctx, "file-browser", *open);
         self.show_hidden = self.show_hidden || !hide_dotfiles;
         self.poll_question();
         self.poll_conflict();
         self.poll_batch(ctx);
         self.poll_transfers(ctx);
         self.poll_count();
-        egui::Window::new(format!("文件 · {}", self.connection.profile.label()))
-            .open(open)
-            .default_size([900.0, 560.0])
-            .min_width(560.0)
-            .min_height(360.0)
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("SFTP").color(p.accent));
-                    if ui.checkbox(&mut self.show_hidden, "显示隐藏文件").changed() {
-                        self.refresh_local();
-                    }
-                });
-                let mut local_next = None;
-                let mut remote_next = None;
-                // Collected by the row loops and applied below, where `&mut self`
-                // is free of the borrows the panes hold.
-                let mut menu = None;
-                let available = ui.available_width();
-                let area = ui.available_rect_before_wrap();
-                // Reserve the measured footer height so the window can shrink.
-                let panes = egui::Rect::from_min_max(
-                    area.min,
-                    egui::pos2(
-                        area.right(),
-                        (area.bottom() - self.footer_height).max(area.top() + 80.0),
-                    ),
-                );
-                let stacked = available < 520.0;
-                let pane = egui::Layout::top_down(egui::Align::LEFT);
-                let (local_rect, remote_rect, divider) = if stacked {
-                    let half = (panes.height() * self.split_ratio.clamp(0.2, 0.8)).round();
-                    let cut = panes.top() + half;
-                    (
-                        egui::Rect::from_min_max(panes.min, egui::pos2(panes.right(), cut - 3.0)),
-                        egui::Rect::from_min_max(egui::pos2(panes.left(), cut + 3.0), panes.max),
-                        egui::Rect::from_min_max(
-                            egui::pos2(panes.left(), cut - 3.0),
-                            egui::pos2(panes.right(), cut + 3.0),
-                        ),
-                    )
-                } else {
-                    let left =
-                        panes.left() + (available * self.split_ratio.clamp(0.25, 0.75)).round();
-                    const GAP: f32 = 7.0;
-                    (
-                        egui::Rect::from_min_max(panes.min, egui::pos2(left - GAP, panes.bottom())),
-                        egui::Rect::from_min_max(egui::pos2(left + GAP, panes.top()), panes.max),
-                        egui::Rect::from_min_max(
-                            egui::pos2(left - 3.0, panes.top()),
-                            egui::pos2(left + 3.0, panes.bottom()),
-                        ),
-                    )
-                };
-                let mut local_ui =
-                    ui.new_child(egui::UiBuilder::new().max_rect(local_rect).layout(pane));
-                self.show_local_pane(&mut local_ui, p, &mut local_next, &mut menu);
-                let mut remote_ui =
-                    ui.new_child(egui::UiBuilder::new().max_rect(remote_rect).layout(pane));
-                self.show_remote_pane(&mut remote_ui, p, &mut remote_next, &mut menu);
-                let drag = ui.interact(divider, ui.id().with("files-split"), egui::Sense::drag());
-                if drag.dragged()
-                    && let Some(pos) = drag.interact_pointer_pos()
-                {
-                    self.split_ratio = if stacked {
-                        ((pos.y - panes.top()) / panes.height().max(1.0)).clamp(0.2, 0.8)
-                    } else {
-                        ((pos.x - panes.left()) / available.max(1.0)).clamp(0.25, 0.75)
-                    };
-                }
-                drag.on_hover_cursor(if stacked {
-                    egui::CursorIcon::ResizeVertical
-                } else {
-                    egui::CursorIcon::ResizeHorizontal
-                });
-                let seam = egui::Stroke::new(1.0_f32, p.line);
-                if stacked {
-                    ui.painter()
-                        .hline(divider.x_range(), divider.center().y, seam);
-                } else {
-                    ui.painter()
-                        .vline(divider.center().x, divider.y_range(), seam);
-                }
-                ui.allocate_rect(panes, egui::Sense::hover());
-                if let Some(path) = local_next {
-                    self.local_path = path;
+        crate::dialog::Dialog::new(
+            format!("文件 · {}", self.connection.profile.label()),
+            crate::icons::Icon::Folder,
+            p,
+        )
+        .resizable(true)
+        .open(open)
+        .default_size([820.0, 480.0])
+        .min_width(560.0)
+        .min_height(360.0)
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("SFTP").color(p.accent));
+                if ui.checkbox(&mut self.show_hidden, "显示隐藏文件").changed() {
                     self.refresh_local();
                 }
-                if let Some(path) = remote_next {
-                    self.remote_path = path;
-                    self.refresh_remote(ctx);
+            });
+            let mut local_next = None;
+            let mut remote_next = None;
+            // Collected by the row loops and applied below, where `&mut self`
+            // is free of the borrows the panes hold.
+            let mut menu = None;
+            let available = ui.available_width();
+            let area = ui.available_rect_before_wrap();
+            // Reserve the measured footer height so the window can shrink.
+            let panes = egui::Rect::from_min_max(
+                area.min,
+                egui::pos2(
+                    area.right(),
+                    (area.bottom() - self.footer_height).max(area.top() + 80.0),
+                ),
+            );
+            let stacked = available < 520.0;
+            let pane = egui::Layout::top_down(egui::Align::LEFT);
+            let (local_rect, remote_rect, divider) = if stacked {
+                let half = (panes.height() * self.split_ratio.clamp(0.2, 0.8)).round();
+                let cut = panes.top() + half;
+                (
+                    egui::Rect::from_min_max(panes.min, egui::pos2(panes.right(), cut - 3.0)),
+                    egui::Rect::from_min_max(egui::pos2(panes.left(), cut + 3.0), panes.max),
+                    egui::Rect::from_min_max(
+                        egui::pos2(panes.left(), cut - 3.0),
+                        egui::pos2(panes.right(), cut + 3.0),
+                    ),
+                )
+            } else {
+                let left = panes.left() + (available * self.split_ratio.clamp(0.25, 0.75)).round();
+                const GAP: f32 = 7.0;
+                (
+                    egui::Rect::from_min_max(panes.min, egui::pos2(left - GAP, panes.bottom())),
+                    egui::Rect::from_min_max(egui::pos2(left + GAP, panes.top()), panes.max),
+                    egui::Rect::from_min_max(
+                        egui::pos2(left - 3.0, panes.top()),
+                        egui::pos2(left + 3.0, panes.bottom()),
+                    ),
+                )
+            };
+            let mut local_ui =
+                ui.new_child(egui::UiBuilder::new().max_rect(local_rect).layout(pane));
+            self.show_local_pane(&mut local_ui, p, &mut local_next, &mut menu);
+            let mut remote_ui =
+                ui.new_child(egui::UiBuilder::new().max_rect(remote_rect).layout(pane));
+            self.show_remote_pane(&mut remote_ui, p, &mut remote_next, &mut menu, focus);
+            let drag = ui.interact(divider, ui.id().with("files-split"), egui::Sense::drag());
+            if drag.dragged()
+                && let Some(pos) = drag.interact_pointer_pos()
+            {
+                self.split_ratio = if stacked {
+                    ((pos.y - panes.top()) / panes.height().max(1.0)).clamp(0.2, 0.8)
+                } else {
+                    ((pos.x - panes.left()) / available.max(1.0)).clamp(0.25, 0.75)
+                };
+            }
+            drag.on_hover_cursor(if stacked {
+                egui::CursorIcon::ResizeVertical
+            } else {
+                egui::CursorIcon::ResizeHorizontal
+            });
+            let seam = egui::Stroke::new(1.0_f32, p.line);
+            if stacked {
+                ui.painter()
+                    .hline(divider.x_range(), divider.center().y, seam);
+            } else {
+                ui.painter()
+                    .vline(divider.center().x, divider.y_range(), seam);
+            }
+            ui.allocate_rect(panes, egui::Sense::hover());
+            if let Some(path) = local_next {
+                self.local_path = path;
+                self.refresh_local();
+            }
+            if let Some(path) = remote_next {
+                self.remote_path = path;
+                self.refresh_remote(ctx);
+            }
+            if let Some(action) = menu {
+                self.dispatch(action, ctx);
+            }
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add(egui::Button::new("上传 →").min_size(egui::vec2(80.0, 0.0)))
+                    .clicked()
+                    && let Some(path) = self.selected_local.clone()
+                {
+                    let directory = path.is_dir();
+                    let remote = self.remote_child(&file_name_of(&path));
+                    self.transfer(path, remote, Direction::Upload, directory, ctx);
                 }
-                if let Some(action) = menu {
-                    self.dispatch(action, ctx);
+                if ui
+                    .add(egui::Button::new("← 下载").min_size(egui::vec2(80.0, 0.0)))
+                    .clicked()
+                    && let Some(e) = self.selected_remote.clone()
+                {
+                    if !remote::safe_local_name(&e.name) {
+                        self.error = Some("服务器返回了非法文件名".into());
+                    } else {
+                        let directory = e.directory;
+                        self.transfer(
+                            PathBuf::from(&self.local_path).join(&e.name),
+                            self.remote_child(&e.name),
+                            Direction::Download,
+                            directory,
+                            ctx,
+                        );
+                    }
                 }
                 ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add(egui::Button::new("上传 →").min_size(egui::vec2(80.0, 0.0)))
-                        .clicked()
-                        && let Some(path) = self.selected_local.clone()
+                editing::field_with(ui, &mut self.name, |edit| edit.desired_width(160.0));
+                let mut op = None;
+                if ui
+                    .add(egui::Button::new("建目录").min_size(egui::vec2(80.0, 0.0)))
+                    .clicked()
+                {
+                    op = Some(0);
+                }
+                if ui
+                    .add(egui::Button::new("重命名").min_size(egui::vec2(80.0, 0.0)))
+                    .clicked()
+                {
+                    op = Some(1);
+                }
+                if let Some(op) = op {
+                    if self.name.is_empty() || self.name.contains(['/', '\\']) || self.name == ".."
                     {
-                        let directory = path.is_dir();
-                        let remote = self.remote_child(&file_name_of(&path));
-                        self.transfer(path, remote, Direction::Upload, directory, ctx);
-                    }
-                    if ui
-                        .add(egui::Button::new("← 下载").min_size(egui::vec2(80.0, 0.0)))
-                        .clicked()
-                        && let Some(e) = self.selected_remote.clone()
-                    {
-                        if !remote::safe_local_name(&e.name) {
-                            self.error = Some("服务器返回了非法文件名".into());
-                        } else {
-                            let directory = e.directory;
-                            self.transfer(
-                                PathBuf::from(&self.local_path).join(&e.name),
-                                self.remote_child(&e.name),
-                                Direction::Download,
-                                directory,
-                                ctx,
-                            );
-                        }
-                    }
-                    ui.separator();
-                    editing::field_with(ui, &mut self.name, |edit| edit.desired_width(160.0));
-                    let mut op = None;
-                    if ui
-                        .add(egui::Button::new("建目录").min_size(egui::vec2(80.0, 0.0)))
-                        .clicked()
-                    {
-                        op = Some(0);
-                    }
-                    if ui
-                        .add(egui::Button::new("重命名").min_size(egui::vec2(80.0, 0.0)))
-                        .clicked()
-                    {
-                        op = Some(1);
-                    }
-                    if let Some(op) = op {
-                        if self.name.is_empty()
-                            || self.name.contains(['/', '\\'])
-                            || self.name == ".."
-                        {
-                            self.error = Some("请输入有效文件名".into());
-                        } else {
-                            let connection = self.connection.clone();
-                            let target = self.remote_child(&self.name);
-                            let source = self
-                                .selected_remote
-                                .as_ref()
-                                .map(|e| self.remote_child(&e.name));
-                            let state = self.simple("新建目录 / 重命名");
-                            let wake = wake(ctx);
-                            remote::runtime().spawn(async move {
-                                let result: anyhow::Result<()> = async {
-                                    let sftp = connection.sftp("新建目录或重命名").await?;
-                                    if op == 0 {
-                                        sftp.create_dir(target).await?;
-                                    } else if let Some(source) = source {
-                                        sftp.rename(source, target).await?;
-                                    } else {
-                                        anyhow::bail!("请先选择远程文件");
-                                    }
-                                    Ok(())
+                        self.error = Some("请输入有效文件名".into());
+                    } else {
+                        let connection = self.connection.clone();
+                        let target = self.remote_child(&self.name);
+                        let source = self
+                            .selected_remote
+                            .as_ref()
+                            .map(|e| self.remote_child(&e.name));
+                        let state = self.simple("新建目录 / 重命名");
+                        let wake = wake(ctx);
+                        remote::runtime().spawn(async move {
+                            let result: anyhow::Result<()> = async {
+                                let sftp = connection.sftp("新建目录或重命名").await?;
+                                if op == 0 {
+                                    sftp.create_dir(target).await?;
+                                } else if let Some(source) = source {
+                                    sftp.rename(source, target).await?;
+                                } else {
+                                    anyhow::bail!("请先选择远程文件");
                                 }
-                                .await;
-                                let result = result
-                                    .map(|_| "操作完成，请刷新".to_string())
-                                    .map_err(|e| e.to_string());
-                                *state.lock().unwrap() = Some(result);
-                                wake();
-                            });
-                        }
+                                Ok(())
+                            }
+                            .await;
+                            let result = result
+                                .map(|_| "操作完成，请刷新".to_string())
+                                .map_err(|e| e.to_string());
+                            *state.lock().unwrap() = Some(result);
+                            wake();
+                        });
+                    }
+                }
+            });
+            if let Some(operation) = &self.operation {
+                let state = operation.state();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(state.name.clone()).color(p.accent));
+                    if state.total > 0 {
+                        ui.add(
+                            egui::ProgressBar::new(state.fraction())
+                                .desired_width(160.0)
+                                .show_percentage(),
+                        );
+                        ui.label(hint(
+                            &format!(
+                                "{} / {} · {}",
+                                format_size(state.done),
+                                format_size(state.total),
+                                state.message
+                            ),
+                            p,
+                        ));
+                    } else {
+                        ui.label(hint(&state.message, p));
+                    }
+                    if operation.running() && ui.small_button("取消").clicked() {
+                        operation
+                            .cancel
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                 });
-                if let Some(operation) = &self.operation {
-                    let state = operation.state();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(state.name.clone()).color(p.accent));
-                        if state.total > 0 {
+                match operation.outcome() {
+                    Some(Ok(message)) => {
+                        ui.colored_label(p.accent, message);
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(p.danger, e);
+                    }
+                    None => {}
+                }
+            }
+            if let Some(error) = &self.error {
+                ui.colored_label(p.danger, error);
+            }
+            if let Some(notice) = self.notice.clone() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(p.accent, &notice);
+                    if ui.small_button("×").clicked() {
+                        self.notice = None;
+                    }
+                });
+            }
+            ui.label("传输队列");
+            egui::ScrollArea::vertical()
+                .id_salt("transfers")
+                .max_height(150.0)
+                .show(ui, |ui| {
+                    for batch in &self.batches {
+                        let members: Vec<&Transfer> = self
+                            .transfers
+                            .iter()
+                            .filter(|t| t.batch == batch.id)
+                            .collect();
+                        let Some(first) = members.first() else {
+                            continue;
+                        };
+                        if !batch.directory {
+                            transfer_row(ui, first, p, ctx, false);
+                            continue;
+                        }
+                        let planned: u64 = members.iter().map(|t| t.planned).sum();
+                        let settled: u64 = members
+                            .iter()
+                            .map(|t| {
+                                let s = t.state.lock().unwrap();
+                                // Count skipped files as settled too.
+                                if s.finished { t.planned } else { s.done }
+                            })
+                            .sum();
+                        let finished = members
+                            .iter()
+                            .filter(|t| t.state.lock().unwrap().finished)
+                            .count();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!(
+                                "{} {}/",
+                                direction_glyph(batch_direction(&members)),
+                                batch.name
+                            )));
                             ui.add(
-                                egui::ProgressBar::new(state.fraction())
-                                    .desired_width(160.0)
-                                    .show_percentage(),
+                                egui::ProgressBar::new(if planned == 0 {
+                                    0.0
+                                } else {
+                                    settled as f32 / planned as f32
+                                })
+                                .desired_width(160.0)
+                                .show_percentage(),
                             );
                             ui.label(hint(
                                 &format!(
-                                    "{} / {} · {}",
-                                    format_size(state.done),
-                                    format_size(state.total),
-                                    state.message
+                                    "{} / {} · {}/{} 个文件",
+                                    format_size(settled),
+                                    format_size(planned),
+                                    finished,
+                                    members.len()
                                 ),
                                 p,
                             ));
-                        } else {
-                            ui.label(hint(&state.message, p));
-                        }
-                        if operation.running() && ui.small_button("取消").clicked() {
-                            operation
-                                .cancel
-                                .store(true, std::sync::atomic::Ordering::Release);
-                        }
-                    });
-                    match operation.outcome() {
-                        Some(Ok(message)) => {
-                            ui.colored_label(p.accent, message);
-                        }
-                        Some(Err(e)) => {
-                            ui.colored_label(p.danger, e);
-                        }
-                        None => {}
-                    }
-                }
-                if let Some(error) = &self.error {
-                    ui.colored_label(p.danger, error);
-                }
-                if let Some(notice) = self.notice.clone() {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(p.accent, &notice);
-                        if ui.small_button("×").clicked() {
-                            self.notice = None;
-                        }
-                    });
-                }
-                ui.label("传输队列");
-                egui::ScrollArea::vertical()
-                    .id_salt("transfers")
-                    .max_height(150.0)
-                    .show(ui, |ui| {
-                        for batch in &self.batches {
-                            let members: Vec<&Transfer> = self
-                                .transfers
-                                .iter()
-                                .filter(|t| t.batch == batch.id)
-                                .collect();
-                            let Some(first) = members.first() else {
-                                continue;
-                            };
-                            if !batch.directory {
-                                transfer_row(ui, first, p, ctx, false);
-                                continue;
-                            }
-                            let planned: u64 = members.iter().map(|t| t.planned).sum();
-                            let settled: u64 = members
-                                .iter()
-                                .map(|t| {
-                                    let s = t.state.lock().unwrap();
-                                    // Count skipped files as settled too.
-                                    if s.finished { t.planned } else { s.done }
-                                })
-                                .sum();
-                            let finished = members
-                                .iter()
-                                .filter(|t| t.state.lock().unwrap().finished)
-                                .count();
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!(
-                                    "{} {}/",
-                                    direction_glyph(batch_direction(&members)),
-                                    batch.name
-                                )));
-                                ui.add(
-                                    egui::ProgressBar::new(if planned == 0 {
-                                        0.0
-                                    } else {
-                                        settled as f32 / planned as f32
-                                    })
-                                    .desired_width(160.0)
-                                    .show_percentage(),
-                                );
-                                ui.label(hint(
-                                    &format!(
-                                        "{} / {} · {}/{} 个文件",
-                                        format_size(settled),
-                                        format_size(planned),
-                                        finished,
-                                        members.len()
-                                    ),
-                                    p,
-                                ));
+                        });
+                        if let Some(active) = members
+                            .iter()
+                            .find(|t| t.active.load(std::sync::atomic::Ordering::Acquire))
+                        {
+                            ui.indent(batch.id, |ui| {
+                                transfer_row(ui, active, p, ctx, true);
                             });
-                            if let Some(active) = members
-                                .iter()
-                                .find(|t| t.active.load(std::sync::atomic::Ordering::Acquire))
-                            {
-                                ui.indent(batch.id, |ui| {
-                                    transfer_row(ui, active, p, ctx, true);
-                                });
-                            }
                         }
-                    });
-                self.footer_height = (ui.min_rect().bottom() - panes.bottom()).max(0.0);
-            });
+                    }
+                });
+            self.footer_height = (ui.min_rect().bottom() - panes.bottom()).max(0.0);
+        });
         // Outside the window closure, where `self` is free to move again.
         self.dialogs(ctx, p);
     }
@@ -823,9 +834,10 @@ pub(crate) fn conflict_body(
     incoming: u64,
     batch_size: usize,
     p: Palette,
+    focus: editing::InitialFocus,
 ) -> Option<remote::ConflictChoice> {
     let mut answer = None;
-    ui.set_width(470.0);
+    ui.set_width(440.0);
     egui::Frame::new()
         .fill(p.warn.gamma_multiply(0.18))
         .inner_margin(egui::Margin::symmetric(12, 9))
@@ -889,7 +901,9 @@ pub(crate) fn conflict_body(
     ui.separator();
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui.button("取消剩余任务").clicked() {
+        let cancel = ui.button("取消剩余任务");
+        focus.request(ui, &cancel);
+        if cancel.clicked() {
             answer = Some(remote::ConflictChoice::CancelRemaining);
         }
         ui.label(hint("文件不会被改动", p));

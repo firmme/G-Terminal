@@ -213,6 +213,7 @@ impl Files {
     }
     /// The conflict dialog. Answers the transfer waiting on it, then forgets it.
     pub(super) fn show_conflict(&mut self, ctx: &egui::Context, p: Palette) {
+        let focus = editing::window_focus(ctx, "sftp-transfer-conflict", self.conflict.is_some());
         let Some(conflict) = &self.conflict else {
             return;
         };
@@ -231,12 +232,19 @@ impl Files {
         // A modal with a real header and a warn-coloured edge: the transfer is
         // blocked until this is answered, so it has to read as one dialog rather
         // than as a heap of equally sized lines and buttons.
-        let frame = egui::Frame::popup(&ctx.style())
-            .stroke(egui::Stroke::new(1.0_f32, p.warn.gamma_multiply(0.7)));
         egui::Modal::new(egui::Id::new("sftp-transfer-conflict"))
-            .frame(frame)
+            .frame(crate::dialog::frame(p))
             .show(ctx, |ui| {
-                answer = conflict_body(ui, &name, existing, incoming, batch_size, p);
+                crate::dialog::form_style(ui, p);
+                ui.set_width(480.0);
+                let cancel =
+                    crate::dialog::header(ui, "文件传输冲突", crate::icons::Icon::Warning, p, true);
+                egui::Frame::new().inner_margin(12).show(ui, |ui| {
+                    answer = conflict_body(ui, &name, existing, incoming, batch_size, p, focus);
+                });
+                if cancel {
+                    answer = Some(remote::ConflictChoice::CancelRemaining);
+                }
             });
         let Some(choice) = answer else {
             return;

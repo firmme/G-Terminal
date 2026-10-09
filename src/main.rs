@@ -2,6 +2,7 @@
 
 mod app;
 mod appicon;
+mod dialog;
 mod editing;
 mod icons;
 #[cfg(windows)]

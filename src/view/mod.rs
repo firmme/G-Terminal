@@ -102,6 +102,14 @@ impl Pane {
                     },
                 )
             });
+        } else if response.has_focus() {
+            response.surrender_focus();
+        }
+        let input_focused =
+            active && keyboard_enabled && response.has_focus() && ui.input(|input| input.focused);
+        if !input_focused {
+            self.preedit.clear();
+            self.composing = false;
         }
         let content = rect.shrink(4.0);
         let rows = (content.height() / cell.y).floor().clamp(1.0, 500.0) as u16;
@@ -396,7 +404,7 @@ impl Pane {
             }
         }
 
-        if active && keyboard_enabled {
+        if input_focused {
             // On Windows the Enter that commits an IME composition also arrives
             // as a key event. Without this it would run the shell as well, so
             // typing pinyin would execute the command the moment it is picked.
@@ -680,7 +688,7 @@ impl Pane {
             content.min + Vec2::new(col as f32 * cell.x, row as f32 * cell.y),
             cell,
         );
-        if active && keyboard_enabled {
+        if input_focused {
             ui.ctx().output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput {
                     rect: content,
@@ -689,8 +697,15 @@ impl Pane {
                 o.mutable_text_under_cursor = true;
             });
         }
-        if !screen.hide_cursor() && screen.scrollback() == 0 && content.intersects(cursor) {
-            if active {
+        // The selected pane stays active behind dialogs, but only the input
+        // owner should paint a blinking caret or publish the terminal IME rect.
+        if keyboard_enabled
+            && ui.input(|input| input.focused)
+            && !screen.hide_cursor()
+            && screen.scrollback() == 0
+            && content.intersects(cursor)
+        {
+            if input_focused {
                 if ui.input(|i| ((i.time * 2.0) as u64).is_multiple_of(2)) {
                     text_painter.rect_filled(
                         Rect::from_min_size(cursor.min, Vec2::new(2.0, cell.y)),
@@ -699,7 +714,7 @@ impl Pane {
                     );
                 }
                 ui.ctx().request_repaint_after(Duration::from_millis(500));
-            } else {
+            } else if !active {
                 text_painter.rect_stroke(
                     cursor,
                     0,
@@ -708,7 +723,7 @@ impl Pane {
                 );
             }
         }
-        if !self.preedit.is_empty() && active {
+        if !self.preedit.is_empty() && input_focused {
             let galley = text_painter.layout_no_wrap(self.preedit.clone(), font, palette.text);
             text_painter.rect_filled(
                 Rect::from_min_size(cursor.min, galley.size() + Vec2::new(4.0, 4.0)),

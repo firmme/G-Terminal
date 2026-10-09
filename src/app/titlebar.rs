@@ -4,6 +4,9 @@ use super::*;
 
 impl App {
     pub(super) fn resize_grips(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+            return;
+        }
         use egui::viewport::ResizeDirection;
         const GRIP: f32 = 5.0;
         let screen = ctx.content_rect();
@@ -132,7 +135,7 @@ impl App {
                             if live
                                 && icons::icon_row(
                                     ui,
-                                    icons::Icon::Restart,
+                                    icons::Icon::Disconnect,
                                     "断开当前连接",
                                     Some(alt_accel("C").as_str()),
                                     p,
@@ -145,7 +148,7 @@ impl App {
                             if (!live || !self.active_is_remote())
                                 && icons::icon_row(
                                     ui,
-                                    icons::Icon::Refresh,
+                                    icons::Icon::Reconnect,
                                     if live {
                                         "重新连接 / 重启"
                                     } else {
@@ -262,6 +265,10 @@ impl App {
                             });
                             ui.separator();
                             ui.label(hint(concat!("G-Terminal ", env!("CARGO_PKG_VERSION")), p));
+                            if icons::icon_row(ui, icons::Icon::Restart, "退出", None, p).clicked() {
+                                *action = Some(Action::Exit);
+                                ui.close();
+                            }
                         });
                         let auto_hide = self.settings.auto_hide_sidebar;
                         let docked = self.settings.sidebar && (!auto_hide || self.sidebar_pinned);
@@ -297,7 +304,7 @@ impl App {
                         let cursor = ui.cursor().min;
                         let strip_rect = egui::Rect::from_min_max(
                             cursor,
-                            egui::pos2(cursor.x + strip_max, cursor.y + 24.0),
+                            egui::pos2(cursor.x + strip_max, cursor.y + 34.0),
                         );
                         if ui.rect_contains_pointer(strip_rect) {
                             // Convert wheel movement only while hovering the tab strip.
@@ -339,7 +346,7 @@ impl App {
                                                             base,
                                                             color,
                                                             if active {
-                                                                0.35
+                                                                0.20
                                                             } else if hovered {
                                                                 0.22
                                                             } else {
@@ -352,44 +359,54 @@ impl App {
                                                                 color.gamma_multiply(0.6),
                                                             )
                                                         } else {
-                                                            egui::Stroke::NONE
+                                                            egui::Stroke::new(1.0_f32, p.line)
                                                         },
                                                     ),
                                                     None if active => (
-                                                        blend(p.raised, p.accent, 0.16),
+                                                        p.raised,
                                                         egui::Stroke::new(
                                                             1.0_f32,
-                                                            p.accent.gamma_multiply(0.45),
+                                                            p.line,
                                                         ),
                                                     ),
                                                     None if hovered => (
                                                         blend(p.panel, p.accent, 0.10),
-                                                        egui::Stroke::NONE,
+                                                        egui::Stroke::new(1.0_f32, p.line),
                                                     ),
-                                                    None => (p.panel, egui::Stroke::NONE),
+                                                    None => (blend(p.panel, p.raised, 0.35), egui::Stroke::new(1.0_f32, p.line)),
                                                 };
-                                                egui::Frame::new()
+                                                // Frame strokes contribute to layout size. Keep the
+                                                // width fixed when only the hover appearance changes.
+                                                let tab_frame = egui::Frame::new()
                                                     .fill(fill)
                                                     .stroke(stroke)
-                                                    .inner_margin(egui::Margin::symmetric(6, 0))
+                                                    .corner_radius(egui::CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 })
+                                                    .inner_margin(egui::Margin::symmetric(10, 4))
                                                     .show(ui, |ui| {
                                                         let mut hit = None;
                                                         ui.horizontal(|ui| {
-                                                            let (dot, _) = ui.allocate_exact_size(
-                                                                egui::vec2(7.0, 7.0),
-                                                                Sense::hover(),
+                                                            let reconnect = t.panes.iter().any(|pane| !pane.session.pending() && pane.session.link() != SessionStatus::Live)
+                                                                && self.login_target.is_none_or(|(id, _)| id != t.id);
+                                                            let (dot, state_response) = ui.allocate_exact_size(
+                                                                egui::vec2(16.0, 16.0),
+                                                                if reconnect || !active { Sense::click() } else { Sense::hover() },
                                                             );
+                                                            if reconnect && state_response.hovered() {
+                                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                                icons::draw(ui.painter(), dot.shrink(1.0), icons::Icon::Reconnect, p.accent, 1.3);
+                                                            } else {
                                                             ui.painter().circle_filled(
                                                                 dot.center(),
-                                                                3.5,
+                                                                4.5,
                                                                 link_color(tab_link(t), p),
                                                             );
-                                                            ui.interact(
-                                                                dot,
-                                                                ui.id().with("tab-state"),
-                                                                Sense::hover(),
-                                                            )
-                                                            .on_hover_text(tab_link(t).describe());
+                                                            }
+                                                            if state_response.clicked() && reconnect {
+                                                                *action = Some(Action::ReconnectTab(i));
+                                                            } else if state_response.clicked() && !active {
+                                                                *action = Some(Action::ActivateTab(i));
+                                                            }
+                                                            state_response.on_hover_text(if reconnect { "点击重新连接" } else { tab_link(t).describe() });
                                                             for (index, pane) in
                                                                 t.panes.iter().enumerate()
                                                             {
@@ -428,19 +445,8 @@ impl App {
                                                                 } else {
                                                                     label
                                                                 });
-                                                                if active && focused {
-                                                                    let state = if pane.session.pending() {
-                                                                        "连接中"
-                                                                    } else {
-                                                                        match pane.session.link() {
-                                                                            SessionStatus::Detached => "未连接",
-                                                                            SessionStatus::Lost => "已断开",
-                                                                            SessionStatus::Live => "",
-                                                                        }
-                                                                    };
-                                                                    if !state.is_empty() {
-                                                                        ui.label(RichText::new(state).small().color(p.muted));
-                                                                    }
+                                                                if active && focused && pane.session.pending() {
+                                                                    ui.label(RichText::new("连接中").small().color(p.muted));
                                                                 }
                                                             }
                                                             if i != self.active
@@ -474,7 +480,7 @@ impl App {
                                                             }
                                                             let label_rect = ui.min_rect();
                                                             hit = Some(egui::Rect::from_min_max(
-                                                                label_rect.min,
+                                                                egui::pos2(label_rect.left() + 16.0 + ui.spacing().item_spacing.x, label_rect.top()),
                                                                 egui::pos2(
                                                                     close.rect.left(),
                                                                     label_rect.max.y,
@@ -502,7 +508,7 @@ impl App {
                                                                 t.panes.len()
                                                             ));
                                                         if r.clicked() {
-                                                            self.active = i;
+                                                            *action = Some(Action::ActivateTab(i));
                                                         }
                                                         if r.clicked_by(egui::PointerButton::Middle)
                                                         {
@@ -566,6 +572,21 @@ impl App {
                                                             }
                                                         });
                                                     });
+                                                if active {
+                                                    let rect = tab_frame.response.rect;
+                                                    let accent = connection_color(
+                                                        &t.panes[t.focused].session.kind,
+                                                        &self.settings.group_colors,
+                                                    ).unwrap_or(p.accent);
+                                                    ui.painter().rect_filled(
+                                                        Rect::from_min_max(
+                                                            egui::pos2(rect.left(), rect.bottom() - 2.5),
+                                                            rect.right_bottom(),
+                                                        ),
+                                                        0,
+                                                        accent,
+                                                    );
+                                                }
                                             });
                                         }
                                     });
@@ -671,7 +692,7 @@ pub(super) fn brand_menu_button(
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> egui::Response {
     let first = ui.fonts_mut(|fonts| {
-        fonts.layout_no_wrap("G".to_owned(), egui::FontId::proportional(17.0), color)
+        fonts.layout_no_wrap("G".to_owned(), egui::FontId::proportional(23.0), color)
     });
     let rest = ui.fonts_mut(|fonts| {
         fonts.layout_no_wrap("  菜单".to_owned(), egui::FontId::proportional(14.0), color)
@@ -685,13 +706,15 @@ pub(super) fn brand_menu_button(
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact_selectable(&response, false);
-        ui.painter().rect(
-            rect,
-            visuals.corner_radius,
-            visuals.weak_bg_fill,
-            visuals.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
+        if response.hovered() || response.is_pointer_button_down_on() {
+            ui.painter().rect(
+                rect,
+                visuals.corner_radius,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
 
         let ink_centre = |galley: &egui::Galley| {
             galley.rows.first().map_or(galley.size().y / 2.0, |row| {
@@ -724,7 +747,7 @@ pub(super) fn topbar_margin() -> egui::Margin {
             bottom: 2,
         }
     } else {
-        egui::Margin::symmetric(4, 2)
+        egui::Margin::symmetric(10, 4)
     }
 }
 

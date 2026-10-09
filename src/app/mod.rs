@@ -41,6 +41,7 @@ mod dialogs;
 mod panes;
 mod port_owner;
 use port_owner::*;
+mod quick_connect;
 mod sidebar;
 mod status;
 mod titlebar;
@@ -163,6 +164,9 @@ fn tab_updated(tab: &Tab, active: bool) -> bool {
 #[derive(Clone)]
 enum Action {
     New(SessionKind),
+    QuickConnect(quick_connect::Target),
+    SaveConnection(SessionKind),
+    MoveConnection(sidebar::SavedConnection, Option<String>),
     /// Open another application window.
     NewWindow,
     /// Open a new tab with the same session as this tab's focused pane.
@@ -180,6 +184,9 @@ enum Action {
     CheckUpdates,
     ClosePane,
     Restart,
+    ReconnectTab(usize),
+    ActivateTab(usize),
+    Exit,
     Disconnect,
     Remote,
     Edit(usize),
@@ -271,6 +278,8 @@ pub struct App {
     editing_serial: Option<usize>,
     new_group: String,
     connection_filter: String,
+    connection_candidate: Option<usize>,
+    recent_profiles: Vec<SessionKind>,
     settings_dirty_at: Option<std::time::Instant>,
     search_open: bool,
     search: String,
@@ -297,6 +306,7 @@ pub struct App {
     /// The floating navigation bar's rect from the last frame, so the pointer
     /// moving onto it keeps it open.
     sidebar_panel_rect: Option<Rect>,
+    navigation_selection: Option<egui::Id>,
     /// The exit confirmation is on screen.
     confirm_exit: bool,
     /// The user has already agreed to close with sessions open.
@@ -344,8 +354,8 @@ impl App {
             next_id: 0,
             settings_open: capture_view.as_deref() == Some("settings"),
             remote_open: matches!(capture_view.as_deref(), Some("connection" | "serial")),
-            help_open: false,
-            groups_open: false,
+            help_open: capture_view.as_deref() == Some("help"),
+            groups_open: capture_view.as_deref() == Some("groups"),
             remote: RemoteProfile::default(),
             serial: SerialProfile::default(),
             serial_ports: Vec::new(),
@@ -362,6 +372,8 @@ impl App {
             editing_serial: None,
             new_group: String::new(),
             connection_filter: String::new(),
+            connection_candidate: None,
+            recent_profiles: vec![],
             settings_dirty_at: None,
             search_open: false,
             search: String::new(),
@@ -382,7 +394,8 @@ impl App {
             sidebar_pinned: false,
             sidebar_reveal: false,
             sidebar_panel_rect: None,
-            confirm_exit: false,
+            navigation_selection: None,
+            confirm_exit: capture_view.as_deref() == Some("confirm"),
             exit_confirmed: false,
             update_status: Arc::new(Mutex::new(update::Status::Checking)),
             update_open: false,
@@ -396,6 +409,17 @@ impl App {
                 Action::New(SessionKind::Local(app.settings.default_shell.clone())),
                 ctx,
             );
+        }
+        if capture_view.as_deref() == Some("login") {
+            let mut login = Login::new(
+                RemoteProfile {
+                    host: "192.0.2.1".into(),
+                    ..RemoteProfile::default()
+                },
+                None,
+            );
+            login.prepare_quick(None, true);
+            app.login = Some(login);
         }
         app
     }
@@ -754,6 +778,124 @@ impl App {
     }
     fn execute(&mut self, action: Action, ctx: &egui::Context) {
         match action {
+            Action::ActivateTab(index) => {
+                if index >= self.tabs.len() {
+                    return;
+                }
+                let was_inactive = self.active != index;
+                self.active = index;
+                if was_inactive
+                    && self.tabs[index].panes.iter().any(|pane| {
+                        matches!(pane.session.kind, SessionKind::Local(_))
+                            && !pane.session.pending()
+                            && pane.session.link() != SessionStatus::Live
+                    })
+                {
+                    let focused = self.tabs[index]
+                        .panes
+                        .iter()
+                        .position(|pane| {
+                            matches!(pane.session.kind, SessionKind::Local(_))
+                                && !pane.session.pending()
+                                && pane.session.link() != SessionStatus::Live
+                        })
+                        .unwrap();
+                    self.tabs[index].focused = focused;
+                    self.execute(Action::Restart, ctx);
+                }
+            }
+            Action::QuickConnect(target) => {
+                zeroize::Zeroize::zeroize(&mut self.connection_filter);
+                self.connection_candidate = None;
+                self.execute(Action::New(SessionKind::Ssh(target.profile)), ctx);
+                if let Some(login) = &mut self.login {
+                    login.prepare_quick(target.password, target.prompt);
+                }
+            }
+            Action::SaveConnection(kind) => {
+                let key = recent_connection_key(&kind);
+                let saved = self
+                    .settings
+                    .profiles
+                    .iter()
+                    .cloned()
+                    .map(SessionKind::Ssh)
+                    .chain(
+                        self.settings
+                            .serial_profiles
+                            .iter()
+                            .cloned()
+                            .map(SessionKind::Serial),
+                    )
+                    .any(|profile| recent_connection_key(&profile) == key);
+                if saved {
+                    self.notify("连接已在列表中");
+                } else {
+                    let validation = match &kind {
+                        SessionKind::Ssh(p) | SessionKind::Sftp(p) => p.validate(),
+                        SessionKind::Serial(p) => p.validate(),
+                        SessionKind::Local(_) => return,
+                    };
+                    if let Err(error) = validation {
+                        self.error = Some(error.to_string());
+                        return;
+                    }
+                    match kind {
+                        SessionKind::Ssh(p) | SessionKind::Sftp(p) => {
+                            self.settings.profiles.push(p)
+                        }
+                        SessionKind::Serial(p) => self.settings.serial_profiles.push(p),
+                        SessionKind::Local(_) => {}
+                    }
+                    self.persist();
+                    self.notify("已保存到连接列表");
+                }
+            }
+            Action::Exit => self.request_exit(ctx),
+            Action::MoveConnection(saved, group) => {
+                let valid = match saved {
+                    sidebar::SavedConnection::Ssh(index) => index < self.settings.profiles.len(),
+                    sidebar::SavedConnection::Serial(index) => {
+                        index < self.settings.serial_profiles.len()
+                    }
+                };
+                if !valid {
+                    return;
+                }
+                let group = group.unwrap_or_else(|| sidebar::next_group_name(&self.settings));
+                if !group.is_empty() && !self.settings.groups.contains(&group) {
+                    self.settings.groups.push(group.clone());
+                }
+                match saved {
+                    sidebar::SavedConnection::Ssh(index) => {
+                        self.settings.profiles[index].group = group
+                    }
+                    sidebar::SavedConnection::Serial(index) => {
+                        self.settings.serial_profiles[index].group = group
+                    }
+                }
+                self.persist();
+            }
+            Action::ReconnectTab(index) => {
+                if let Some(tab) = self.tabs.get(index)
+                    && let Some(focused) = tab
+                        .panes
+                        .iter()
+                        .enumerate()
+                        .cycle()
+                        .skip(tab.focused)
+                        .take(tab.panes.len())
+                        .find(|(_, pane)| {
+                            !pane.session.pending() && pane.session.link() != SessionStatus::Live
+                        })
+                        .map(|(index, _)| index)
+                    && self.login_target != Some((tab.id, tab.panes[focused].id))
+                {
+                    self.active = index;
+                    self.tabs[index].focused = focused;
+                    self.execute(Action::Restart, ctx);
+                }
+            }
             Action::NewWindow => match std::env::current_exe() {
                 Ok(exe) => {
                     if let Err(error) = std::process::Command::new(exe).spawn() {
@@ -787,6 +929,10 @@ impl App {
             }
             Action::New(kind) => {
                 if let Some(key) = recent_connection_key(&kind) {
+                    self.recent_profiles
+                        .retain(|profile| recent_connection_key(profile).as_ref() != Some(&key));
+                    self.recent_profiles.insert(0, kind.clone());
+                    self.recent_profiles.truncate(8);
                     self.settings
                         .recent_connections
                         .retain(|saved| saved != &key);
@@ -1097,7 +1243,8 @@ impl App {
                         // tab shortcut stays on Ctrl there and accepts either.
                         if (modifiers.ctrl || modifiers.command) && *key == Key::Tab {
                             if !self.tabs.is_empty() {
-                                self.active = (self.active + 1) % self.tabs.len();
+                                action =
+                                    Some(Action::ActivateTab((self.active + 1) % self.tabs.len()));
                             }
                             return false;
                         }
@@ -1260,6 +1407,7 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(150));
             }
         }
+        sidebar::drag_preview(ctx, p);
         if let Some(action) = action {
             self.execute(action, ctx);
         }
@@ -1399,5 +1547,7 @@ fn unique_copy_name(base: &str, taken: &[String]) -> String {
 
 #[cfg(test)]
 mod helper_tests;
+#[cfg(test)]
+mod sidebar_drag_tests;
 #[cfg(all(test, windows))]
 mod tests;
