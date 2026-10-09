@@ -24,6 +24,7 @@ pub enum Icon {
     SplitVertical,
     ClosePane,
     Restart,
+    History,
     Bell,
     Search,
     Plus,
@@ -226,6 +227,11 @@ pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, wid
         Icon::Restart => {
             ring(0.85, -1.05, 4.19);
             seg((0.0, -1.05), (0.0, -0.2));
+        }
+        Icon::History => {
+            painter.circle_stroke(c, r * 0.82, stroke);
+            seg((0.0, -0.48), (0.0, 0.0));
+            seg((0.0, 0.0), (0.38, 0.23));
         }
         Icon::Bell => {
             ring(0.55, std::f32::consts::PI, std::f32::consts::TAU);
@@ -718,7 +724,7 @@ mod tests {
 
     #[test]
     fn every_icon_paints_something_at_every_size() {
-        const ALL: [Icon; 38] = [
+        const ALL: [Icon; 39] = [
             Icon::Terminal,
             Icon::Host,
             Icon::Connect,
@@ -737,6 +743,7 @@ mod tests {
             Icon::SplitVertical,
             Icon::ClosePane,
             Icon::Restart,
+            Icon::History,
             Icon::Bell,
             Icon::Search,
             Icon::Plus,

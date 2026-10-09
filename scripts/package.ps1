@@ -1,7 +1,10 @@
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [string]$Executable = '')
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 Set-Location $projectRoot
+if ($Executable -and -not $SkipBuild) {
+    throw '-Executable requires -SkipBuild; build the selected binary first.'
+}
 if (-not $SkipBuild) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\build.ps1" -Release
     if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
@@ -13,7 +16,9 @@ $version = ($metadata.packages | Where-Object { $_.name -eq 'g-terminal' }).vers
 $packageName = "G-Terminal-$version-windows-x64"
 $packageDir = Join-Path $projectRoot "dist\$packageName"
 New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
-Copy-Item -LiteralPath "$projectRoot\target\release\g-terminal.exe" -Destination $packageDir -Force
+if (-not $Executable) { $Executable = "$projectRoot\target\release\g-terminal.exe" }
+$Executable = (Resolve-Path -LiteralPath $Executable).Path
+Copy-Item -LiteralPath $Executable -Destination (Join-Path $packageDir 'g-terminal.exe') -Force
 Copy-Item -LiteralPath "$projectRoot\README.md", "$projectRoot\LICENSE" -Destination $packageDir -Force
 $notices = [System.Collections.Generic.List[string]]::new()
 $notices.Add('G-Terminal third-party dependencies (Cargo.lock, including platform-specific build dependencies).')

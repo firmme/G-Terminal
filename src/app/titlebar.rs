@@ -4,7 +4,9 @@ use super::*;
 
 impl App {
     pub(super) fn resize_grips(&self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+        if ctx.input(|i| {
+            i.viewport().fullscreen.unwrap_or(false) || i.viewport().maximized.unwrap_or(false)
+        }) {
             return;
         }
         use egui::viewport::ResizeDirection;

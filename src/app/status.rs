@@ -29,12 +29,18 @@ impl App {
         let connecting = self.connecting();
         let down_rate = self.rates.down_per_sec;
         let up_rate = self.rates.up_per_sec;
+        let resizable = !cfg!(target_os = "macos")
+            && ctx.input(|i| {
+                !i.viewport().fullscreen.unwrap_or(false)
+                    && !i.viewport().maximized.unwrap_or(false)
+            });
         egui::TopBottomPanel::bottom("status")
-            .frame(
-                egui::Frame::new()
-                    .fill(p.panel)
-                    .inner_margin(egui::Margin::symmetric(12, 5)),
-            )
+            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin {
+                left: 12,
+                right: if resizable { 24 } else { 12 },
+                top: 5,
+                bottom: 5,
+            }))
             .show(ctx, |ui| {
                 if let Some(error) = self.error.clone() {
                     ui.horizontal_wrapped(|ui| {
@@ -136,20 +142,6 @@ impl App {
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
                         }
-                        if !cfg!(target_os = "macos") && !fullscreen {
-                            let grip = resize_grip(ui, p);
-                            if grip.hovered() || grip.dragged() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-                            }
-                            if grip.drag_started()
-                                || (grip.hovered() && ui.input(|i| i.pointer.primary_pressed()))
-                            {
-                                ui.ctx()
-                                    .send_viewport_cmd(egui::ViewportCommand::BeginResize(
-                                        egui::viewport::ResizeDirection::SouthEast,
-                                    ));
-                            }
-                        }
                         if connecting {
                             connecting_spinner(ui, p);
                         }
@@ -158,13 +150,13 @@ impl App {
                             format_bitrate(up_rate),
                             format_bitrate(down_rate)
                         );
-                        ui.label(RichText::new("↓").color(if down_rate > TRAFFIC_IDLE {
+                        ui.label(RichText::new("↓").color(if self.rates.down_active {
                             p.ok
                         } else {
                             p.muted
                         }))
                         .on_hover_text(&rates);
-                        ui.label(RichText::new("↑").color(if up_rate > TRAFFIC_IDLE {
+                        ui.label(RichText::new("↑").color(if self.rates.up_active {
                             p.danger
                         } else {
                             p.muted
@@ -241,6 +233,27 @@ impl App {
                     ctx.request_repaint_after(std::time::Duration::from_millis(150));
                 }
             });
+        if resizable {
+            egui::Area::new(egui::Id::new("window-resize-grip"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::Vec2::ZERO)
+                .order(egui::Order::Middle)
+                .movable(false)
+                .fade_in(false)
+                .show(ctx, |ui| {
+                    let grip = resize_grip(ui, p);
+                    if grip.hovered() || grip.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                    }
+                    if grip.drag_started()
+                        || (grip.hovered() && ui.input(|i| i.pointer.primary_pressed()))
+                    {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                                egui::viewport::ResizeDirection::SouthEast,
+                            ));
+                    }
+                });
+        }
     }
 }
 
@@ -252,42 +265,78 @@ pub(super) struct RateMeter {
     at: Option<std::time::Instant>,
     up: u64,
     down: u64,
+    last_up: u64,
+    last_down: u64,
+    up_at: Option<std::time::Instant>,
+    down_at: Option<std::time::Instant>,
+    pub(super) up_active: bool,
+    pub(super) down_active: bool,
     pub(super) up_per_sec: f64,
     pub(super) down_per_sec: f64,
 }
 
-pub(super) const TRAFFIC_IDLE: f64 = 1.0;
+const RATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const TRAFFIC_ACTIVITY: std::time::Duration = std::time::Duration::from_millis(600);
 
 impl RateMeter {
     pub(super) fn sample(&mut self, pane: u64, up: u64, down: u64) -> bool {
-        let now = std::time::Instant::now();
-        if self.pane == Some(pane) {
-            let seconds = self
-                .at
-                .map(|at| now.duration_since(at).as_secs_f64())
-                .unwrap_or(0.0)
-                .max(0.001);
-            let up_rate = up.saturating_sub(self.up) as f64 / seconds;
-            let down_rate = down.saturating_sub(self.down) as f64 / seconds;
-            self.up_per_sec = self.up_per_sec * 0.5 + up_rate * 0.5;
-            self.down_per_sec = self.down_per_sec * 0.5 + down_rate * 0.5;
-        } else {
-            self.pane = Some(pane);
-            self.up_per_sec = 0.0;
-            self.down_per_sec = 0.0;
+        self.sample_at(pane, up, down, std::time::Instant::now())
+    }
+
+    pub(super) fn sample_at(
+        &mut self,
+        pane: u64,
+        up: u64,
+        down: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.pane != Some(pane) || up < self.last_up || down < self.last_down {
+            *self = Self {
+                pane: Some(pane),
+                at: Some(now),
+                up,
+                down,
+                last_up: up,
+                last_down: down,
+                ..Self::default()
+            };
+            return false;
         }
-        self.at = Some(now);
-        self.up = up;
-        self.down = down;
-        self.up_per_sec > TRAFFIC_IDLE || self.down_per_sec > TRAFFIC_IDLE
+        if up > self.last_up {
+            self.up_at = Some(now);
+        }
+        if down > self.last_down {
+            self.down_at = Some(now);
+        }
+        self.last_up = up;
+        self.last_down = down;
+        self.up_active = self
+            .up_at
+            .is_some_and(|at| now.duration_since(at) < TRAFFIC_ACTIVITY);
+        self.down_active = self
+            .down_at
+            .is_some_and(|at| now.duration_since(at) < TRAFFIC_ACTIVITY);
+        if let Some(at) = self.at {
+            let elapsed = now.duration_since(at);
+            if elapsed >= RATE_INTERVAL {
+                // Hold the displayed value for a whole second, independent of frame rate.
+                self.up_per_sec = up.saturating_sub(self.up) as f64 / elapsed.as_secs_f64();
+                self.down_per_sec = down.saturating_sub(self.down) as f64 / elapsed.as_secs_f64();
+                self.at = Some(now);
+                self.up = up;
+                self.down = down;
+            }
+        }
+        self.up_active
+            || self.down_active
+            || up != self.up
+            || down != self.down
+            || self.up_per_sec > 0.0
+            || self.down_per_sec > 0.0
     }
 
     pub(super) fn clear(&mut self) {
-        let pane = self.pane;
-        *self = Self {
-            pane,
-            ..Self::default()
-        };
+        *self = Self::default();
     }
 }
 

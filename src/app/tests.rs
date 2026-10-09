@@ -405,6 +405,52 @@ fn recent_connections_select_on_single_click_and_connect_on_double_click() {
         render(&mut app, &ctx, vec![], i as f64 * 0.1);
     }
     let (output, _) = render(&mut app, &ctx, vec![], 0.3);
+    assert_eq!(
+        output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "recent-double-click"
+            ))
+            .count(),
+        1,
+        "recent connections should start collapsed; only the saved row should be visible"
+    );
+    let heading = output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape
+                && text.galley.text() == "最近连接"
+            {
+                Some(text.pos + text.galley.rect.center().to_vec2())
+            } else {
+                None
+            }
+        })
+        .expect("recent connections heading");
+    render(
+        &mut app,
+        &ctx,
+        vec![Event::PointerMoved(heading), press(heading, true)],
+        0.31,
+    );
+    render(&mut app, &ctx, vec![press(heading, false)], 0.32);
+    for i in 0..3 {
+        render(&mut app, &ctx, vec![], 0.4 + i as f64 * 0.1);
+    }
+    let (output, _) = render(&mut app, &ctx, vec![], 0.7);
+    assert_eq!(
+        output
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "recent-double-click"
+            ))
+            .count(),
+        2,
+        "clicking the heading should expand recent connections"
+    );
     let pos = output
         .shapes
         .iter()
@@ -422,9 +468,9 @@ fn recent_connections_select_on_single_click_and_connect_on_double_click() {
         &mut app,
         &ctx,
         vec![Event::PointerMoved(pos), press(pos, true)],
-        0.4,
+        0.8,
     );
-    let (_, action) = render(&mut app, &ctx, vec![press(pos, false)], 0.45);
+    let (_, action) = render(&mut app, &ctx, vec![press(pos, false)], 0.85);
     assert!(
         action.is_none(),
         "a single click must only select the recent row"
@@ -434,8 +480,8 @@ fn recent_connections_select_on_single_click_and_connect_on_double_click() {
         Some(egui::Id::new(("navigation-recent", &recent_key)))
     );
     assert!(app.login.is_none());
-    render(&mut app, &ctx, vec![press(pos, true)], 0.5);
-    let (_, action) = render(&mut app, &ctx, vec![press(pos, false)], 0.55);
+    render(&mut app, &ctx, vec![press(pos, true)], 0.9);
+    let (_, action) = render(&mut app, &ctx, vec![press(pos, false)], 0.95);
     assert!(
         matches!(action, Some(Action::New(SessionKind::Ssh(profile)))
         if profile.host == "recent.invalid" && profile.user == "root")
@@ -650,8 +696,13 @@ fn the_status_button_enters_and_leaves_fullscreen() {
         for _ in 0..3 {
             render(vec![]);
         }
-        // The rightmost status control has a 20pt hit region inside the 12pt margin.
-        let pos = egui::pos2(size.x - 22.0, size.y - 14.0);
+        // The corner grip has its own space; the fullscreen button remains separate.
+        let margin = if !cfg!(target_os = "macos") && !fullscreen {
+            24.0
+        } else {
+            12.0
+        };
+        let pos = egui::pos2(size.x - margin - 10.0, size.y - 14.0);
         render(vec![Event::PointerMoved(pos)]);
         render(vec![press(pos, true)]);
         let output = render(vec![press(pos, false)]);
@@ -1112,22 +1163,82 @@ fn the_spinner_runs_only_while_a_connection_is_pending() {
 /// The arrows light on a burst and settle back to idle once it stops.
 #[test]
 fn the_rate_meter_lights_up_then_settles() {
+    let now = std::time::Instant::now();
+    let at = |ms| now + std::time::Duration::from_millis(ms);
     let mut meter = RateMeter::default();
     assert!(
-        !meter.sample(1, 0, 0),
+        !meter.sample_at(1, 0, 0, at(0)),
         "the first sample is only a baseline"
     );
-    assert!(meter.sample(1, 4096, 0), "a write must light the up arrow");
-    let mut settled = None;
-    for frame in 0..64 {
-        if !meter.sample(1, 4096, 0) {
-            settled = Some(frame);
-            break;
-        }
-    }
-    assert!(settled.is_some(), "the rate never decayed to idle");
-    assert!(meter.up_per_sec <= TRAFFIC_IDLE);
+    assert!(meter.sample_at(1, 4096, 0, at(50)));
+    assert!(meter.up_active, "a write must light the up arrow promptly");
+    assert!(!meter.down_active);
+    meter.sample_at(1, 4096, 0, at(800));
+    assert!(
+        !meter.up_active,
+        "the arrow should settle independently of the text"
+    );
+    meter.sample_at(1, 4096, 0, at(1000));
+    assert_eq!(meter.up_per_sec, 4096.0);
+    assert!(!meter.sample_at(1, 4096, 0, at(2000)));
+    assert_eq!(meter.up_per_sec, 0.0);
     assert_eq!(meter.down_per_sec, 0.0);
+}
+
+#[test]
+fn rate_text_stays_stable_between_seconds_regardless_of_frame_count() {
+    let now = std::time::Instant::now();
+    let at = |ms| now + std::time::Duration::from_millis(ms);
+    for frame_interval in [5, 50, 200] {
+        let mut meter = RateMeter::default();
+        meter.sample_at(1, 0, 0, at(0));
+        for ms in (frame_interval..1000).step_by(frame_interval as usize) {
+            meter.sample_at(1, ms * 4, ms * 2, at(ms));
+            assert_eq!((meter.up_per_sec, meter.down_per_sec), (0.0, 0.0));
+        }
+        meter.sample_at(1, 4000, 2000, at(1000));
+        assert_eq!((meter.up_per_sec, meter.down_per_sec), (4000.0, 2000.0));
+        for ms in (1000 + frame_interval..2000).step_by(frame_interval as usize) {
+            meter.sample_at(1, 4000 + (ms - 1000) * 8, 2000, at(ms));
+            assert_eq!((meter.up_per_sec, meter.down_per_sec), (4000.0, 2000.0));
+        }
+        meter.sample_at(1, 12000, 2000, at(2000));
+        assert_eq!((meter.up_per_sec, meter.down_per_sec), (8000.0, 0.0));
+        meter.sample_at(2, 90000, 80000, at(2050));
+        assert_eq!((meter.up_per_sec, meter.down_per_sec), (0.0, 0.0));
+        meter.clear();
+        assert!(!meter.sample_at(2, 90000, 80000, at(2100)));
+    }
+}
+
+#[test]
+fn the_resize_handle_stays_at_the_window_corner_and_drags_southeast() {
+    if cfg!(target_os = "macos") {
+        return;
+    }
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    for size in [Vec2::new(1280.0, 800.0), Vec2::new(900.0, 600.0)] {
+        app.error = Some("An extra status row must not move the corner grip".into());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
+        }
+        let rect = egui::AreaState::load(&ctx, egui::Id::new("window-resize-grip"))
+            .expect("missing corner grip")
+            .rect();
+        assert_eq!(rect.right_bottom(), size.to_pos2());
+        assert_eq!(rect.size(), Vec2::splat(16.0));
+        let pos = rect.center();
+        commands(&mut app, &ctx, vec![Event::PointerMoved(pos)], size);
+        let seen = commands(&mut app, &ctx, vec![press(pos, true)], size);
+        assert!(
+            seen.contains(&egui::ViewportCommand::BeginResize(
+                egui::viewport::ResizeDirection::SouthEast
+            )),
+            "corner grip did not start resizing: {seen:?}"
+        );
+        commands(&mut app, &ctx, vec![press(pos, false)], size);
+    }
 }
 
 /// A background tab that receives output is underlined, and looking at it

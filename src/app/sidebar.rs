@@ -433,62 +433,83 @@ impl App {
             if filter.is_empty() && !self.settings.recent_connections.is_empty() {
                 ui.add_space(4.0);
                 ui.separator();
-                navigation_heading(ui, icons::Icon::Restart, "最近连接", p);
-                let candidates: Vec<_> = self
-                    .recent_profiles
-                    .iter()
-                    .cloned()
-                    .chain(
-                        self.settings
-                            .profiles
-                            .iter()
-                            .chain(self.settings.ssh_config_profiles.iter())
-                            .cloned()
-                            .map(SessionKind::Ssh)
-                            .chain(
-                                self.settings
-                                    .serial_profiles
-                                    .iter()
-                                    .cloned()
-                                    .map(SessionKind::Serial),
-                            ),
-                    )
-                    .chain(
-                        self.settings
-                            .recent_connections
-                            .iter()
-                            .filter_map(|key| quick_connect::from_recent_key(key)),
-                    )
-                    .collect();
-                for key in self.settings.recent_connections.iter().take(5) {
-                    if let Some(kind) = candidates
-                        .iter()
-                        .find(|kind| recent_connection_key(kind).as_ref() == Some(key))
-                    {
-                        let row = connection_row(
-                            ui,
-                            kind,
-                            egui::Id::new(("navigation-recent", key)),
-                            &mut self.navigation_selection,
-                            p,
-                        );
-                        drag_source(&row, kind.clone(), None);
-                        if row.double_clicked() {
-                            *action = Some(Action::New(kind.clone()));
-                        }
-                        row.on_hover_text("单击选中 · 双击连接 / 右键管理")
-                            .context_menu(|ui| {
-                                if ui.button("保存到连接列表").clicked() {
-                                    *action = Some(Action::SaveConnection(kind.clone()));
-                                    ui.close();
-                                }
-                                if ui.button("复制连接信息").clicked() {
-                                    *action = Some(Action::CopyConnectionInfo(kind.clone()));
-                                    ui.close();
-                                }
-                            });
-                    }
+                let mut header_clicked = false;
+                let mut header = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    egui::Id::new("recent-connections"),
+                    false,
+                )
+                .show_header(ui, |ui| {
+                    ui.set_min_height(22.0);
+                    let (rect, icon) =
+                        ui.allocate_exact_size(egui::vec2(15.0, 15.0), Sense::click());
+                    icons::draw(ui.painter(), rect, icons::Icon::History, p.muted, 1.3);
+                    let label = ui.add(
+                        egui::Label::new(RichText::new("最近连接").strong().color(p.text))
+                            .sense(Sense::click()),
+                    );
+                    header_clicked = icon.clicked() || label.clicked();
+                });
+                if header_clicked {
+                    header.toggle();
                 }
+                header.body(|ui| {
+                    let candidates: Vec<_> = self
+                        .recent_profiles
+                        .iter()
+                        .cloned()
+                        .chain(
+                            self.settings
+                                .profiles
+                                .iter()
+                                .chain(self.settings.ssh_config_profiles.iter())
+                                .cloned()
+                                .map(SessionKind::Ssh)
+                                .chain(
+                                    self.settings
+                                        .serial_profiles
+                                        .iter()
+                                        .cloned()
+                                        .map(SessionKind::Serial),
+                                ),
+                        )
+                        .chain(
+                            self.settings
+                                .recent_connections
+                                .iter()
+                                .filter_map(|key| quick_connect::from_recent_key(key)),
+                        )
+                        .collect();
+                    for key in self.settings.recent_connections.iter().take(5) {
+                        if let Some(kind) = candidates
+                            .iter()
+                            .find(|kind| recent_connection_key(kind).as_ref() == Some(key))
+                        {
+                            let row = connection_row(
+                                ui,
+                                kind,
+                                egui::Id::new(("navigation-recent", key)),
+                                &mut self.navigation_selection,
+                                p,
+                            );
+                            drag_source(&row, kind.clone(), None);
+                            if row.double_clicked() {
+                                *action = Some(Action::New(kind.clone()));
+                            }
+                            row.on_hover_text("单击选中 · 双击连接 / 右键管理")
+                                .context_menu(|ui| {
+                                    if ui.button("保存到连接列表").clicked() {
+                                        *action = Some(Action::SaveConnection(kind.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button("复制连接信息").clicked() {
+                                        *action = Some(Action::CopyConnectionInfo(kind.clone()));
+                                        ui.close();
+                                    }
+                                });
+                        }
+                    }
+                });
             }
             ui.add_space(4.0);
             ui.separator();
