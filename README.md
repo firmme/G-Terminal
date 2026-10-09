@@ -1,224 +1,113 @@
 # G-Terminal
 
-Windows 优先的原生 GPU 终端，使用 Rust、egui，Windows 默认使用原生 Direct3D 11 渲染，其他平台保留 wgpu，无 Electron、Chromium 或 WebView。
+原生 GPU 终端，Rust + egui。Windows 默认 Direct3D 11 渲染，其余平台走 wgpu；无 Electron / Chromium / WebView。
 
-当前版本 **0.4.10**。交付 Windows x64 与 macOS arm64 便携版：Windows 版在本机 Windows / MSVC 环境构建和验证；macOS 版使用隐藏标题栏的原生窗口、用户 `$SHELL` 与系统字体，已在 Apple Silicon 完成编译、测试、界面冒烟与本机打包。Linux 的平台入口保留，尚未实机验证或发布。推荐 Windows 11；ConPTY 要求 Windows 10 1809 或更新版本。
+当前版本 **0.4.10**。交付 Windows x64 与 macOS arm64 便携版；Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
 
 ## 截图
 
-主界面：左侧为本地 Shell 与分组连接，状态栏右侧有历史查找、上下行流量箭头（有流量时红/绿点亮）和窗口缩放手柄。
-
 ![主界面](docs/screenshots/main.png)
 
-G 菜单按新建、当前会话、文件与连接、应用分区；分屏、连接工具和帮助更新收在子菜单中，常用的新建终端入口单独强调：
+本地 Shell 与分组连接；状态栏含历史查找、上下行速率和缩放手柄。
 
 ![菜单](docs/screenshots/menu.png)
 
-新建连接支持串口，端口可下拉选择，也可手填或使用 `auto`。macOS 上只列出 `/dev/cu.*`（call-out），成对的 `/dev/tty.*`（dial-in，等待载波）会被去掉；端口按 `cu` 优先、编号自然序排列，蓝牙口（`Bluetooth-*`、`rfcomm*`）排在最后：
+G 菜单按新建、当前会话、文件与连接、应用分区；分屏 / 连接工具 / 帮助更新收在子菜单。
 
 ![串口连接](docs/screenshots/serial-connection.png)
 
-串口被别的程序占着时，错误提示之外还有「串口占用排查」（G 菜单，串口选择窗口里也有「占用排查」按钮）：它列出持有该端口的进程名、PID 与路径，可以只结束那个程序；Windows 与 Linux 上还能「重启设备」，让占用者的句柄失效而不必关掉它。Windows 走系统句柄表（同 Sysinternals `handle.exe` 的思路），Linux 读 `/proc/<pid>/fd` 按设备号比对，macOS 用 `libproc` 列描述符；三者都只读，列出的进程是否结束完全由用户决定。查看其他用户或高完整性进程的句柄需要管理员权限，未提权时会在窗口里说明。结束不了的程序（属于别的用户、或自身以管理员运行）会给出「以管理员身份结束」：Windows 用 `runas` 重新启动自己、弹出 UAC 授权，Linux 走 `pkexec`，被授权的副本执行完把结果写回窗口；不想结束进程时就「重启设备」。
-
-后台标签有新输出时标签文字带下划线，切回后自动消失：
+串口连接（端口下拉 / 手填 / `auto`）；被占用时可「占用排查」列出持有进程并结束它。
 
 ![标签页活动标记](docs/screenshots/tab-activity.png)
 
-## 启动与构建
+后台标签有新输出时标签带下划线，切回即消失。
 
-解压发布包，运行 `g-terminal.exe`。默认打开 Windows PowerShell，工作目录为用户主目录。PowerShell 7 和 WSL 需自行安装。
+## 功能
 
-源码构建需要 Rust（本次验证为 1.98.1），再加以下任一套链接环境：
+**会话与界面**
 
-- **MSVC（默认，与发布包一致）**：Visual Studio C++ Build Tools 和 Windows SDK。
-- **GNU/mingw-w64**：`rustup toolchain install stable-x86_64-pc-windows-gnu`，以及 mingw-w64 工具链（提供 `gcc`）。适合没装 Visual Studio 的机器，产物与发布包不同。
+- 本地 Shell 枚举：Windows 为 PowerShell / PowerShell 7 / CMD / WSL；macOS、Linux 读 `/etc/shells`（加 `$SHELL` 与常见 Homebrew 路径），可选默认项。
+- 任意嵌套分屏（每标签 ≤ 32 窗格）；标签页右键：分屏 / 复制会话 / 关闭其它 / 关闭断开；菜单「新建窗口」。
+- 连接和分组可配标签颜色，**连接色优先于分组色**；有颜色的会话给标签页铺底色。
+- 连接导航：搜索框支持 `user:pass@host[:port]` 快速连接；保存的连接可拖入分组、拖到控制台新建会话；右键复制连接配置或整份列表。
+- 标签：后台新输出加下划线、响铃显示铃铛；shell 的 OSC 0/2 标题用于窗口标题。
+- 输入：文本框右键菜单（复制 / 剪切 / 粘贴 / 全选）；终端链接 `Cmd/Ctrl+点击` 打开；选中文本浏览器搜索（引擎可切换）；拖放文件上传 SFTP。
+- 记住上次标签（按断开状态还原）；串口可设后台自动断开。
 
-```powershell
-./scripts/build.ps1 -Action build -Release
-./target/release/g-terminal.exe
-./scripts/package.ps1 -SkipBuild
+**SSH / 文件 / 传输**
 
-# 另一台机器走 GNU 工具链：
-./scripts/build.ps1 -Action build -Release -Toolchain stable-x86_64-pc-windows-gnu
-```
+- 内置 `russh` / `russh-sftp` / Tokio，不依赖本机 OpenSSH；密码或私钥（含口令）认证；首连指纹写入 `~/.ssh/known_hosts`，密钥变化拒绝连接。
+- 单级 ProxyJump 与多条本地转发；连接时先自动试一次免密。
+- 启动读取 `~/.ssh/config`，导入带 `HostName` 的 `Host`，列在只读的 SSH-CONFIG 分组。
+- 文件窗口：本地 / 远程双表格，目录传输、断点续传、冲突处理；POSIX 权限编辑（本地在 macOS / Linux 亦可）。
+- ZMODEM：终端内敲 `rz` / `sz` 或文件窗口显式收发。
 
-构建脚本按当前工具链的 host triple 判断该准备哪套环境：MSVC 目标用 `vswhere` 定位 Visual Studio 与 SDK，并设置 `PATH`／`LIB`／`INCLUDE`；GNU 目标直接交给 cargo，不触碰 MSVC。始终用 `rustc -vV` 实测而非猜测，因此 Git for Windows 自带的 `link.exe`（coreutils 的同名工具）不会被误认成 MSVC 链接器。缺依赖时报错会直接给出安装命令，而不是把链接器的原始报错抛出来。用 `-Toolchain` 可在不切换 rustup 默认工具链的情况下为单次调用指定工具链。
+**终端能力**
 
-macOS 不需要完整 Xcode，装好 Command Line Tools（`xcode-select --install`）和 rustup 即可，直接用 cargo，不使用上面的 PowerShell 脚本：
-
-```sh
-cargo run --release
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
-./scripts/package-macos.sh      # 生成 dist/G-Terminal-<version>-macos-<arch>.tar.gz（含 G-Terminal.app）与 SHA256
-```
-
-发布包包含第三方许可，旁附 SHA256 校验文件。使用 `Cargo.lock`；RSA 依赖的 pkcs8 暂固定在兼容的预发布版本。
-
-## 界面与会话
-
-- 「最近连接」默认折叠，点击标题或箭头展开，标题使用历史时钟图标。
-- 紧凑单行顶栏：左上菜单、侧栏收起按钮、横向标签和关闭按钮。品牌信息、设置、帮助与会话操作归入菜单；终端上方不再重复显示标题和工具栏。菜单里的「检查更新」会查询 GitHub 最新 Release：有新版本时列出说明，可「下载并更新」——下载后退出，由一个脱离进程的脚本替换 `.app` 并重启（用系统自带 `curl` 和 `tar`，不引入依赖）；开发构建（未打包成 `.app`）只给「打开发布页」。
-- 可调整宽度的连接导航栏、自定义连接分组；连接名称留空时默认显示主机 IP / 主机名。提示文字与标签使用不同颜色。设置里的「自动隐藏导航栏」把导航栏移出布局，只在鼠标移到左侧半透明的 `>` 条时以悬浮层展开；该模式下顶栏的展开 / 收起按钮改为在「常驻」与「自动隐藏」之间切换。保存的连接（SSH / 串口）右键可「复制连接配置」，副本名为「原名 副本」（重名自动编号），跳板机与转发规则一并复制；也可复制单条连接信息。右键「所有连接」可复制完整连接列表，选项卡右键菜单可复制其窗格信息与状态。
-- 侧栏使用带搜索图标的输入框、分区标题和紧凑的连接行；最近打开的 SSH / 串口连接列在分组之前。本地 Shell 列表首次使用默认展开，之后保留展开 / 折叠状态。本地 Shell、最近连接和保存的连接均为单击选中、双击打开；选中的一行以背景渐变和青色竖线显示，选中状态独立于活跃会话，同地址的其他行不会联动高亮，切换标签也不改变选中行。过长名称显示省略号。最近连接只记录连接标识，不保存密码。
-- 已保存的 SSH / 串口连接可拖到分组调整归属；空分组显示为「默认分组」。拖拽时列表末尾出现「新建分组」，松开后按「新分组 1、2、3…」顺序命名，取消不创建分组。长列表靠近上下边缘可自动滚动。本地 Shell 和 SSH-CONFIG 可拖到控制台创建新会话，分组对它们不显示落点；保存的连接和最近连接也可拖到控制台新建会话。
-- 连接和分组都能配一个**标签颜色**（一行预设色点 + 「无颜色」，默认无）。规则是「**连接的自身颜色优先于所属分组，两者都没有则不着色**」；当前窗格的会话带颜色时，整个标签页标签会用该颜色铺一层底色，便于一眼区分环境。
-- 设置里可让程序记住上次关闭时的连接标签，重启后按断开状态还原（不重连、不新建 Shell）；关闭窗口时若有未断开的连接会先确认。菜单里的「断开当前连接 / 重新连接」按当前激活会话的状态给出：已连接时只显示「断开当前连接」（远程会话还一并忽略「重新连接」和 `Alt+R`），断开时只显示「重新连接」；本地 Shell 即使在运行也保留「重启」。
-- 串口连接可选后台自动断开（默认关闭、默认 5 分钟，可在设置中修改）。切到其他标签或窗口失焦后开始计时，回到前台时重置；到时释放串口并保留终端输出。
-- 侧栏「本地 Shell」在 Windows 列出 PowerShell / PowerShell 7 / CMD / WSL；macOS 与 Linux 读取 `/etc/shells`（加上 `$SHELL` 和常见 Homebrew 路径）枚举机器上实际存在的 shell（zsh、bash、fish…），可在「默认 Shell」里选默认项。早先配置里的 `shell` 值仍然可用，表示跟随 `$SHELL`。
-- 左右、上下任意嵌套分屏，每标签最多 32 个窗格；拖动分隔线调整比例。标签页右键菜单：左右 / 上下分屏、**复制会话**（按当前窗格同样的类型开一个新标签）、关闭标签、关闭其它标签页、关闭断开的标签页（该标签下所有会话都已结束时才可点）。菜单里的「新建窗口」另开一个独立的应用窗口。
-- **终端标题**：标签优先显示稳定的会话名称，长名称会省略并可悬停查看完整信息；shell 通过 OSC 0/2 设置的标题仍用于系统窗口标题，也会在标签悬停提示中显示。
-- **响铃**：会话输出里的 BEL（`\x07`）会让**后台标签**显示一个铃铛图标，切到该标签后消失。
-- 深色界面采用蓝黑色分层背景与青色强调色。活动标签使用抬高的背景、圆角和底部强调线，连接 / 分组的标签颜色仍优先用于强调线与底色；上下行箭头及时指示收发活动，只在悬浮时以两行提示显示速率，速率每秒更新一次，不随重绘跳动。窗口缩放手柄独立固定在最右下角，最大化或全屏时隐藏。
-- 未连接标签不再附加“未连接”文字；状态圆点在悬浮时显示链环重连图标，点击重连并保留输出，后台标签同样支持，点击时会激活对应标签。重连与断开图标使用原生矢量线条绘制。激活未连接的本地 Shell 标签会自动启动 Shell，SSH / 串口仍手动连接。主菜单提供“退出”，沿用退出确认设置；底部状态栏右侧提供全屏 / 退出全屏按钮。
-- 弹窗统一使用紧凑的标题栏、信息卡片和操作按钮，按内容限制尺寸；连接、登录与重命名等表单打开时聚焦合理的输入框。输入框或弹窗接管输入时，终端光标停止闪烁，IME 候选位置跟随实际输入焦点。
-- 导航搜索框支持 `username:password@hostname`、`username@hostname`、`:password@hostname`、IP / 域名与可选端口（如 `alice@host:2222`、`alice@[::1]:2222`）。有效目标会把搜索图标变成可点击的连接图标，Enter 同样可连接；只输入地址时先弹出登录窗口。普通关键词继续筛选连接，有候选时用 ↑↓ 选择、Enter 连接。密码只用于本次登录，提交后清空输入，不写入配置或最近连接；最近连接右键可保存到连接列表，重复保存不会增加副本。
-- **拖放上传**：把本地文件或目录拖进窗口即加入当前 SSH 会话的上传队列（目标是文件窗口正在显示的远程目录；还没打开文件窗口时自动打开）。拖动过程中窗口变暗并显示目标路径，松开开始上传。
-- 默认恢复标签、分屏比例、焦点和会话类型，但全部按断开状态还原：不新建 Shell、不建立连接，通过“重新连接”后才在原窗格启动。不会恢复旧进程、执行中的命令或终端输出。
-- 查询当前窗格整个保留历史，支持跨自动换行匹配、跳转和可见匹配高亮。区分大小写，最多返回 10,000 个命中；不搜索其他窗格或上次运行的输出。
-- 设置提供“选中自动复制”（默认关闭）。鼠标中键直接粘贴，右键打开终端菜单。应用启用鼠标上报时按住 Shift 可拖选。选择支持**双击选词、三击选整行、四击选当前屏幕**；在普通屏幕拖选到上下边缘会滚动历史，选区可跨屏。备用屏幕仍只在当前屏幕内选择。
-- 终端右键菜单可把选中内容交给默认浏览器搜索，默认 Google、可在设置里切换 Bing / DuckDuckGo / 百度。链接按各引擎的查询参数拼接，查询词做了百分号编码（中文等 UTF-8 也正确）。
-- 终端里的 `http(s)://` 与 `www.` 链接在鼠标悬停时会加下划线并显示手型光标，**Cmd / Ctrl + 点击**用默认浏览器打开（避免和普通点选冲突）。尾部标点不计入链接，`www.` 会自动补 `http://`。
-- 所有文本输入框（连接、串口、地址栏、重命名、搜索等）带右键菜单：复制 / 剪切 / 粘贴 / 全选。egui 的 `TextEdit` 只有键盘快捷键、没有菜单，这里直接按字符区间改文本并写回光标状态，中文等多字节字符不会错位。
-- 弹窗打开时自动定位合理焦点：SSH 登录到用户名，新建连接到主机地址，串口到端口，分组到名称，重命名到文件名。初始焦点只设置一次，支持切换输入框，关闭后重新打开会再次定位；终端不会抢走弹窗输入焦点。
-- 应用弹窗统一采用图标标题栏、深蓝圆角面板、分区卡片和青色主按钮；连接配置使用 SSH / 串口页签，支持选择私钥文件。长内容可滚动，缩放、最小化恢复后仍保持完整布局；浅色主题使用同一套布局。
-- 保留底部状态栏、退出状态、错误信息、文件入口和转发状态。
-
-## SSH、文件与传输
-
-内置 `russh` / `russh-sftp` / Tokio；GUI SSH 不依赖本机 OpenSSH。支持密码和私钥（包括私钥口令）认证。首次连接显示主机指纹，确认后记录到 `~/.ssh/known_hosts`；已知主机密钥变化会拒绝连接。密码不写入配置。
-
-连接编辑器提供单级 ProxyJump 和多条本地转发规则。转发仅监听 `127.0.0.1`，可查看状态并停止全部转发。**打开连接时会先自动尝试一次免密认证** —— 只用私钥或服务器本身不需要认证的场合，点一下就进去了，不再需要先点「连接」；失败才展开用户名 / 密码 / 私钥字段，并显示每个方法失败的原因，等待期间可以取消。启动时会读取 `~/.ssh/config`：只导入带 `HostName` 的 `Host` 块，`Host` 上的每个别名各成为一条连接，显示在侧栏只读的 **SSH-CONFIG** 分组里，可双击连接或「保存到连接」。当前不支持多跳链、远程转发、动态 SOCKS、`Include`、SSH agent 或键盘交互 MFA。SFTP 子系统在首次打开文件窗口时按需建立，服务器未启用 SFTP 不影响连接和终端；此前的版本在建立连接时就会初始化 SFTP，无 SFTP 的服务器会白等一个超时。
-
-界面图标（侧栏、菜单、标签栏、文件窗口按钮、状态栏）都是代码手绘的矢量图形，不依赖字体 —— 字体链里没有可靠的字形，用字符会显示成方框。窗口 / 任务栏图标同样是代码生成的；exe 文件图标由 `build.rs` 生成 `.ico` 后交给 Windows SDK 的 `rc.exe` 编译，**不引入任何构建期依赖**，且在没有 SDK 的 GNU 工具链上会静默跳过（只影响资源管理器里的图标，不影响构建）。
-
-文件窗口以两个表格展示本地和远程目录（名称 / 大小 / 权限 / 修改时间；Windows 本地表没有权限列，因为没有 POSIX 权限位），每行带文件类型图标（目录、文本、代码、图片、压缩包、音视频、二进制），符号链接在图标左下角加一个快捷方式角标。支持进入目录、刷新、建远程目录、重命名、上传和下载（单文件或**整个目录**）。**双击文件直接在系统默认程序里打开**，双击目录进入。两栏各有右键菜单：打开、编辑、上传 / 下载、重命名、删除、复制路径、属性。删除文件和空目录直接执行，非空目录需确认后递归删除，且不跟随符号链接。本地栏默认打开系统下载目录，地址栏提供上一级和主目录快捷按钮。
-
-远程文件的**属性**窗口可以直接改权限：九位权限勾选框（所有者 / 用户组 / 其他 × 读 / 写 / 执行）、setuid / setgid / sticky，实时显示八进制值；所有者与用户组可填数字 id 或名字（名字由服务器上的 `id` / `getent` 解析）；可选**递归**应用到目录下所有内容 —— 勾了递归会先遍历统计条目数并让你确认，因为递归 chmod 是最容易造成不可逆后果的操作之一。macOS 与 Linux 上**本地文件也有同一套权限编辑**（用 `std::fs` 直接 chmod，符号链接会跳过以免改到链接目标；递归时先改内容再改目录，否则去掉目录的执行位后就进不去了）；本地不提供所有者 / 用户组（改属主需要 root），符号链接本身也只显示不可编辑。Windows 本地文件没有这一区。
-
-权限和所有者是**分两次请求**发的。SFTP 协议把两者放在同一个 SETSTAT 里，但服务器对非 root 用户会拒绝其中的所有者部分 —— 合成一次的话，这个拒绝会把权限修改一起带下去。分开之后权限照常生效，失败信息会说明只有所有者没改。
-
-目录传输会先遍历源树、在目标侧建好缺失的目录，再把每个文件排进队列；遍历同样不跟随符号链接。
-
-传输队列每连接串行执行，运行中可暂停或取消，停止后可继续（暂停和失败共用同一个继续入口）。取消只把该条移出队列，已传的断点文件保留，重新加入同一文件仍可续传。目录传输在队列里占一行聚合进度（已完成/总数、总体字节），下面只显示**当前正在传的那一个文件** —— 未开始和已完成的文件不显示，免得长目录把正在跑的埋掉。
-
-一批传输全部结束时，文件窗口会汇总完成、跳过／取消和失败的数量；失败汇总用错误色显示。队列中的单项结果仍短暂保留，便于定位具体文件。
-
-目标已存在时会弹冲突对话框，可选：覆盖、本批全部覆盖、自动重命名、本批全部重命名、跳过这个文件、本批全部跳过、取消剩余任务。「全部」的作用范围是**本次这一批**（选一个目录算一批），下一次操作会重新询问；批内文件数只有 1 时「全部」按钮会置灰。自动重命名取 `名称 (1).扩展名` 的第一个可用编号，只改接收端 —— 发送端是源文件，名字不动。
-
-传输结束（整批传完）后会自动刷新目标那一栏的列表，前提是你还停在那个目录；中途切走就不打扰。续传使用 `.gterminal.part` 临时文件，先逐字节校验已有前缀，再追加剩余内容。重启后临时文件保留，需要重新选择同一源和目标加入队列。下载提交使用硬链接，需要 NTFS 等支持硬链接的文件系统。不支持持久化队列或自动同步。
-
-「打开」交给系统默认关联程序，「编辑」用文本编辑器（Windows 默认 `notepad.exe`，可被 `%EDITOR%` / `$VISUAL` 覆盖）。远程文件先取到临时目录再打开；编辑模式下会持续监视该临时文件，一有改动就回传覆盖远程原文件。
-
-ZMODEM 使用独立 SSH 二进制通道，文件窗口中选择文件后显式发送 / 接收；远端需安装 `rz` / `sz`。**在终端里直接敲 `rz` 或 `sz` 也可以**：识别到 ZMODEM 帧头后会弹窗让你选文件（`rz` 是上传，`sz` 是下载），判断依据是帧类型而不是屏幕文字。支持单文件，大小小于 4 GiB。下载续传用 `.zmodem.part`，与 SFTP 一样在冲突对话框里提供「续传」；上传用 `rz --protect`，接收端已有同名文件时不会覆盖。
-
-远程 Agent **仅预留协议**：版本 1、4 字节大端长度前缀、JSON 请求/响应、1 MiB 帧限制，预留 Hello / SystemInfo / Cancel。没有部署、启动服务端或开放端口。
-
-## 终端能力与边界
-
-| 能力 | 当前支持范围 |
+| 能力 | 范围 |
 | --- | --- |
-| VT / xterm | 光标、擦除、16/256/RGB 色、备用屏幕、应用光标键、光标位置查询、括号粘贴等；基于 vt100，尚非完整 xterm 实现 |
-| 鼠标 | legacy、UTF-8、SGR 坐标编码，按钮、移动、拖动和滚轮；Shift 绕过上报进行选择 |
-| 图像 | OSC 1337 inline PNG，限制解码尺寸和内存，只保留最近一张图像；不支持 Kitty / Sixel，也不将图片保留到滚动历史 |
-| 文字 | 中文宽字符和字体回退；cosmic-text 高级 shaping、Swash 字形栅格化及彩色字体 Emoji，依赖系统字体；界面上中文字体回退按平台做了基线微调（macOS 实测下移 0.25 em，与拉丁字体对齐），复杂双向文字、组合 Emoji 的终端单元格定位仍有兼容边界 |
-| 输入法 | IME 预编辑、提交与候选窗位置接入；提交（如拼音回车/选词）时那一次回车不会同时发给 Shell；尚未完成各输入法、多屏 DPI 的实机矩阵验证 |
-| 无障碍 | 启用 AccessKit，终端可见文本提供可访问标签；尚未完成 Narrator 验收、逐行输出播报和完整终端读屏导航 |
-
-默认保留每会话 10,000 行输出。普通屏幕选区可跨滚动历史，滚动和正常输出后仍保留；清屏或调整尺寸会清除选区。备用屏幕没有历史选区。终端和文件列表只创建可见内容的绘制控件，shaping 纹理缓存限制 256 项 / 16 MiB。Windows 启动内存可用 `scripts/measure-memory.ps1` 复测；界面帧耗时可用下文的可选基准复测。
+| VT / xterm | 光标、擦除、16 / 256 / RGB 色、备用屏、应用光标键、光标查询、括号粘贴；基于 vt100，非完整 xterm |
+| 鼠标 | legacy / UTF-8 / SGR；Shift 绕过上报进行选择 |
+| 图像 | OSC 1337 内联 PNG（限尺寸与内存，只留最近一张；不支持 Kitty / Sixel） |
+| 文字 | 中文宽字符与字体回退；cosmic-text shaping + swash 栅格化；macOS 中文基线已对齐拉丁字体 |
+| 输入法 | IME 预编辑 / 提交 / 候选位置；提交时那一次回车不会发给 Shell |
+| 无障碍 | AccessKit 提供可见文本标签（未做读屏播报验收） |
 
 ## 快捷键
 
 | 快捷键 | 操作 |
 | --- | --- |
-| Ctrl+Shift+T | 新建标签 |
-| Ctrl+Shift+W | 关闭当前窗格，最后一个窗格关闭标签 |
-| Ctrl+Tab | 下一个标签 |
-| Ctrl+Shift+D / Ctrl+Shift+E | 左右 / 上下分屏 |
-| Alt+Right | 切换窗格 |
-| Ctrl+Shift+C | 复制选区 |
-| Ctrl+Shift+V / Ctrl+V / 鼠标中键 | 粘贴 |
-| Ctrl+C | 发送 Shell 中断 |
-| Ctrl+Shift+F | 搜索当前窗格保留的全部历史 |
+| Ctrl+Shift+T / W | 新建标签 / 关闭窗格 |
+| Ctrl+Shift+D / E | 左右 / 上下分屏 |
+| Ctrl+Tab / Alt+Right | 切换标签 / 窗格 |
+| Ctrl+Shift+C / V、Ctrl+V、中键 | 复制 / 粘贴 |
+| Ctrl+C | Shell 中断 |
+| Ctrl+Shift+F | 历史查找 |
 | Shift+PageUp / PageDown | 翻阅历史 |
-| Ctrl+Plus / Minus / 0 | 放大 / 缩小 / 重置字号 |
-| Ctrl+Comma | 设置 |
-| Ctrl+Shift+B | 展开 / 收起侧栏 |
+| Ctrl+Plus / Minus / 0 | 字号放大 / 缩小 / 重置 |
+| Ctrl+, / Ctrl+Shift+B | 设置 / 侧栏 |
 
-关闭窗格终止对应 Shell。粘贴发送给当前 Shell，含换行的文本可能执行；单次粘贴限制 1 MiB。
+关闭窗格终止对应 Shell；粘贴可能执行换行文本，单次 ≤ 1 MiB。
+macOS 上 `Ctrl` 对应 `Cmd`、`Alt` 对应 `Option`；`Ctrl+C` 仍是中断、`Ctrl+Tab` 仍切换标签（`Cmd+Tab` 被系统占用）。
 
-macOS 上表里的 `Ctrl` 对应 `Cmd`（复制 / 粘贴为 `Cmd+C` / `Cmd+V`）；`Ctrl+C` 仍是发送 Shell 中断，`Ctrl+Tab` 仍切换标签，因为 `Cmd+Tab` 被系统占用。`Alt` 是 macOS 的 **Option** 键，界面上按平台显示为 `Option+C` / `Option+R` 等（用文字而非 `⌥`，因为系统 UI 字体链里没有该符号，会变方框）。
+## 构建与运行
+
+需要 Rust ≥ 1.88（验证 1.98.1）。
+
+Windows（MSVC，与发布包一致；或 mingw 工具链）：
+
+```powershell
+./scripts/build.ps1 -Action build -Release
+./scripts/package.ps1
+```
+
+macOS（只需 Command Line Tools 和 rustup，直接用 cargo）：
+
+```sh
+cargo run --release
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+./scripts/package-macos.sh   # 产出 .app 与 tar.gz + SHA256
+```
+
+发布包内含第三方许可，旁附 SHA256 校验文件。
 
 ## 配置与架构
 
-Windows 配置通常位于 `%APPDATA%\gterminal\G-Terminal\config\settings.json`，macOS 位于 `~/Library/Application Support/gterminal/G-Terminal/config/settings.json`，以设置页显示的实际路径为准。旧版配置自动补充新字段；设置历史上限对新会话生效。
+配置：Windows `%APPDATA%\gterminal\G-Terminal\config\settings.json`，macOS `~/Library/Application Support/dev.gterminal.G-Terminal/settings.json`（以设置页显示的实际路径为准）；旧配置自动补充新字段。
 
-`native_dx11.rs` 管理 Windows 窗口、D3D11、截图及 egui-winit 输入/AccessKit 桥接；`app.rs` 管理布局与持久化，`layout.rs` 管理分屏树；`view.rs` / `shaping.rs` 渲染终端；`terminal.rs` / `graphics.rs` 解析输出；`session.rs` 连接 ConPTY 或原生 SSH 通道；`remote.rs` / `remote_ui.rs` 实现 SSH、SFTP、转发及文件界面；`ztransfer.rs` 实现 ZMODEM；`agent.rs` 定义预留协议。
+渲染：Windows 走 `native_dx11.rs`（D3D11），其余平台走 eframe / wgpu。界面在 `app/`，分屏树 `layout.rs`；终端解析 `terminal.rs` / `graphics.rs`，绘制 `view/` / `shaping.rs`；会话 `session/`；SSH / SFTP `remote/` 与 `remote_ui/`；ZMODEM `ztransfer.rs`。
+
+## 边界
+
+- SSH：不支持多跳链、远程转发、动态 SOCKS、`Include`、SSH agent、键盘交互 MFA。
+- 传输：队列不持久化、不自动同步；下载提交依赖硬链接。
+- 终端：不支持 Kitty / Sixel；普通屏选区可跨历史，备用屏不跨屏。
+- 平台：Linux 未实机验证；macOS 包未签名，首次打开需右键「打开」。
 
 ## 验证
 
-```powershell
-cargo fmt --check
-./scripts/build.ps1 -Action clippy
-./scripts/build.ps1 -Action test
-./scripts/build.ps1 -Action test -Release -BenchUi
-```
+`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（120+ 项：真实 ConPTY、SSH / SFTP、ZMODEM、图标与手势等）。
 
-`-BenchUi` 运行可选的合成界面基准，输出空闲、持续输出、滚动历史、多标签、输入以及 1 万文件行的 p50 / p95 帧耗时。文件行基准同时报告完整构造与只构造可见行，方便在同一机器上对照；它不包含磁盘扫描、SFTP 网络耗时或真实鼠标到显示器的端到端延迟。
+截图冒烟：`g-terminal --screenshot <png>`（约 4 秒后截图退出，不加载 / 写入工作区）；可用 `GTERMINAL_SCREENSHOT_VIEW=menu|settings|connection|serial|login|help|groups|confirm` 打开对应弹窗，`GTERMINAL_SCREENSHOT_LIGHT=1` 检查浅色主题。
 
-测试覆盖真实 Windows PowerShell / CMD ConPTY、键盘路由、嵌套布局恢复、自动复制、滚动历史查找、鼠标编码与多击手势判定，以及本机临时 SSH 服务器上的认证、主机密钥变化拒绝、ProxyJump、本地转发、SFTP 双向断点续传、冲突处理（重命名后临时文件落在新名字上、批内「全部」生效且不跨批泄漏、跳过与取消的收尾）、目录遍历与建树、递归删除和符号链接处理、权限修改（chmod 改完能读回、被拒的 chown 不会带走 chmod）。另有 ZMODEM 帧头探测（`rz` 与 `sz` 两侧、跨读取分片、不被屏幕转义误判）、图标光栅化（每个图形在每种尺寸下都画出内容）、本地目录排序与队列裁剪。ZMODEM 使用真实协议完成二进制往返测试。测试不连接用户远程服务器；真实 OpenSSH / lrzsz、读屏及不同系统彩色字体仍需实际环境验收。
-
-原生窗口截图冒烟检查（约四秒后截图并退出，不加载或写入已保存的工作区）：
-
-```powershell
-./target/release/g-terminal.exe --screenshot D:/path/to/window.png
-```
-
-截图时可临时设置 `GTERMINAL_SCREENSHOT_VIEW=settings|connection|serial` 打开对应弹窗，或设 `GTERMINAL_SCREENSHOT_LIGHT=1` 检查浅色主题；这些参数只在截图模式生效，截图模式不保存设置。
-
-
-## 0.2.1 启动内存修复
-
-上一版使用 wgpu 默认的性能优先分配策略，且 epaint 将拥有所有权的系统字体数据完整复制到字体解析器。0.2.1 改为 `MemoryHints::MemoryUsage`、一帧排队目标，系统字体通过进程内 OnceLock 保存单份字节并以静态借用交给 epaint。没有裁掉中文、历史、分屏或 SSH 功能，也没有调用工作集清理 API 制造较低读数。
-
-2026-09-13，本机 Windows、AMD Radeon(TM) Graphics、驱动 32.0.21043.12001，Release，1280×800 逻辑窗口 / 1920×1200 截图、一个默认 PowerShell、未连接远程。每版启动三次，采样启动后约 3.2 秒、截图读回之前的数据：
-
-| 主进程指标（MiB） | 0.2.0 三次 | 0.2.1 三次 | 中位数变化 |
-| --- | --- | --- | --- |
-| 工作集 | 264.7 / 265.2 / 264.7 | 173.1 / 172.4 / 172.6 | 264.7 → 172.6，下降 34.8% |
-| 私有提交 | 241.2 / 241.3 / 241.3 | 144.1 / 143.2 / 143.4 | 241.3 → 143.4，下降 40.6% |
-
-工作集包含进程驻留的共享页，私有提交不是任务管理器的“专用工作集”；两者不可混用。这里均不包含 PowerShell / ConHost 子进程或独立统计的 GPU 显存，不代表任务管理器折叠进程组的总数。驱动、DPI、窗口面积和字体会影响结果。这是启动烟测，不能据此证明长时间运行无泄漏或所有场景低延迟。
-
-复测：`./scripts/measure-memory.ps1 -Executable ./target/release/g-terminal.exe -Runs 3`。脚本输出四个启动阶段样本，使用最后一个作比较；截图模式不加载或写回工作区，结束后删除临时截图。原始本机样本保存在 `dist/memory-baseline.csv` 和 `dist/memory-optimized.csv`。
-
-## 0.2.2 原生 Windows 渲染与字体按需加载
-
-Windows 默认切换到 Direct3D 11，使用两个与窗口实际尺寸一致的翻转交换链缓冲，保留 GPU 渲染。窗口事件、键盘、剪贴板、IME、DPI 和 AccessKit 继续通过 egui-winit 接入。硬件设备创建失败时使用系统 WARP；非 Windows 平台仍采用 eframe/wgpu。渲染器采用 [egui-directx11 0.12.0](https://docs.rs/egui-directx11/0.12.0/egui_directx11/)，兼容现有 egui 0.33 界面。
-
-Windows 字体改为只读文件映射，页面按需读取，不再把整个微软雅黑字体集合放进私有堆。文件句柄在使用期间禁止写入/删除共享，以保证映射内容稳定。保留完整字体与原有功能，不预删中文字形，也不清空工作集或周期性调用内存回收 API 修改任务管理器读数。
-
-直接从构建目录启动，本机同样的 Release、1280×800 逻辑窗口 / 1920×1200 截图、一个默认 PowerShell、无 SSH 连接。3 次启动，取约 3.2 秒、截图读回之前的样本（单位 MiB）：
-
-| 主进程指标 | 第 1 次 | 第 2 次 | 第 3 次 |
-| --- | --- | --- | --- |
-| 总工作集 | 50.2 | 50.2 | 50.2 |
-| 专用工作集 | 22.7 | 22.7 | 22.7 |
-| 私有提交 | 35.0 | 35.0 | 34.8 |
-
-相比 0.2.1 的总工作集中位数 172.6 MiB，本机下降约 71%；相比 0.2.0 的 264.7 MiB，下降约 81%。新增专用工作集采样使用 Windows QueryWorkingSet 遍历驻留页面，仅统计非共享页，不将 PrivateMemorySize64 的私有提交误称为任务管理器专用工作集。数据不含 PowerShell/ConHost 子进程与独立统计的显存；不同显卡驱动、窗口大小、输出与字体使用会改变结果。Windows Terminal 的“10 MB”没有在本次任务中用相同条件复测，不据此作直接比较。
-
-原始数据：`dist/memory-v022.csv`。采样脚本仍为 `scripts/measure-memory.ps1`，新增 `PrivateWorkingMiB` 列。Windows 原生缩放、最小化、恢复及截图检查使用 `scripts/smoke-window.ps1`；它只操作自行启动的测试窗口，不改变用户配置。已通过这些烟测、19 项功能测试、Clippy 和格式检查。真实输入法、多屏 DPI 和读屏器的完整验收范围未扩大。
-
-如果特定驱动在新渲染器上出现问题，可在 PowerShell 中只为当前启动会话使用旧路径：
-
-```powershell
-$env:GTERMINAL_RENDERER = 'wgpu'
-./g-terminal.exe
-Remove-Item Env:GTERMINAL_RENDERER
-```
-
-默认渲染路径不受 WGPU_BACKEND 影响；该变量只在选择 wgpu 回退路径时适用。
-
-### 交付便携包的复测
-
-将同一 EXE 打包后，从 `dist/G-Terminal-0.2.2-windows-x64/g-terminal.exe` 再启动三次，测得总工作集 **63.0 / 63.5 / 63.8 MiB**、专用工作集 **28.1 / 28.6 / 28.9 MiB**、私有提交 **41.3 / 42.1 / 42.4 MiB**。EXE 哈希与构建目录相同；观测到的启动差异尚未归因，交付结果采用这组更保守的数据。相比上版总工作集中位数 172.6 MiB，便携包的 63.5 MiB 下降约 **63%**，落在本次要求的 40–80 MB 范围。原始数据为 `dist/memory-v022-packaged.csv`。
+Windows 启动内存约 50 MiB（Release、一个 PowerShell、D3D11 + 字体按需映射），复测脚本 `scripts/measure-memory.ps1`。数据为启动烟测，不含子进程与显存。
