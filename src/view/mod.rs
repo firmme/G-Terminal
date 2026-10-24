@@ -3,6 +3,7 @@ use eframe::egui::{
     self, Align2, Color32, Event, FontId, ImeEvent, Key, Pos2, Rect, Sense, Stroke, StrokeKind,
     Vec2,
 };
+use g_terminal::LockExt;
 use g_terminal::{
     config::{search_engine_label, search_url},
     input::{encode_key, encode_mouse, encode_paste},
@@ -143,7 +144,7 @@ impl Pane {
         let mut outgoing = Vec::<Vec<u8>>::new();
         let mut copied = None;
         let mut notice = None;
-        let mut terminal = self.session.terminal.lock().unwrap();
+        let mut terminal = self.session.terminal.locked();
         if self.selection_epoch != terminal.selection_epoch {
             self.selection = None;
             self.selection_epoch = terminal.selection_epoch;
@@ -757,16 +758,25 @@ impl Pane {
         let selection = self.selection;
         if !mouse {
             response.context_menu(|ui| {
+                use crate::icons::{Icon, icon_row};
+                let p = palette;
+                ui.set_min_width(240.0);
                 if ui
-                    .button(format!(
-                        "复制选中内容   {}",
-                        crate::app::accel("Ctrl+Shift+C")
-                    ))
+                    .add_enabled_ui(selection.is_some(), |ui| {
+                        icon_row(
+                            ui,
+                            Icon::Copy,
+                            "复制",
+                            Some(&crate::app::accel("Ctrl+Shift+C")),
+                            p,
+                        )
+                    })
+                    .inner
                     .clicked()
                 {
                     if let Some((a, b)) = selection {
                         let text = {
-                            let mut terminal = self.session.terminal.lock().unwrap();
+                            let mut terminal = self.session.terminal.locked();
                             selection_text_history(terminal.parser.screen_mut(), a, b)
                         };
                         notice = Some(moved_message("复制", &text));
@@ -774,14 +784,19 @@ impl Pane {
                     }
                     ui.close();
                 }
-                if ui.button("复制可见屏幕").clicked() {
+                if icon_row(ui, Icon::Copy, "复制整屏", None, p).clicked() {
                     notice = Some(moved_message("复制", &visible_text));
                     ui.ctx().copy_text(visible_text);
                     ui.close();
                 }
-                if ui
-                    .button(format!("粘贴   {}", crate::app::accel("Ctrl+Shift+V")))
-                    .clicked()
+                if icon_row(
+                    ui,
+                    Icon::FileText,
+                    "粘贴",
+                    Some(&crate::app::accel("Ctrl+Shift+V")),
+                    p,
+                )
+                .clicked()
                 {
                     match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
                         Ok(text) => {
@@ -789,8 +804,7 @@ impl Pane {
                             let bracketed = self
                                 .session
                                 .terminal
-                                .lock()
-                                .unwrap()
+                                .locked()
                                 .parser
                                 .screen()
                                 .bracketed_paste();
@@ -803,18 +817,21 @@ impl Pane {
                 // A lookup of the selection, in the configured engine. It is the
                 // one action here that leaves the app, so it lives on its own.
                 if ui
-                    .add_enabled(
-                        selection.is_some(),
-                        egui::Button::new(format!(
-                            "浏览器搜索选中内容（{}）",
-                            search_engine_label(search_engine)
-                        )),
-                    )
+                    .add_enabled_ui(selection.is_some(), |ui| {
+                        icon_row(
+                            ui,
+                            Icon::Search,
+                            &format!("用 {} 搜索", search_engine_label(search_engine)),
+                            None,
+                            p,
+                        )
+                    })
+                    .inner
                     .clicked()
                 {
                     if let Some((a, b)) = selection {
                         let text = {
-                            let mut terminal = self.session.terminal.lock().unwrap();
+                            let mut terminal = self.session.terminal.locked();
                             selection_text_history(terminal.parser.screen_mut(), a, b)
                         };
                         let query = text.trim();
@@ -834,23 +851,23 @@ impl Pane {
                     }
                     ui.close();
                 }
-                if ui.button("滚动到底部").clicked() {
-                    self.session.terminal.lock().unwrap().bottom();
+                if icon_row(ui, Icon::ArrowDown, "滚到底部", None, p).clicked() {
+                    self.session.terminal.locked().bottom();
                     ui.close();
                 }
                 ui.separator();
                 // Ways to tidy up: 清屏 keeps the scrollback, 清空 throws the
                 // whole transcript away, and images are dropped on their own.
-                if ui.button("清屏").clicked() {
-                    self.session.terminal.lock().unwrap().clear_screen();
+                if icon_row(ui, Icon::Close, "清屏（保留历史）", None, p).clicked() {
+                    self.session.terminal.locked().clear_screen();
                     ui.close();
                 }
-                if ui.button("清空所有控制台输出").clicked() {
-                    self.session.terminal.lock().unwrap().clear_all();
+                if icon_row(ui, Icon::Trash, "清空全部输出", None, p).clicked() {
+                    self.session.terminal.locked().clear_all();
                     ui.close();
                 }
-                if ui.button("清除内联图片").clicked() {
-                    self.session.terminal.lock().unwrap().graphics.clear();
+                if icon_row(ui, Icon::FileImage, "清除内联图片", None, p).clicked() {
+                    self.session.terminal.locked().clear_graphics();
                     self.graphic = None;
                     ui.close();
                 }

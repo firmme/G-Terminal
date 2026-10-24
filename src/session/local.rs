@@ -2,6 +2,7 @@
 //! write into.
 
 use super::*;
+use crate::LockExt;
 
 impl Session {
     /// The screen a new session writes into: the previous one when reconnecting,
@@ -14,10 +15,7 @@ impl Session {
     ) -> Arc<Mutex<Terminal>> {
         match previous {
             Some(terminal) => {
-                terminal
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .recycle(rows, cols);
+                terminal.locked().recycle(rows, cols);
                 terminal
             }
             None => Arc::new(Mutex::new(Terminal::new(rows, cols, scrollback))),
@@ -88,17 +86,7 @@ impl Session {
                         break;
                     }
                     Ok(n) => {
-                        reader_traffic.add_down(n);
-                        let replies = {
-                            let mut terminal =
-                                output_terminal.lock().unwrap_or_else(|e| e.into_inner());
-                            if terminal.process(&bytes[..n]) {
-                                reader_traffic
-                                    .bell
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            std::mem::take(&mut terminal.parser.callbacks_mut().replies)
-                        };
+                        let replies = feed(&output_terminal, &reader_traffic, &bytes[..n]);
                         if !replies.is_empty() {
                             let _ = reply_sender.try_send(Control::Write(replies));
                         }
@@ -117,7 +105,7 @@ impl Session {
                     }
                 }
             }
-            output_status.lock().unwrap().eof = true;
+            output_status.locked().eof = true;
             output_wake();
         });
 
@@ -154,10 +142,9 @@ impl Session {
                     Ok(Control::Write(bytes)) => pending.extend_from_slice(&bytes),
                     // The device has no size, but the terminal still has to
                     // follow the pane. No ZMODEM channel is ever opened here.
-                    Ok(Control::Resize(size)) => control_terminal
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .resize(size.rows, size.cols),
+                    Ok(Control::Resize(size)) => {
+                        control_terminal.locked().resize(size.rows, size.cols)
+                    }
                     Ok(Control::ZmodemBridge { .. }) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -172,7 +159,7 @@ impl Session {
             kind: SessionKind::Serial(profile),
             pid: None,
             size,
-            input,
+            input: Input::Sync(input),
             stop,
             killer: None,
             remote: None,
@@ -242,17 +229,7 @@ impl Session {
                 match reader.read(&mut bytes) {
                     Ok(0) => break,
                     Ok(n) => {
-                        output_traffic.add_down(n);
-                        let replies = {
-                            let mut terminal =
-                                output_terminal.lock().unwrap_or_else(|e| e.into_inner());
-                            if terminal.process(&bytes[..n]) {
-                                output_traffic
-                                    .bell
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            std::mem::take(&mut terminal.parser.callbacks_mut().replies)
-                        };
+                        let replies = feed(&output_terminal, &output_traffic, &bytes[..n]);
                         if !replies.is_empty() {
                             let _ = reply_sender.try_send(Control::Write(replies));
                         }
@@ -268,7 +245,7 @@ impl Session {
                     }
                 }
             }
-            output_status.lock().unwrap().eof = true;
+            output_status.locked().eof = true;
             output_wake();
         });
         let control_stop = stop.clone();
@@ -291,12 +268,9 @@ impl Session {
                                 }
                                 written
                             }
-                            Control::Resize(size) => master.resize(size).map(|_| {
-                                control_terminal
-                                    .lock()
-                                    .unwrap()
-                                    .resize(size.rows, size.cols)
-                            }),
+                            Control::Resize(size) => master
+                                .resize(size)
+                                .map(|_| control_terminal.locked().resize(size.rows, size.cols)),
                             Control::ZmodemBridge { .. } => Ok(()),
                         };
                         if let Err(e) = result {
@@ -320,14 +294,10 @@ impl Session {
             match child.wait() {
                 Ok(exit) => {
                     let code = exit.exit_code();
-                    wait_status
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .exit_code = Some(code);
+                    wait_status.locked().exit_code = Some(code);
                     if code != 0 {
                         wait_terminal
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
+                            .locked()
                             .note(&format!("进程已退出（退出码 {code}）"));
                     }
                 }
@@ -342,7 +312,7 @@ impl Session {
             kind,
             pid,
             size: (size.rows, size.cols),
-            input,
+            input: Input::Sync(input),
             stop,
             killer: Some(killer),
             remote: None,

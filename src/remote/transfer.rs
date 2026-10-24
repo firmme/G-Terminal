@@ -2,6 +2,7 @@
 //! and cancels.
 
 use super::*;
+use crate::LockExt;
 
 /// One file a directory transfer will move. The size is known before anything
 /// starts, which is what lets the queue show aggregate progress up front.
@@ -409,7 +410,7 @@ impl Transfer {
             .store(true, std::sync::atomic::Ordering::Release);
     }
     pub fn start(&self, wake: Wake) {
-        if self.state.lock().unwrap().running {
+        if self.state.locked().running {
             return;
         }
         use std::sync::atomic::Ordering;
@@ -417,7 +418,7 @@ impl Transfer {
         self.cancel.store(false, Ordering::Release);
         self.skipped.store(false, Ordering::Release);
         self.active.store(false, Ordering::Release);
-        self.state.lock().unwrap().running = true;
+        self.state.locked().running = true;
         let control = TransferControl {
             pause: self.pause.clone(),
             cancel: self.cancel.clone(),
@@ -453,7 +454,7 @@ impl Transfer {
             let cancelled = control.cancel.load(Ordering::Acquire);
             let skipped = control.skipped.load(Ordering::Acquire);
             active.store(false, Ordering::Release);
-            let mut s = state.lock().unwrap();
+            let mut s = state.locked();
             s.running = false;
             match result {
                 Ok(()) => {
@@ -475,7 +476,7 @@ impl Transfer {
                 }
             }
             drop(s);
-            *settled_at.lock().unwrap() = Some(std::time::Instant::now());
+            *settled_at.locked() = Some(std::time::Instant::now());
             settled.store(true, Ordering::Release);
             wake();
         });

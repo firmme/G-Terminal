@@ -7,20 +7,48 @@ pub(super) enum Control {
     Resize(PtySize),
     /// Route raw session bytes through a terminal-initiated ZMODEM transfer.
     ZmodemBridge {
-        to_transfer: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        to_transfer: tokio::sync::mpsc::Sender<Vec<u8>>,
         from_transfer: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     },
 }
 
+/// Where a session's input goes: a worker thread for local shells and serial
+/// ports, the async channel pump for SSH.
+pub(super) enum Input {
+    Sync(SyncSender<Control>),
+    Async(tokio::sync::mpsc::Sender<Control>),
+}
+
+/// Why a control message could not be queued.
+pub(super) enum SendError {
+    Full,
+    Closed,
+}
+
+impl Input {
+    pub(super) fn try_send(&self, control: Control) -> Result<(), SendError> {
+        match self {
+            Self::Sync(sender) => sender.try_send(control).map_err(|e| match e {
+                mpsc::TrySendError::Full(_) => SendError::Full,
+                mpsc::TrySendError::Disconnected(_) => SendError::Closed,
+            }),
+            Self::Async(sender) => sender.try_send(control).map_err(|e| match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => SendError::Full,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => SendError::Closed,
+            }),
+        }
+    }
+}
+
 pub(super) type ZmodemBridge = (
-    tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    tokio::sync::mpsc::Sender<Vec<u8>>,
     tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 );
 
 /// A ZMODEM endpoint wired into a live session channel: data arriving from the
 /// remote host is read here, and frames written here are sent back to it.
 pub struct BridgeStream {
-    pub(super) rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pub(super) rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     pub(super) tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     pub(super) buffer: Vec<u8>,
     pub(super) position: usize,

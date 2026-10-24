@@ -30,6 +30,9 @@ pub struct Release {
     pub notes: String,
     pub asset: Option<String>,
     pub asset_name: Option<String>,
+    /// The `<asset>.sha256` file published beside the archive. Without it the
+    /// download cannot be verified, so it is not installed.
+    pub checksum: Option<String>,
 }
 
 pub fn current_version() -> &'static str {
@@ -71,8 +74,16 @@ fn parse_latest(json: &str, current: &str) -> Result<Status, String> {
         });
     }
 
-    let asset = asset_suffix().and_then(|suffix| {
-        let expected = format!("G-Terminal-{version}-{suffix}");
+    let expected = asset_suffix().map(|suffix| format!("G-Terminal-{version}-{suffix}"));
+    let checksum = expected.as_ref().and_then(|expected| {
+        let name = format!("{expected}.sha256");
+        latest
+            .assets
+            .iter()
+            .find(|asset| asset.name == name)
+            .map(|asset| asset.browser_download_url.clone())
+    });
+    let asset = expected.and_then(|expected| {
         latest
             .assets
             .into_iter()
@@ -86,6 +97,7 @@ fn parse_latest(json: &str, current: &str) -> Result<Status, String> {
             .as_ref()
             .map(|asset| asset.browser_download_url.clone()),
         asset_name: asset.map(|asset| asset.name),
+        checksum,
     }))
 }
 
@@ -124,9 +136,12 @@ fn asset_suffix() -> Option<&'static str> {
     }
 }
 
-/// Downloads an asset into a per-run directory under the temp dir and returns
-/// the file path.
-pub fn download(url: &str, name: &str) -> Result<PathBuf, String> {
+/// Downloads an asset into a per-run directory under the temp dir, checks it
+/// against the published SHA-256 and returns the file path. A mismatch deletes
+/// the file: nothing unverified is ever extracted.
+pub fn download(url: &str, name: &str, checksum_url: &str) -> Result<PathBuf, String> {
+    let expected =
+        parse_checksum(&curl(checksum_url)?).ok_or_else(|| "校验文件格式不正确".to_string())?;
     let dir = update_dir()?;
     let path = dir.join(name);
     let status = Command::new("curl")
@@ -138,7 +153,38 @@ pub fn download(url: &str, name: &str) -> Result<PathBuf, String> {
     if !status.success() {
         return Err(format!("下载失败（curl {status}）"));
     }
+    if sha256_file(&path)? != expected {
+        let _ = std::fs::remove_file(&path);
+        return Err("下载文件校验失败，已删除".into());
+    }
     Ok(path)
+}
+
+/// The hex digest at the start of a `sha256sum`-style line, lowercased.
+fn parse_checksum(text: &str) -> Option<String> {
+    let digest = text.split_whitespace().next()?.to_ascii_lowercase();
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let read_error = |e: std::io::Error| format!("无法读取下载文件：{e}");
+    let mut file = std::fs::File::open(path).map_err(read_error)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer).map_err(read_error)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 fn update_dir() -> Result<PathBuf, String> {
@@ -237,14 +283,27 @@ fn swap(dir: &Path) -> Result<(), String> {
         .ok_or_else(|| "下载包里没有找到 g-terminal.exe".to_string())?;
     let current = std::env::current_exe().map_err(|e| e.to_string())?;
     let batch = dir.join("apply.bat");
+    let failed = dir.join("update-failed.txt");
+    // The exe stays locked while any window of it is open, so the move is
+    // retried for about 20 s. Only a successful move relaunches; a failure is
+    // left in a note beside the download instead of silently restarting the
+    // old version.
     let body = format!(
         "@echo off\r\n\
+         set tries=0\r\n\
+         :retry\r\n\
          ping 127.0.0.1 -n 3 >nul\r\n\
-         move /y \"{}\" \"{}\"\r\n\
-         start \"\" \"{}\"\r\n",
-        new_exe.display(),
-        current.display(),
-        current.display(),
+         move /y \"{new}\" \"{current}\" >nul 2>&1\r\n\
+         if not errorlevel 1 goto done\r\n\
+         set /a tries+=1\r\n\
+         if %tries% lss 10 goto retry\r\n\
+         echo Could not replace g-terminal.exe. Close every G-Terminal window and update again.>\"{failed}\"\r\n\
+         exit /b 1\r\n\
+         :done\r\n\
+         start \"\" \"{current}\"\r\n",
+        new = new_exe.display(),
+        current = current.display(),
+        failed = failed.display(),
     );
     std::fs::write(&batch, body).map_err(|e| format!("无法写入更新脚本：{e}"))?;
     Command::new("cmd")
@@ -357,6 +416,31 @@ mod tests {
             }
             other => panic!("expected an available release, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_checksum_asset_is_found_and_parsed() {
+        let json = r#"{
+            "tag_name": "v9.9.9",
+            "html_url": "x",
+            "assets": [
+                {"name": "G-Terminal-9.9.9-windows-x64.zip", "browser_download_url": "https://example.com/win.zip"},
+                {"name": "G-Terminal-9.9.9-windows-x64.zip.sha256", "browser_download_url": "https://example.com/win.zip.sha256"},
+                {"name": "G-Terminal-9.9.9-macos-arm64.tar.gz", "browser_download_url": "https://example.com/mac.tar.gz"},
+                {"name": "G-Terminal-9.9.9-macos-arm64.tar.gz.sha256", "browser_download_url": "https://example.com/mac.tar.gz.sha256"}
+            ]
+        }"#;
+        if let Status::Available(release) = parse_latest(json, "0.4.1").unwrap()
+            && let Some(asset) = release.asset
+        {
+            assert_eq!(release.checksum, Some(format!("{asset}.sha256")));
+        }
+        let digest = "AB".repeat(32);
+        assert_eq!(
+            parse_checksum(&format!("{digest}  G-Terminal.zip\n")),
+            Some(digest.to_ascii_lowercase())
+        );
+        assert_eq!(parse_checksum("nothing useful"), None);
     }
 
     #[test]

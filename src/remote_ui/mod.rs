@@ -1,6 +1,7 @@
 use crate::editing;
 use crate::theme::Palette;
 use eframe::egui::{self, RichText};
+use g_terminal::LockExt;
 use g_terminal::{
     config::RemoteProfile,
     remote::{self, ConnectJob, Connection, Credentials, Direction, Transfer},
@@ -49,16 +50,13 @@ struct Operation {
 
 impl Operation {
     fn state(&self) -> ztransfer::Progress {
-        self.progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.progress.locked().clone()
     }
     fn outcome(&self) -> Option<Result<String, String>> {
-        self.result.lock().unwrap().clone()
+        self.result.locked().clone()
     }
     fn running(&self) -> bool {
-        self.result.lock().unwrap().is_none()
+        self.result.locked().is_none()
     }
 }
 
@@ -379,7 +377,7 @@ impl Files {
     /// repaints to keep turning for that whole time.
     pub fn loading(&self) -> bool {
         // Either pane still filling counts: both drive their own repaints.
-        self.directory.lock().unwrap().loading || self.local.lock().unwrap().loading
+        self.directory.locked().loading || self.local.locked().loading
     }
 
     /// Asks a running transfer to stop; it aborts the peer and cleans up.
@@ -401,7 +399,7 @@ impl Files {
         let state = self.local.clone();
         let wake = self.wake.clone();
         {
-            let mut state = state.lock().unwrap();
+            let mut state = state.locked();
             state.loading = true;
             state.error = None;
             state.path = path.clone();
@@ -410,7 +408,7 @@ impl Files {
         self.selected_local = None;
         remote::runtime().spawn_blocking(move || {
             let result = read_local(&path);
-            let mut state = state.lock().unwrap();
+            let mut state = state.locked();
             // A slower listing for an older directory must not overwrite this one.
             if state.path == path {
                 match result {
@@ -428,16 +426,12 @@ impl Files {
         self.selected_remote = None;
     }
     fn remote_child(&self, name: &str) -> String {
-        join_path(&self.directory.lock().unwrap().path, name)
+        join_path(&self.directory.locked().path, name)
     }
 
     /// The remote directory the listing is showing, for the drag-and-drop hint.
     pub fn remote_dir(&self) -> String {
-        self.directory
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .path
-            .clone()
+        self.directory.locked().path.clone()
     }
 
     /// Queues a local file or directory for upload into the directory the
@@ -698,7 +692,7 @@ impl Files {
                             let result = result
                                 .map(|_| "操作完成，请刷新".to_string())
                                 .map_err(|e| e.to_string());
-                            *state.lock().unwrap() = Some(result);
+                            *state.locked() = Some(result);
                             wake();
                         });
                     }
@@ -726,7 +720,16 @@ impl Files {
                     } else {
                         ui.label(hint(&state.message, p));
                     }
-                    if operation.running() && ui.small_button("取消").clicked() {
+                    if operation.running()
+                        && crate::icons::icon_button(
+                            ui,
+                            crate::icons::Icon::Close,
+                            p,
+                            crate::icons::Size::Row,
+                        )
+                        .on_hover_text("取消")
+                        .clicked()
+                    {
                         operation
                             .cancel
                             .store(true, std::sync::atomic::Ordering::Release);
@@ -748,7 +751,7 @@ impl Files {
             if let Some(notice) = self.notice.clone() {
                 ui.horizontal(|ui| {
                     ui.colored_label(p.accent, &notice);
-                    if ui.small_button("×").clicked() {
+                    if crate::icons::close_button(ui, p, "关闭").clicked() {
                         self.notice = None;
                     }
                 });
@@ -775,21 +778,15 @@ impl Files {
                         let settled: u64 = members
                             .iter()
                             .map(|t| {
-                                let s = t.state.lock().unwrap();
+                                let s = t.state.locked();
                                 // Count skipped files as settled too.
                                 if s.finished { t.planned } else { s.done }
                             })
                             .sum();
-                        let finished = members
-                            .iter()
-                            .filter(|t| t.state.lock().unwrap().finished)
-                            .count();
+                        let finished = members.iter().filter(|t| t.state.locked().finished).count();
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!(
-                                "{} {}/",
-                                direction_glyph(batch_direction(&members)),
-                                batch.name
-                            )));
+                            direction_mark(ui, batch_direction(&members), p);
+                            ui.label(RichText::new(format!("{}/", batch.name)));
                             ui.add(
                                 egui::ProgressBar::new(if planned == 0 {
                                     0.0

@@ -1,3 +1,4 @@
+use crate::LockExt;
 use crate::{
     config::{RemoteProfile, SerialProfile},
     terminal::Terminal,
@@ -60,7 +61,7 @@ pub struct Session {
     /// A pane that exists but has no connection yet. The status bar spins while
     /// any of these is on screen.
     pending: bool,
-    input: SyncSender<Control>,
+    input: Input,
     stop: Arc<AtomicBool>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     /// A serial device is exclusive, so its workers are joined on drop to
@@ -76,7 +77,7 @@ impl Session {
         if self.detached {
             return SessionStatus::Detached;
         }
-        let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        let status = self.status.locked();
         match (status.exit_code, status.eof, &status.error) {
             // A clean exit is a normal end, not a failure.
             (Some(0), _, None) => SessionStatus::Detached,
@@ -98,7 +99,7 @@ impl Session {
         scrollback: usize,
         previous: Option<Arc<Mutex<Terminal>>>,
     ) -> Self {
-        let (input, _) = mpsc::sync_channel(1);
+        let input = Input::Sync(mpsc::sync_channel(1).0);
         let terminal =
             previous.unwrap_or_else(|| Arc::new(Mutex::new(Terminal::new(30, 100, scrollback))));
         Self {
@@ -127,7 +128,7 @@ impl Session {
     /// it does have a screen, which is where the connection's own notices and
     /// failures are written so they are never mistaken for another session's.
     pub fn connecting(kind: SessionKind, scrollback: usize) -> Self {
-        let (input, _) = mpsc::sync_channel(1);
+        let input = Input::Sync(mpsc::sync_channel(1).0);
         Self {
             terminal: Arc::new(Mutex::new(Terminal::new(30, 100, scrollback))),
             status: Arc::new(Mutex::new(Status::default())),
@@ -153,26 +154,17 @@ impl Session {
 
     /// Writes a notice into this session's own screen.
     pub fn note(&self, line: &str) {
-        self.terminal
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .note(line);
+        self.terminal.locked().note(line);
     }
 
     /// Writes a failure into this session's own screen.
     pub fn note_error(&self, line: &str) {
-        self.terminal
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .note_error(line);
+        self.terminal.locked().note_error(line);
     }
 
     /// Blank lines separating a new run of notices from older output.
     pub fn separator(&self) {
-        self.terminal
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .separator();
+        self.terminal.locked().separator();
     }
 
     /// Take over the session channel for a terminal-initiated ZMODEM transfer
@@ -180,14 +172,14 @@ impl Session {
     /// drops the returned stream.
     pub fn begin_terminal_zmodem(&self) -> Result<BridgeStream> {
         anyhow::ensure!(self.remote.is_some(), "仅内置 SSH 会话支持 ZMODEM 抓取");
-        let (to_transfer, to_transfer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (to_transfer, to_transfer_rx) = tokio::sync::mpsc::channel(64);
         let (from_transfer_tx, from_transfer) = tokio::sync::mpsc::unbounded_channel();
         self.input
             .try_send(Control::ZmodemBridge {
                 to_transfer,
                 from_transfer,
             })
-            .context("会话已关闭，无法开始 ZMODEM 传输")?;
+            .map_err(|_| anyhow::anyhow!("会话已关闭，无法开始 ZMODEM 传输"))?;
         Ok(BridgeStream {
             rx: to_transfer_rx,
             tx: from_transfer_tx,
@@ -201,7 +193,7 @@ impl Session {
             bail!("单次粘贴不能超过 1 MiB");
         }
         {
-            let status = self.status.lock().unwrap();
+            let status = self.status.locked();
             if status.exit_code.is_some() {
                 bail!("会话已退出，请重新启动");
             }
@@ -213,17 +205,13 @@ impl Session {
                 bail!("会话已断开，请重新连接");
             }
         }
-        self.input.try_send(Control::Write(bytes)).map_err(|error| {
-            match error {
+        self.input
+            .try_send(Control::Write(bytes))
+            .map_err(|error| match error {
                 // The reader went away between the check above and here.
-                std::sync::mpsc::TrySendError::Disconnected(_) => {
-                    anyhow::anyhow!("会话已断开，请重新连接")
-                }
-                std::sync::mpsc::TrySendError::Full(_) => {
-                    anyhow::anyhow!("终端输入过快，请稍后重试")
-                }
-            }
-        })
+                SendError::Closed => anyhow::anyhow!("会话已断开，请重新连接"),
+                SendError::Full => anyhow::anyhow!("终端输入过快，请稍后重试"),
+            })
     }
 
     /// Follows the pane size. This is best effort: once a session has ended its
@@ -243,6 +231,18 @@ impl Session {
             self.size = size;
         }
     }
+}
+
+/// One read from any session kind into its screen: counts it, raises the
+/// bell, and returns the replies the program asked for (cursor reports and
+/// the like) for the caller to send back.
+fn feed(terminal: &Mutex<Terminal>, traffic: &Traffic, bytes: &[u8]) -> Vec<u8> {
+    traffic.add_down(bytes.len());
+    let fed = crate::terminal::feed(terminal, bytes);
+    if fed.bell {
+        traffic.bell.store(true, Ordering::Relaxed);
+    }
+    fed.replies
 }
 
 impl Drop for Session {

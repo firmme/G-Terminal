@@ -421,7 +421,7 @@ fn recent_connections_select_on_single_click_and_connect_on_double_click() {
         .iter()
         .find_map(|shape| {
             if let egui::Shape::Text(text) = &shape.shape
-                && text.galley.text() == "最近连接"
+                && text.galley.text() == "最近"
             {
                 Some(text.pos + text.galley.rect.center().to_vec2())
             } else {
@@ -522,7 +522,7 @@ fn a_background_reconnect_indicator_reconnects_and_activates_its_tab() {
         .iter()
         .find_map(|shape| {
             if let egui::epaint::Shape::Circle(circle) = &shape.shape
-                && circle.radius == 4.5
+                && circle.radius == 2.8
                 && circle.fill == Palette::new(false).muted
             {
                 Some(circle.center)
@@ -530,12 +530,12 @@ fn a_background_reconnect_indicator_reconnects_and_activates_its_tab() {
                 None
             }
         })
-        .expect("disconnected status dot");
+        .expect("disconnected status badge");
     assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
         egui::epaint::Shape::Text(text) if text.galley.job.text == "未连接")));
     let (hover, _) = render(vec![Event::PointerMoved(pos)]);
     assert!(!hover.shapes.iter().any(|shape| matches!(&shape.shape,
-        egui::epaint::Shape::Circle(circle) if circle.center == pos && circle.radius == 4.5)));
+        egui::epaint::Shape::Circle(circle) if circle.center == pos && circle.radius == 2.8)));
     render(vec![press(pos, true)]);
     let (_, action) = render(vec![press(pos, false)]);
     assert!(matches!(action, Some(Action::ReconnectTab(0))));
@@ -897,6 +897,7 @@ fn benchmark_ui_frames() {
     let size = Vec2::new(1280.0, 800.0);
     frame(&mut app, &ctx, vec![], Modifiers::NONE, size);
     let mut samples = Vec::new();
+    let mut run_samples = Vec::new();
     for scenario in ["idle", "output", "history", "four-tabs", "input"] {
         if scenario == "four-tabs" {
             for _ in 0..3 {
@@ -935,6 +936,52 @@ fn benchmark_ui_frames() {
         );
         samples.clear();
     }
+    // A full screen of coloured output, then the pointer sweeping over the
+    // sidebar: what a hover highlight costs per frame, layout plus
+    // tessellation, as the native renderer pays it.
+    {
+        let pane = &app.tabs[app.active].panes[0];
+        let mut terminal = pane.session.terminal.lock().unwrap();
+        for i in 0..200 {
+            terminal.process(
+                format!(
+                    "[3{}m{i:04} 中文输出 {}[0m
+",
+                    i % 7 + 1,
+                    "word ".repeat(30)
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    for i in 0..60 {
+        let pos = egui::pos2(120.0, 150.0 + (i % 20) as f32 * 18.0);
+        let start = std::time::Instant::now();
+        let output = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: vec![Event::PointerMoved(pos)],
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        let run = start.elapsed().as_secs_f64() * 1000.0;
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let total = start.elapsed().as_secs_f64() * 1000.0;
+        if i >= 5 {
+            samples.push(total);
+            run_samples.push(run);
+        }
+        let _ = primitives;
+    }
+    samples.sort_by(f64::total_cmp);
+    run_samples.sort_by(f64::total_cmp);
+    println!(
+        "UI full-screen hover: layout p50={:.2}ms, layout+tessellate p50={:.2}ms p95={:.2}ms",
+        run_samples[run_samples.len() / 2],
+        samples[samples.len() / 2],
+        samples[samples.len() * 95 / 100]
+    );
 }
 
 /// Pumps frames until a pending serial owner check has answered and the connect

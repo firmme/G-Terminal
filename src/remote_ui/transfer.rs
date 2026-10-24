@@ -2,6 +2,7 @@
 //! and how conflicts and progress are polled while it runs.
 
 use super::*;
+use g_terminal::LockExt;
 
 impl Files {
     pub fn start_terminal_zmodem(
@@ -32,7 +33,7 @@ impl Files {
                 }
             }
             .await;
-            *operation.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+            *operation.locked() = Some(result.map_err(|e| format!("{e:#}")));
             wake();
         });
     }
@@ -87,7 +88,7 @@ impl Files {
     pub(super) fn is_queued(&self, local: &Path, remote: &str) -> bool {
         self.transfers
             .iter()
-            .any(|t| t.local == local && t.remote == remote && !t.state.lock().unwrap().finished)
+            .any(|t| t.local == local && t.remote == remote && !t.state.locked().finished)
     }
     pub(super) fn push_transfer(&mut self, spec: remote::TransferSpec, ctx: &egui::Context) {
         self.transfers.push(Transfer::new(
@@ -140,7 +141,7 @@ impl Files {
                 }
             }
             .await;
-            *slot.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+            *slot.locked() = Some(result.map_err(|e| format!("{e:#}")));
             wake();
         });
         self.pending_batch = Some(PendingBatch {
@@ -155,7 +156,7 @@ impl Files {
         let Some(pending) = &self.pending_batch else {
             return;
         };
-        let planned = pending.plan.lock().unwrap().clone();
+        let planned = pending.plan.locked().clone();
         let Some(planned) = planned else {
             return;
         };
@@ -286,7 +287,7 @@ impl Files {
                     let busy = self.transfers.iter().any(|other| {
                         matches!(other.direction, Direction::Upload)
                             && parent_path(&other.remote) == dir
-                            && other.state.lock().unwrap().running
+                            && other.state.locked().running
                     });
                     if !busy {
                         remote_dir = Some(dir);
@@ -299,7 +300,7 @@ impl Files {
                     let busy = self.transfers.iter().any(|other| {
                         matches!(other.direction, Direction::Download)
                             && other.local.parent() == Some(dir.as_path())
-                            && other.state.lock().unwrap().running
+                            && other.state.locked().running
                     });
                     if !busy {
                         local_dir = Some(dir);
@@ -309,7 +310,7 @@ impl Files {
         }
         // Only if the user is still looking at that directory.
         if let Some(dir) = remote_dir
-            && self.directory.lock().unwrap().path == dir
+            && self.directory.locked().path == dir
         {
             self.refresh_remote(ctx);
         }
@@ -326,7 +327,7 @@ impl Files {
                 .collect();
             let states: Vec<_> = members
                 .iter()
-                .map(|transfer| transfer.state.lock().unwrap().clone())
+                .map(|transfer| transfer.state.locked().clone())
                 .collect();
             if !states.iter().all(|state| state.finished) {
                 continue;
@@ -378,14 +379,14 @@ impl Files {
         let unfinished: std::collections::HashSet<u64> = self
             .transfers
             .iter()
-            .filter(|transfer| !transfer.state.lock().unwrap().finished)
+            .filter(|transfer| !transfer.state.locked().finished)
             .map(|transfer| transfer.batch)
             .collect();
         let finished: Vec<usize> = self
             .transfers
             .iter()
             .enumerate()
-            .filter(|(_, transfer)| transfer.state.lock().unwrap().finished)
+            .filter(|(_, transfer)| transfer.state.locked().finished)
             .map(|(index, _)| index)
             .collect();
         let mut doomed: Vec<usize> = finished
@@ -398,8 +399,7 @@ impl Files {
                 }
                 transfer
                     .settled_at
-                    .lock()
-                    .unwrap()
+                    .locked()
                     .is_some_and(|at| now.duration_since(at) >= LINGER)
             })
             .collect();

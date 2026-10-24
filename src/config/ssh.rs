@@ -100,7 +100,9 @@ impl SshConfigBlock {
             "hostname" if self.hostname.is_none() => self.hostname = Some(value.to_string()),
             "user" if self.user.is_none() => self.user = Some(value.to_string()),
             "port" if self.port.is_none() => self.port = value.parse().ok(),
-            "identityfile" if self.identity.is_none() => self.identity = Some(expand_home(value)),
+            "identityfile" if self.identity.is_none() => {
+                self.identity = Some(expand_home(value).to_string_lossy().into_owned())
+            }
             "proxyjump" if self.jump.is_none() => self.jump = parse_proxy_jump(value),
             _ => {}
         }
@@ -209,17 +211,4 @@ pub(super) fn unquote(value: &str) -> String {
         return inner.to_string();
     }
     value.to_string()
-}
-
-/// Expands a leading `~` in a config path, which OpenSSH does for
-/// `IdentityFile`.
-pub(super) fn expand_home(value: &str) -> String {
-    let Some(home) = directories::UserDirs::new().map(|dirs| PathBuf::from(dirs.home_dir())) else {
-        return value.to_string();
-    };
-    match value.strip_prefix("~/") {
-        Some(rest) => home.join(rest).to_string_lossy().into_owned(),
-        None if value == "~" => home.to_string_lossy().into_owned(),
-        None => value.to_string(),
-    }
 }

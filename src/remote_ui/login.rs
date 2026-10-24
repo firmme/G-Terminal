@@ -2,6 +2,7 @@
 //! key-only fallback.
 
 use super::*;
+use g_terminal::LockExt;
 
 pub struct Login {
     pub profile: RemoteProfile,
@@ -64,7 +65,7 @@ impl Login {
         let mut cancel = false;
         crate::dialog::Dialog::new(
             format!("SSH · {}", self.profile.label()),
-            crate::icons::Icon::Connect,
+            crate::icons::Icon::Host,
             p,
         )
         .open(open)
@@ -72,13 +73,24 @@ impl Login {
         .resizable(false)
         .default_width(420.0)
         .show(ctx, |ui| {
-            ui.label(format!(
-                "{}:{}",
-                self.profile.destination(),
-                self.profile.port
-            ));
+            ui.horizontal(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                crate::icons::draw(
+                    ui.painter(),
+                    rect,
+                    crate::icons::Icon::Connect,
+                    p.muted,
+                    1.3,
+                );
+                ui.label(hint(
+                    &format!("{}:{}", self.profile.destination(), self.profile.port),
+                    p,
+                ));
+            });
+            ui.add_space(2.0);
             if let Some(job) = &self.job {
-                let mut state = job.state.lock().unwrap();
+                let mut state = job.state.locked();
                 if let Some(connection) = state.ready.take() {
                     ready = Some(connection);
                 }
@@ -92,32 +104,58 @@ impl Login {
                         self.noted = Some(error.clone());
                         if let Some(console) = &self.console {
                             console
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
+                                .locked()
                                 .note_error(&format!("[错误] connect failed: {error}"));
                         }
                     }
                 }
                 if let Some(trust) = &mut state.trust {
-                    ui.colored_label(p.accent, "首次连接：确认服务器公钥指纹");
-                    ui.label(&trust.host);
-                    ui.monospace(&trust.fingerprint);
-                    ui.label(hint(
-                        "核对指纹后将保存到 known_hosts。主机密钥变化时拒绝连接。",
-                        p,
-                    ));
-                    ui.horizontal(|ui| {
-                        if ui.button("信任并继续").clicked()
-                            && let Some(answer) = trust.answer.take()
-                        {
-                            let _ = answer.send(true);
-                        }
-                        let reject = ui.button("拒绝");
+                    egui::Frame::new()
+                        .fill(p.warn.gamma_multiply(0.08))
+                        .stroke(egui::Stroke::new(1.0_f32, p.warn.gamma_multiply(0.5)))
+                        .corner_radius(8)
+                        .inner_margin(12)
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(18.0, 18.0),
+                                    egui::Sense::hover(),
+                                );
+                                crate::icons::draw(
+                                    ui.painter(),
+                                    rect,
+                                    crate::icons::Icon::Key,
+                                    p.warn,
+                                    1.4,
+                                );
+                                ui.label(egui::RichText::new("首次连接，请核对主机指纹").strong());
+                            });
+                            ui.label(hint(&trust.host, p));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&trust.fingerprint).monospace(),
+                                )
+                                .wrap(),
+                            );
+                            ui.label(hint(
+                                "信任后写入 known_hosts；之后主机密钥一旦变化将拒绝连接。",
+                                p,
+                            ));
+                        });
+                    ui.add_space(6.0);
+                    crate::dialog::footer(ui, |ui| {
+                        let reject = crate::dialog::secondary(ui, "拒绝");
                         editing::focus_once(ui, &reject, &mut self.focus_trust);
                         if reject.clicked()
                             && let Some(answer) = trust.answer.take()
                         {
                             let _ = answer.send(false);
+                        }
+                        if crate::dialog::primary(ui, "信任并连接", p).clicked()
+                            && let Some(answer) = trust.answer.take()
+                        {
+                            let _ = answer.send(true);
                         }
                     });
                 } else if state.error.is_none() {
@@ -128,7 +166,8 @@ impl Login {
                         ui.spinner();
                         ui.label(&state.message);
                     });
-                    let cancel = ui.small_button("取消");
+                    ui.add_space(4.0);
+                    let cancel = crate::dialog::secondary(ui, "取消");
                     editing::focus_once(ui, &cancel, &mut self.focus_cancel);
                     if cancel.clicked() {
                         abort = true;
@@ -136,52 +175,50 @@ impl Login {
                 }
             }
             if self.job.is_none() || self.error.is_some() {
-                crate::dialog::card(
+                ui.spacing_mut().item_spacing.y = 8.0;
+                let username = crate::dialog::icon_field(
                     ui,
+                    crate::icons::Icon::User,
+                    "用户名",
+                    &mut self.profile.user,
+                    false,
                     p,
-                    crate::icons::Icon::Host,
-                    "身份验证",
-                    "使用账号密码或 SSH 私钥登录",
-                    |ui| {
-                        egui::Grid::new("credentials")
-                            .num_columns(2)
-                            .spacing([12.0, 6.0])
-                            .min_col_width(72.0)
-                            .show(ui, |ui| {
-                                ui.label("用户名");
-                                let username =
-                                    editing::field_with(ui, &mut self.profile.user, |edit| {
-                                        edit.desired_width(230.0)
-                                    });
-                                editing::focus_once(ui, &username, &mut self.focus_username);
-                                ui.end_row();
-                                ui.label("密码");
-                                editing::field_with(ui, &mut self.credentials.password, |edit| {
-                                    edit.password(true).desired_width(230.0)
-                                });
-                                ui.end_row();
-                                ui.label("私钥路径");
-                                editing::field_with(ui, &mut self.profile.identity, |edit| {
-                                    edit.desired_width(230.0)
-                                });
-                                ui.end_row();
-                                ui.label("私钥口令");
-                                editing::field_with(ui, &mut self.credentials.passphrase, |edit| {
-                                    edit.password(true).desired_width(230.0)
-                                });
-                                ui.end_row();
-                                if self.profile.jump.is_some() {
-                                    ui.label("跳板机密码");
-                                    editing::field_with(
-                                        ui,
-                                        &mut self.credentials.jump_password,
-                                        |edit| edit.password(true).desired_width(230.0),
-                                    );
-                                    ui.end_row();
-                                }
-                            });
-                    },
                 );
+                editing::focus_once(ui, &username, &mut self.focus_username);
+                crate::dialog::icon_field(
+                    ui,
+                    crate::icons::Icon::Lock,
+                    "密码",
+                    &mut self.credentials.password,
+                    true,
+                    p,
+                );
+                crate::dialog::icon_field(
+                    ui,
+                    crate::icons::Icon::Key,
+                    "私钥路径（可选）",
+                    &mut self.profile.identity,
+                    false,
+                    p,
+                );
+                crate::dialog::icon_field(
+                    ui,
+                    crate::icons::Icon::Lock,
+                    "私钥口令（可选）",
+                    &mut self.credentials.passphrase,
+                    true,
+                    p,
+                );
+                if self.profile.jump.is_some() {
+                    crate::dialog::icon_field(
+                        ui,
+                        crate::icons::Icon::Host,
+                        "跳板机密码",
+                        &mut self.credentials.jump_password,
+                        true,
+                        p,
+                    );
+                }
                 if self.quiet {
                     // The passwordless attempt failing usually just means the
                     // server wants credentials, so say so — but the failure
@@ -189,7 +226,18 @@ impl Login {
                     ui.label(hint("需要密码或私钥", p));
                 }
                 if let Some(error) = &self.error {
-                    ui.colored_label(p.danger, error);
+                    ui.horizontal_wrapped(|ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        crate::icons::draw(
+                            ui.painter(),
+                            rect,
+                            crate::icons::Icon::Warning,
+                            p.danger,
+                            1.3,
+                        );
+                        ui.colored_label(p.danger, error);
+                    });
                 }
                 // Enter submits, matching the other connection dialogs. A
                 // combo/popup consumes Enter for itself first.

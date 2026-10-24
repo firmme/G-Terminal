@@ -9,18 +9,19 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{HMODULE, HWND},
+        Foundation::{CloseHandle, HANDLE, HMODULE, HWND},
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0},
             Direct3D11::*,
             Dxgi::{Common::*, *},
         },
+        System::Threading::WaitForSingleObjectEx,
     },
     core::Interface,
 };
 use winit::{
     application::ApplicationHandler,
-    dpi::LogicalSize,
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
@@ -86,8 +87,8 @@ impl ApplicationHandler<Event> for Runner {
                         .with_decorations(false)
                         .with_visible(false)
                         .with_window_icon(window_icon())
-                        .with_inner_size(LogicalSize::new(1280., 800.))
-                        .with_min_inner_size(LogicalSize::new(400., 300.)),
+                        .with_inner_size(LogicalSize::new(DEFAULT_SIZE.0, DEFAULT_SIZE.1))
+                        .with_min_inner_size(LogicalSize::new(MIN_SIZE.0, MIN_SIZE.1)),
                 )?,
             );
             Native::new(
@@ -153,10 +154,15 @@ impl ApplicationHandler<Event> for Runner {
                 native.window.request_redraw();
             }
             WindowEvent::Resized(size) => {
+                native.repair_geometry();
                 if let Err(error) = native.gpu.resize(size.width, size.height) {
                     self.fail(event_loop, error);
                 }
             }
+            WindowEvent::Moved(_)
+            | WindowEvent::ScaleFactorChanged { .. }
+            | WindowEvent::Focused(true)
+            | WindowEvent::Occluded(false) => native.repair_geometry(),
             WindowEvent::RedrawRequested => match native.draw() {
                 Ok(true) => event_loop.exit(),
                 Ok(false) => {}
@@ -187,6 +193,60 @@ impl ApplicationHandler<Event> for Runner {
     }
 }
 
+/// The window's size when it opens, and the smallest it may become, in logical
+/// pixels.
+const DEFAULT_SIZE: (f64, f64) = (1280.0, 800.0);
+const MIN_SIZE: (f64, f64) = (400.0, 300.0);
+
+/// A rectangle in physical pixels: x, y, width, height.
+type Area = (i32, i32, i32, i32);
+
+/// Where a window that has ended up unusable should go instead, or `None` when
+/// it is fine.
+///
+/// Logging back in at the machine after a Remote Desktop session changes the
+/// resolution and DPI under the window, and Windows can leave it as a sliver a
+/// few pixels high, or off every screen. Neither the title bar nor an edge can
+/// then be grabbed, so the app puts it back itself: a window below the minimum
+/// gets the default size, and one whose title bar is on no monitor is centred
+/// on `home`. All values are physical pixels.
+fn repaired_geometry(
+    outer: Area,
+    inner: (i32, i32),
+    min: (i32, i32),
+    default: (i32, i32),
+    monitors: &[Area],
+    home: Option<Area>,
+) -> Option<Area> {
+    let home = home.or_else(|| monitors.first().copied())?;
+    let too_small = inner.0 < min.0 || inner.1 < min.1;
+    // A piece of the title bar has to be on some screen to be draggable.
+    let visible = monitors.iter().any(|&(mx, my, mw, mh)| {
+        let left = outer.0.max(mx);
+        let right = (outer.0 + outer.2).min(mx + mw);
+        let top = outer.1.max(my);
+        let bottom = (outer.1 + 40).min(my + mh);
+        right - left >= 120 && bottom - top >= 20
+    });
+    if !too_small && visible {
+        return None;
+    }
+    let (width, height) = if too_small {
+        (
+            default.0.min(home.2 * 9 / 10).max(min.0),
+            default.1.min(home.3 * 9 / 10).max(min.1),
+        )
+    } else {
+        inner
+    };
+    Some((
+        home.0 + (home.2 - width).max(0) / 2,
+        home.1 + (home.3 - height).max(0) / 2,
+        width,
+        height,
+    ))
+}
+
 struct Native {
     // Drop GPU references before destroying the HWND.
     gpu: Gpu,
@@ -202,6 +262,54 @@ struct Native {
     close_requested: bool,
 }
 impl Native {
+    /// Puts back a window that a display change left too small or off-screen.
+    fn repair_geometry(&self) {
+        let window = &self.window;
+        if window.is_minimized() == Some(true) || window.fullscreen().is_some() {
+            return;
+        }
+        let scale = window.scale_factor();
+        let physical = |(w, h): (f64, f64)| ((w * scale) as i32, (h * scale) as i32);
+        let inner = window.inner_size();
+        let outer = window.outer_size();
+        let Ok(position) = window.outer_position() else {
+            return;
+        };
+        let area = |m: &winit::monitor::MonitorHandle| {
+            let (p, s) = (m.position(), m.size());
+            (p.x, p.y, s.width as i32, s.height as i32)
+        };
+        let monitors: Vec<Area> = window.available_monitors().map(|m| area(&m)).collect();
+        let home = window
+            .current_monitor()
+            .or_else(|| window.primary_monitor())
+            .map(|m| area(&m));
+        let Some((x, y, width, height)) = repaired_geometry(
+            (
+                position.x,
+                position.y,
+                outer.width as i32,
+                outer.height as i32,
+            ),
+            (inner.width as i32, inner.height as i32),
+            physical(MIN_SIZE),
+            physical(DEFAULT_SIZE),
+            &monitors,
+            home,
+        ) else {
+            return;
+        };
+        // A maximized window that came back tiny has to leave that state
+        // first, or the new size is ignored.
+        if window.is_maximized() {
+            window.set_maximized(false);
+        }
+        window.set_min_inner_size(Some(LogicalSize::new(MIN_SIZE.0, MIN_SIZE.1)));
+        let _ = window.request_inner_size(PhysicalSize::new(width as u32, height as u32));
+        window.set_outer_position(PhysicalPosition::new(x, y));
+        window.request_redraw();
+    }
+
     fn new(
         window: Arc<Window>,
         event_loop: &ActiveEventLoop,
@@ -243,6 +351,9 @@ impl Native {
             // a pending close request just goes through.
             return Ok(self.close_requested);
         }
+        // Wait for the display to take a frame *before* reading input, so
+        // what is drawn is the freshest pointer and key state there is.
+        self.gpu.wait_for_frame();
         egui_winit::update_viewport_info(&mut self.info, &self.ctx, &self.window, false);
         // The close request rides in as a viewport event, which is where
         // `ViewportInfo::close_requested` looks for it.
@@ -307,11 +418,28 @@ impl Native {
 
 struct Gpu {
     target: Option<ID3D11RenderTargetView>,
+    /// Signalled when the swap chain can accept another frame. `None` on a
+    /// system without the waitable swap chain, which falls back to a latency
+    /// limit on the device.
+    waitable: Option<HANDLE>,
+    /// The flags the swap chain was made with; resizing has to repeat them.
+    flags: DXGI_SWAP_CHAIN_FLAG,
     renderer: egui_directx11::Renderer,
     swap: IDXGISwapChain,
     context: ID3D11DeviceContext,
     device: ID3D11Device,
 }
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        if let Some(waitable) = self.waitable.take() {
+            // SAFETY: the handle came from the swap chain and is closed once.
+            unsafe {
+                let _ = CloseHandle(waitable);
+            }
+        }
+    }
+}
+
 impl Gpu {
     fn new(window: &Window) -> Result<Self> {
         let RawWindowHandle::Win32(handle) = window.window_handle()?.as_raw() else {
@@ -348,32 +476,53 @@ impl Gpu {
             result.context("Create D3D11 device")?;
             let device = device.context("Missing D3D11 device")?;
             let context = context.context("Missing D3D11 context")?;
+            // Without a limit DXGI queues up to three frames ahead, so a click
+            // or hover reached the screen 30-50 ms late, and by a varying
+            // amount. One queued frame is what the wgpu path already asks for.
+            if let Ok(device1) = device.cast::<IDXGIDevice1>() {
+                let _ = device1.SetMaximumFrameLatency(1);
+            }
             let dxgi: IDXGIDevice = device.cast()?;
             let factory: IDXGIFactory = dxgi.GetAdapter()?.GetParent()?;
             let size = window.inner_size();
             let hwnd = HWND(handle.hwnd.get() as _);
-            let desc = DXGI_SWAP_CHAIN_DESC {
-                BufferDesc: DXGI_MODE_DESC {
-                    Width: size.width.max(1),
-                    Height: size.height.max(1),
-                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                    ..Default::default()
-                },
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
-                OutputWindow: hwnd,
-                Windowed: true.into(),
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                Flags: 0,
-            };
-            let mut swap = None;
-            factory.CreateSwapChain(&device, &desc, &mut swap).ok()?;
+            let (width, height) = (size.width.max(1), size.height.max(1));
+            let (swap, waitable, flags) =
+                match Self::waitable_swap(&device, &factory, hwnd, width, height) {
+                    Ok((swap, waitable)) => (
+                        swap,
+                        Some(waitable),
+                        DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+                    ),
+                    Err(_) => {
+                        let desc = DXGI_SWAP_CHAIN_DESC {
+                            BufferDesc: DXGI_MODE_DESC {
+                                Width: width,
+                                Height: height,
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                ..Default::default()
+                            },
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                            BufferCount: 2,
+                            OutputWindow: hwnd,
+                            Windowed: true.into(),
+                            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                            Flags: 0,
+                        };
+                        let mut swap = None;
+                        factory.CreateSwapChain(&device, &desc, &mut swap).ok()?;
+                        (
+                            swap.context("Missing swap chain")?,
+                            None,
+                            DXGI_SWAP_CHAIN_FLAG(0),
+                        )
+                    }
+                };
             factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)?;
-            let swap = swap.context("Missing swap chain")?;
             let target = Some(Self::target(&device, &swap)?);
             let renderer = egui_directx11::Renderer::new(&device)?;
             Ok(Self {
@@ -382,7 +531,57 @@ impl Gpu {
                 swap,
                 target,
                 renderer,
+                waitable,
+                flags,
             })
+        }
+    }
+
+    /// A flip-model swap chain that signals when it can take the next frame,
+    /// holding at most one frame in flight. Waiting on it before each frame
+    /// keeps input-to-screen latency at the minimum vsync allows.
+    unsafe fn waitable_swap(
+        device: &ID3D11Device,
+        factory: &IDXGIFactory,
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+    ) -> Result<(IDXGISwapChain, HANDLE)> {
+        unsafe {
+            let factory: IDXGIFactory2 = factory.cast()?;
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: width,
+                Height: height,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Stereo: false.into(),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
+                Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
+            };
+            let swap = factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None)?;
+            let swap2: IDXGISwapChain2 = swap.cast()?;
+            swap2.SetMaximumFrameLatency(1)?;
+            let waitable = swap2.GetFrameLatencyWaitableObject();
+            anyhow::ensure!(!waitable.is_invalid(), "No frame latency waitable object");
+            Ok((swap.cast()?, waitable))
+        }
+    }
+
+    /// Blocks until the swap chain can take a frame, at most a few frames'
+    /// time so a stalled display never freezes input handling.
+    fn wait_for_frame(&self) {
+        if let Some(waitable) = self.waitable {
+            // SAFETY: the handle is owned by this Gpu and closed only on drop.
+            unsafe {
+                WaitForSingleObjectEx(waitable, 50, true);
+            }
         }
     }
     fn target(device: &ID3D11Device, swap: &IDXGISwapChain) -> Result<ID3D11RenderTargetView> {
@@ -402,13 +601,8 @@ impl Gpu {
             return Ok(());
         }
         unsafe {
-            self.swap.ResizeBuffers(
-                2,
-                width,
-                height,
-                DXGI_FORMAT_R8G8B8A8_UNORM,
-                DXGI_SWAP_CHAIN_FLAG(0),
-            )?;
+            self.swap
+                .ResizeBuffers(2, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, self.flags)?;
         }
         self.target = Some(Self::target(&self.device, &self.swap)?);
         Ok(())
@@ -455,5 +649,60 @@ impl Gpu {
                 &pixels,
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCREEN: Area = (0, 0, 1920, 1080);
+
+    fn repair(outer: Area, inner: (i32, i32), monitors: &[Area]) -> Option<Area> {
+        repaired_geometry(
+            outer,
+            inner,
+            (400, 300),
+            (1280, 800),
+            monitors,
+            monitors.first().copied(),
+        )
+    }
+
+    #[test]
+    fn a_normal_window_is_left_alone() {
+        assert_eq!(repair((100, 100, 1280, 800), (1280, 800), &[SCREEN]), None);
+    }
+
+    /// The Remote Desktop sliver: full width, a few pixels high.
+    #[test]
+    fn a_sliver_gets_the_default_size_back_centred() {
+        assert_eq!(
+            repair((0, 0, 1920, 12), (1920, 4), &[SCREEN]),
+            Some((320, 140, 1280, 800))
+        );
+    }
+
+    #[test]
+    fn a_window_off_every_screen_is_brought_back() {
+        assert_eq!(
+            repair((5000, 3000, 900, 600), (900, 600), &[SCREEN]),
+            Some((510, 240, 900, 600))
+        );
+    }
+
+    /// On a small screen the restored size still fits on it.
+    #[test]
+    fn the_restored_size_fits_a_small_monitor() {
+        let small = (0, 0, 1024, 600);
+        assert_eq!(
+            repair((0, 0, 50, 50), (50, 50), &[small]),
+            Some((51, 30, 921, 540))
+        );
+    }
+
+    #[test]
+    fn without_a_monitor_there_is_nothing_to_do() {
+        assert_eq!(repair((0, 0, 10, 10), (10, 10), &[]), None);
     }
 }

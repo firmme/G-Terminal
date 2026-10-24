@@ -349,19 +349,28 @@ impl PortOwnerWindow {
             Err(_) => (Phase::Scanning, None, true, Vec::new()),
         };
 
-        crate::dialog::Dialog::new("串口占用排查", crate::icons::Icon::Search, p)
+        crate::dialog::Dialog::new("串口占用排查", crate::icons::Icon::Serial, p)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .default_width(440.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("端口");
-                    let port = editing::field_with(ui, &mut self.port, |edit| {
-                        edit.desired_width(170.0).hint_text("端口或 auto")
+                    ui.allocate_ui(egui::vec2(ui.available_width() - 42.0, 32.0), |ui| {
+                        let port = crate::dialog::icon_field(
+                            ui,
+                            icons::Icon::Serial,
+                            "端口或 auto",
+                            &mut self.port,
+                            false,
+                            p,
+                        );
+                        editing::focus_once(ui, &port, &mut self.focus_port);
                     });
-                    editing::focus_once(ui, &port, &mut self.focus_port);
-                    if ui.button("查找").clicked() {
+                    if crate::dialog::primary_icon(ui, icons::Icon::Search, p)
+                        .on_hover_text("查找占用程序")
+                        .clicked()
+                    {
                         rescan = true;
                     }
                 });
@@ -378,8 +387,12 @@ impl PortOwnerWindow {
                         ctx.request_repaint_after(std::time::Duration::from_millis(150));
                     }
                     Phase::Failed(error) => {
-                        ui.colored_label(p.danger, error.as_str());
-                        if ui.button("重试").clicked() {
+                        ui.horizontal_wrapped(|ui| {
+                            status_icon(ui, icons::Icon::Warning, p.danger);
+                            ui.colored_label(p.danger, error.as_str());
+                        });
+                        if icons::icon_label_button(ui, icons::Icon::Refresh, "重试", p).clicked()
+                        {
                             rescan = true;
                         }
                     }
@@ -389,8 +402,17 @@ impl PortOwnerWindow {
                             report.owners.iter().filter(|o| !o.is_self()).collect();
                         if blockers.is_empty() {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("✓ 端口空闲").color(p.ok).strong());
-                                if self.retry && ui.button("重新连接").clicked() {
+                                status_icon(ui, icons::Icon::Check, p.ok);
+                                ui.label(RichText::new("端口空闲").color(p.ok).strong());
+                                if self.retry
+                                    && icons::icon_label_button(
+                                        ui,
+                                        icons::Icon::Reconnect,
+                                        "重新连接",
+                                        p,
+                                    )
+                                    .clicked()
+                                {
                                     reconnect = true;
                                 }
                             });
@@ -406,14 +428,26 @@ impl PortOwnerWindow {
                                 ));
                             }
                         } else {
-                            ui.label(
-                                RichText::new(format!("⚠ 端口被 {} 个程序占用", blockers.len()))
-                                    .color(p.warn)
-                                    .strong(),
-                            );
+                            ui.horizontal(|ui| {
+                                status_icon(ui, icons::Icon::Warning, p.warn);
+                                ui.label(
+                                    RichText::new(format!("被 {} 个程序占用", blockers.len()))
+                                        .color(p.warn)
+                                        .strong(),
+                                );
+                            });
                             for owner in &blockers {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&owner.name).color(p.text));
+                                    ui.set_min_height(30.0);
+                                    status_icon(ui, icons::Icon::Terminal, p.muted);
+                                    ui.label(RichText::new(&owner.name).color(p.text))
+                                        .on_hover_text(
+                                            owner
+                                                .path
+                                                .as_ref()
+                                                .map(|path| path.display().to_string())
+                                                .unwrap_or_default(),
+                                        );
                                     ui.label(hint(&format!("PID {}", owner.pid), p));
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         let stuck = failed.contains(&owner.pid);
@@ -422,16 +456,27 @@ impl PortOwnerWindow {
                                             // not help, the device has to go.
                                             ui.label(hint("未退出，请用「重启设备」", p));
                                         } else if !stuck && owner.killable {
-                                            if ui.button("结束").clicked() {
+                                            if icons::icon_label_button(
+                                                ui,
+                                                icons::Icon::Power,
+                                                "结束",
+                                                p,
+                                            )
+                                            .clicked()
+                                            {
                                                 kill = Some(vec![owner.pid]);
                                             }
                                         } else if g_terminal::port_owner::CAN_ELEVATE {
                                             // Out of reach for this user, or the
                                             // direct attempt already failed.
-                                            if ui
-                                                .button("以管理员身份结束")
-                                                .on_hover_text("会弹出管理员授权（UAC）")
-                                                .clicked()
+                                            if icons::icon_label_button(
+                                                ui,
+                                                icons::Icon::Lock,
+                                                "管理员结束",
+                                                p,
+                                            )
+                                            .on_hover_text("会弹出管理员授权（UAC）")
+                                            .clicked()
                                             {
                                                 privileged = Some(Privileged::Kill(owner.pid));
                                             }
@@ -442,11 +487,19 @@ impl PortOwnerWindow {
                                 });
                             }
                             ui.horizontal(|ui| {
-                                if ui.button("重新查找").clicked() {
+                                if icons::icon_label_button(ui, icons::Icon::Refresh, "重新查找", p)
+                                    .clicked()
+                                {
                                     rescan = true;
                                 }
                                 if blockers.iter().filter(|o| o.killable).count() > 1
-                                    && ui.button("全部结束").clicked()
+                                    && icons::icon_label_button(
+                                        ui,
+                                        icons::Icon::Power,
+                                        "全部结束",
+                                        p,
+                                    )
+                                    .clicked()
                                 {
                                     kill = Some(
                                         blockers
@@ -457,10 +510,14 @@ impl PortOwnerWindow {
                                     );
                                 }
                                 if g_terminal::port_owner::CAN_RELEASE
-                                    && ui
-                                        .button("重启设备")
-                                        .on_hover_text("禁用再启用设备，让占用者的句柄失效")
-                                        .clicked()
+                                    && icons::icon_label_button(
+                                        ui,
+                                        icons::Icon::Restart,
+                                        "重启设备",
+                                        p,
+                                    )
+                                    .on_hover_text("禁用再启用设备，让占用者的句柄失效")
+                                    .clicked()
                                 {
                                     if g_terminal::port_owner::elevated() {
                                         release = true;
@@ -541,6 +598,12 @@ impl PortOwnerWindow {
             })),
         }
     }
+}
+
+/// A small state glyph leading a line.
+fn status_icon(ui: &mut egui::Ui, icon: icons::Icon, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+    icons::draw(ui.painter(), rect, icon, color, 1.5);
 }
 
 #[cfg(test)]

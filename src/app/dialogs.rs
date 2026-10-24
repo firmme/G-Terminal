@@ -3,25 +3,6 @@
 use super::*;
 use crate::icons::Icon;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SettingsSection {
-    Appearance,
-    Terminal,
-    Connection,
-    Files,
-    Startup,
-}
-
-impl SettingsSection {
-    const ALL: [Self; 5] = [
-        Self::Appearance,
-        Self::Terminal,
-        Self::Files,
-        Self::Connection,
-        Self::Startup,
-    ];
-}
-
 impl App {
     pub(super) fn dialogs(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
         let p = self.palette;
@@ -36,175 +17,214 @@ impl App {
             .show(ctx, |ui| {
                 ui.spacing_mut().interact_size.y = 24.0;
                 ui.spacing_mut().button_padding.y = 4.0;
-                ui.spacing_mut().item_spacing.y = 5.0;
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.spacing_mut().slider_width = 110.0;
                 ui.columns(2, |columns| {
-                    for (index, section) in SettingsSection::ALL.into_iter().enumerate() {
-                        let column = &mut columns[index % 2];
-                        let (icon, title, description) = match section {
-                            SettingsSection::Appearance => {
-                                (Icon::Settings, "外观与导航", "调整显示与工作区布局")
-                            }
-                            SettingsSection::Terminal => {
-                                (Icon::Terminal, "终端", "历史记录与文本操作")
-                            }
-                            SettingsSection::Connection => {
-                                (Icon::Connect, "连接", "默认会话与后台行为")
-                            }
-                            SettingsSection::Files => {
-                                (Icon::Folder, "文件与搜索", "文件显示与浏览器搜索")
-                            }
-                            SettingsSection::Startup => {
-                                (Icon::Restart, "启动行为", "工作区恢复与退出确认")
-                            }
-                        };
-                        crate::dialog::card(
-                            column,
+                    let left = &mut columns[0];
+                    crate::dialog::group_title(left, "外观", p);
+                    crate::dialog::setting_row(left, Icon::Sun, "主题", None, p, |ui| {
+                        let mut index = usize::from(self.settings.light_theme);
+                        if crate::dialog::segmented(
+                            ui,
+                            &[(Icon::Moon, "深色"), (Icon::Sun, "浅色")],
+                            &mut index,
                             p,
-                            icon,
-                            title,
-                            description,
-                            |ui| match section {
-                                SettingsSection::Appearance => {
-                                    let font_size = ui.add(
-                                        egui::Slider::new(
-                                            &mut self.settings.font_size,
-                                            10.0..=28.0,
-                                        )
-                                        .text("字号"),
-                                    );
-                                    settings_focus.request(ui, &font_size);
-                                    changed |= font_size.changed();
-                                    ui.horizontal(|ui| {
-                                        changed |= ui
-                                            .checkbox(&mut self.settings.light_theme, "浅色主题")
-                                            .changed();
-                                        changed |= ui
-                                            .checkbox(&mut self.settings.sidebar, "导航栏")
-                                            .changed();
-                                    });
-                                    changed |= ui
-                                        .checkbox(
-                                            &mut self.settings.auto_hide_sidebar,
-                                            "自动隐藏导航栏",
-                                        )
-                                        .on_hover_text("鼠标移到左侧边缘时展开")
-                                        .changed();
-                                }
-                                SettingsSection::Terminal => {
-                                    changed |= ui
-                                        .add(
-                                            egui::Slider::new(
-                                                &mut self.settings.scrollback,
-                                                100..=50_000,
-                                            )
-                                            .logarithmic(true)
-                                            .text("历史行数"),
-                                        )
-                                        .changed();
-                                    changed |= ui
-                                        .checkbox(
-                                            &mut self.settings.copy_on_select,
-                                            "选中文本后自动复制",
-                                        )
-                                        .changed();
-                                    ui.label(hint("中键粘贴 · Shift+鼠标强制选择", p));
-                                }
-                                SettingsSection::Connection => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("默认 Shell");
-                                        egui::ComboBox::from_id_salt("default-shell")
-                                            .selected_text(shell_label(
-                                                &self.settings.default_shell,
-                                            ))
-                                            .show_ui(ui, |ui| {
-                                                for shell in local_shells() {
-                                                    changed |= ui
-                                                        .selectable_value(
-                                                            &mut self.settings.default_shell,
-                                                            shell.value.clone(),
-                                                            &shell.label,
-                                                        )
-                                                        .changed();
-                                                }
-                                            });
-                                    });
-                                    changed |= ui
-                                        .checkbox(
-                                            &mut self.settings.serial_background_timeout_enabled,
-                                            "串口在后台超时后自动断开",
-                                        )
-                                        .changed();
-                                    ui.add_enabled_ui(
-                                        self.settings.serial_background_timeout_enabled,
-                                        |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label("后台超时");
-                                                changed |= ui
-                                                    .add(
-                                                        egui::DragValue::new(
-                                                            &mut self
-                                                                .settings
-                                                                .serial_background_timeout_minutes,
-                                                        )
-                                                        .range(1..=1440)
-                                                        .suffix(" 分钟"),
-                                                    )
-                                                    .changed();
-                                            });
-                                        },
-                                    );
-                                    ui.label(hint("切到后台后开始计时，返回时重置", p));
-                                }
-                                SettingsSection::Files => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("浏览器搜索");
-                                        egui::ComboBox::from_id_salt("search-engine")
-                                            .selected_text(search_engine_label(
-                                                &self.settings.search_engine,
-                                            ))
-                                            .show_ui(ui, |ui| {
-                                                for (key, label, _) in SEARCH_ENGINES {
-                                                    changed |= ui
-                                                        .selectable_value(
-                                                            &mut self.settings.search_engine,
-                                                            key.to_string(),
-                                                            label,
-                                                        )
-                                                        .changed();
-                                                }
-                                            });
-                                    });
-                                    changed |= ui
-                                        .checkbox(
-                                            &mut self.settings.hide_dotfiles,
-                                            "文件窗口默认隐藏 . 开头文件",
-                                        )
-                                        .changed();
-                                }
-                                SettingsSection::Startup => {
-                                    changed |= ui
-                                        .checkbox(
-                                            &mut self.settings.restore_tabs,
-                                            "恢复上次标签（不自动重连）",
-                                        )
-                                        .changed();
-                                    changed |= ui
-                                        .checkbox(
-                                            &mut self.settings.confirm_on_exit,
-                                            "退出时确认活动会话",
-                                        )
-                                        .changed();
-                                }
+                        ) {
+                            self.settings.light_theme = index == 1;
+                            changed = true;
+                        }
+                    });
+                    crate::dialog::setting_row(left, Icon::FileText, "字号", None, p, |ui| {
+                        let font_size = ui.add(
+                            egui::Slider::new(&mut self.settings.font_size, 10.0..=28.0)
+                                .fixed_decimals(0),
+                        );
+                        settings_focus.request(ui, &font_size);
+                        changed |= font_size.changed();
+                    });
+                    crate::dialog::setting_row(left, Icon::Sidebar, "导航栏", None, p, |ui| {
+                        changed |=
+                            crate::dialog::switch(ui, &mut self.settings.sidebar, p).changed();
+                    });
+                    let sidebar = self.settings.sidebar;
+                    left.add_enabled_ui(sidebar, |ui| {
+                        crate::dialog::setting_row(
+                            ui,
+                            Icon::ChevronLeft,
+                            "自动隐藏",
+                            Some("导航栏平时收起，鼠标移到窗口左边缘时展开"),
+                            p,
+                            |ui| {
+                                changed |= crate::dialog::switch(
+                                    ui,
+                                    &mut self.settings.auto_hide_sidebar,
+                                    p,
+                                )
+                                .changed();
                             },
                         );
-                        column.add_space(4.0);
+                    });
+                    crate::dialog::group_title(left, "终端", p);
+                    crate::dialog::setting_row(
+                        left,
+                        Icon::History,
+                        "历史行数",
+                        Some("每个终端保留的回滚行数"),
+                        p,
+                        |ui| {
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut self.settings.scrollback, 100..=50_000)
+                                        .logarithmic(true),
+                                )
+                                .changed();
+                        },
+                    );
+                    crate::dialog::setting_row(
+                        left,
+                        Icon::Copy,
+                        "选中即复制",
+                        Some("中键粘贴；按住 Shift 可在程序接管鼠标时强制选择"),
+                        p,
+                        |ui| {
+                            changed |=
+                                crate::dialog::switch(ui, &mut self.settings.copy_on_select, p)
+                                    .changed();
+                        },
+                    );
+                    crate::dialog::setting_row(
+                        left,
+                        Icon::Search,
+                        "搜索选中文字",
+                        Some("终端右键「搜索」使用的搜索引擎"),
+                        p,
+                        |ui| {
+                            egui::ComboBox::from_id_salt("search-engine")
+                                .width(110.0)
+                                .selected_text(search_engine_label(&self.settings.search_engine))
+                                .show_ui(ui, |ui| {
+                                    for (key, label, _) in SEARCH_ENGINES {
+                                        changed |= ui
+                                            .selectable_value(
+                                                &mut self.settings.search_engine,
+                                                key.to_string(),
+                                                label,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                        },
+                    );
+
+                    let right = &mut columns[1];
+                    crate::dialog::group_title(right, "连接", p);
+                    crate::dialog::setting_row(
+                        right,
+                        Icon::Terminal,
+                        "默认 Shell",
+                        None,
+                        p,
+                        |ui| {
+                            egui::ComboBox::from_id_salt("default-shell")
+                                .width(130.0)
+                                .selected_text(shell_label(&self.settings.default_shell))
+                                .show_ui(ui, |ui| {
+                                    for shell in local_shells() {
+                                        changed |= ui
+                                            .selectable_value(
+                                                &mut self.settings.default_shell,
+                                                shell.value.clone(),
+                                                &shell.label,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                        },
+                    );
+                    crate::dialog::setting_row(
+                        right,
+                        Icon::Serial,
+                        "串口后台断开",
+                        Some("标签在后台或窗口失焦超过设定时间后断开串口；切回时重新计时"),
+                        p,
+                        |ui| {
+                            changed |= crate::dialog::switch(
+                                ui,
+                                &mut self.settings.serial_background_timeout_enabled,
+                                p,
+                            )
+                            .changed();
+                            ui.add_enabled_ui(
+                                self.settings.serial_background_timeout_enabled,
+                                |ui| {
+                                    changed |= ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut self
+                                                    .settings
+                                                    .serial_background_timeout_minutes,
+                                            )
+                                            .range(1..=1440)
+                                            .suffix(" 分"),
+                                        )
+                                        .changed();
+                                },
+                            );
+                        },
+                    );
+                    crate::dialog::group_title(right, "文件", p);
+                    crate::dialog::setting_row(
+                        right,
+                        Icon::Folder,
+                        "隐藏点文件",
+                        Some("文件窗口默认不显示以 . 开头的文件"),
+                        p,
+                        |ui| {
+                            changed |=
+                                crate::dialog::switch(ui, &mut self.settings.hide_dotfiles, p)
+                                    .changed();
+                        },
+                    );
+                    crate::dialog::group_title(right, "启动与退出", p);
+                    crate::dialog::setting_row(
+                        right,
+                        Icon::Restart,
+                        "恢复上次标签",
+                        Some("只恢复标签布局，不会自动连接"),
+                        p,
+                        |ui| {
+                            changed |=
+                                crate::dialog::switch(ui, &mut self.settings.restore_tabs, p)
+                                    .changed();
+                        },
+                    );
+                    crate::dialog::setting_row(
+                        right,
+                        Icon::Power,
+                        "退出前确认",
+                        Some("仍有连接中的会话时，关闭窗口前先确认"),
+                        p,
+                        |ui| {
+                            changed |=
+                                crate::dialog::switch(ui, &mut self.settings.confirm_on_exit, p)
+                                    .changed();
+                        },
+                    );
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let path = Settings::path().to_string_lossy().into_owned();
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+                    icons::draw(ui.painter(), rect, Icon::FileCode, p.muted, 1.3);
+                    ui.add(egui::Label::new(hint(&path, p)).truncate());
+                    if icons::icon_button(ui, Icon::Copy, p, icons::Size::Row)
+                        .on_hover_text("复制配置文件路径")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(path);
                     }
                 });
-                egui::CollapsingHeader::new("配置文件位置")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.label(hint(Settings::path().to_string_lossy().as_ref(), p));
-                    });
             });
         self.settings_open = open;
         if self.settings.auto_hide_sidebar != auto_hide_before {
@@ -231,7 +251,7 @@ impl App {
         let mut connect = false;
         let mut refresh_ports = false;
         let mut cancel_config = false;
-        crate::dialog::Dialog::new("连接配置", Icon::Settings, p)
+        crate::dialog::Dialog::new("连接配置", Icon::Host, p)
             .open(&mut open)
             .collapsible(false)
             .default_width(480.0)
@@ -239,13 +259,25 @@ impl App {
                 let full = (ui.available_width() - 132.0).max(120.0);
                 let half = 130.0;
                 ui.horizontal(|ui| {
-                    if crate::dialog::tab(ui, "SSH", self.profile_kind == ProfileKind::Ssh, p)
-                        .clicked()
+                    if crate::dialog::tab(
+                        ui,
+                        Icon::Host,
+                        "SSH",
+                        self.profile_kind == ProfileKind::Ssh,
+                        p,
+                    )
+                    .clicked()
                     {
                         self.profile_kind = ProfileKind::Ssh;
                     }
-                    if crate::dialog::tab(ui, "串口", self.profile_kind == ProfileKind::Serial, p)
-                        .clicked()
+                    if crate::dialog::tab(
+                        ui,
+                        Icon::Serial,
+                        "串口",
+                        self.profile_kind == ProfileKind::Serial,
+                        p,
+                    )
+                    .clicked()
                     {
                         self.profile_kind = ProfileKind::Serial;
                     }
@@ -253,337 +285,330 @@ impl App {
                 ui.separator();
                 match self.profile_kind {
                     ProfileKind::Ssh => {
-                        crate::dialog::card(
-                            ui,
-                            p,
-                            Icon::Host,
-                            "连接信息",
-                            "设置远程主机的连接参数",
-                            |ui| {
-                                egui::Grid::new("connection-form")
-                                    .spacing([12.0, 6.0])
-                                    .min_col_width(80.0)
-                                    .show(ui, |ui| {
-                                        ui.label("主机 / IP");
-                                        let host = editing::field_with(
-                                            ui,
-                                            &mut self.remote.host,
-                                            |edit| {
-                                                edit.hint_text("example.com 或 192.168.1.10")
-                                                    .desired_width(full)
-                                            },
-                                        );
-                                        if focus_host {
-                                            ssh_focus.request(ui, &host);
-                                        }
-                                        ui.end_row();
-                                        ui.label("端口");
-                                        ui.add_sized(
-                                            egui::vec2(full + 16.0, 28.0),
-                                            egui::DragValue::new(&mut self.remote.port)
-                                                .range(1..=65535),
-                                        );
-                                        ui.end_row();
-                                        ui.label("连接名称");
-                                        editing::field_with(ui, &mut self.remote.name, |edit| {
-                                            edit.hint_text("留空时显示主机名").desired_width(full)
+                        crate::dialog::panel(ui, p, |ui| {
+                            egui::Grid::new("connection-form")
+                                .spacing([12.0, 6.0])
+                                .min_col_width(80.0)
+                                .show(ui, |ui| {
+                                    ui.label("主机 / IP");
+                                    let host =
+                                        editing::field_with(ui, &mut self.remote.host, |edit| {
+                                            edit.hint_text("example.com 或 192.168.1.10")
+                                                .desired_width(full)
                                         });
-                                        ui.end_row();
-                                        ui.label("分组");
-                                        egui::ComboBox::from_id_salt("profile-group")
-                                            .width(full + 16.0)
-                                            .selected_text(if self.remote.group.is_empty() {
-                                                "默认分组"
-                                            } else {
-                                                &self.remote.group
-                                            })
-                                            .show_ui(ui, |ui| {
+                                    if focus_host {
+                                        ssh_focus.request(ui, &host);
+                                    }
+                                    ui.end_row();
+                                    ui.label("端口");
+                                    ui.add_sized(
+                                        egui::vec2(half, 28.0),
+                                        egui::DragValue::new(&mut self.remote.port)
+                                            .range(1..=65535),
+                                    );
+                                    ui.end_row();
+                                    ui.label("连接名称");
+                                    editing::field_with(ui, &mut self.remote.name, |edit| {
+                                        edit.hint_text("留空时显示主机名").desired_width(full)
+                                    });
+                                    ui.end_row();
+                                    ui.label("分组");
+                                    egui::ComboBox::from_id_salt("profile-group")
+                                        .width(full + 16.0)
+                                        .selected_text(if self.remote.group.is_empty() {
+                                            "默认分组"
+                                        } else {
+                                            &self.remote.group
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.remote.group,
+                                                String::new(),
+                                                "默认分组",
+                                            );
+                                            for group in &self.settings.groups {
                                                 ui.selectable_value(
                                                     &mut self.remote.group,
-                                                    String::new(),
-                                                    "默认分组",
+                                                    group.clone(),
+                                                    group,
                                                 );
-                                                for group in &self.settings.groups {
-                                                    ui.selectable_value(
-                                                        &mut self.remote.group,
-                                                        group.clone(),
-                                                        group,
-                                                    );
-                                                }
-                                            });
-                                        ui.end_row();
-                                        ui.label("用户名");
-                                        let username = editing::field_with(
+                                            }
+                                        });
+                                    ui.end_row();
+                                    ui.label("用户名");
+                                    let username =
+                                        editing::field_with(ui, &mut self.remote.user, |edit| {
+                                            edit.hint_text("留空时连接时输入").desired_width(full)
+                                        });
+                                    if !focus_host {
+                                        ssh_focus.request(ui, &username);
+                                    }
+                                    ui.end_row();
+                                    ui.label("私钥路径");
+                                    ui.horizontal(|ui| {
+                                        editing::field_with(
                                             ui,
-                                            &mut self.remote.user,
+                                            &mut self.remote.identity,
                                             |edit| {
-                                                edit.hint_text("留空时连接时输入")
-                                                    .desired_width(full)
+                                                edit.hint_text("可选，SSH 私钥文件路径")
+                                                    .desired_width((full - 34.0).max(100.0))
                                             },
                                         );
-                                        if !focus_host {
-                                            ssh_focus.request(ui, &username);
+                                        let browse =
+                                            crate::dialog::icon_button(ui, Icon::Folder, p)
+                                                .on_hover_text("选择 SSH 私钥文件");
+                                        if browse.clicked()
+                                            && let Some(path) = rfd::FileDialog::new()
+                                                .set_title("选择 SSH 私钥文件")
+                                                .pick_file()
+                                        {
+                                            self.remote.identity =
+                                                path.to_string_lossy().into_owned();
                                         }
-                                        ui.end_row();
-                                        ui.label("私钥路径");
-                                        ui.horizontal(|ui| {
-                                            editing::field_with(
-                                                ui,
-                                                &mut self.remote.identity,
-                                                |edit| {
-                                                    edit.hint_text("可选，SSH 私钥文件路径")
-                                                        .desired_width((full - 34.0).max(100.0))
-                                                },
-                                            );
-                                            let browse =
-                                                crate::dialog::icon_button(ui, Icon::Folder, p)
-                                                    .on_hover_text("选择 SSH 私钥文件");
-                                            if browse.clicked()
-                                                && let Some(path) = rfd::FileDialog::new()
-                                                    .set_title("选择 SSH 私钥文件")
-                                                    .pick_file()
-                                            {
-                                                self.remote.identity =
-                                                    path.to_string_lossy().into_owned();
-                                            }
-                                        });
-                                        ui.end_row();
-                                        ui.label("标签颜色");
-                                        ui.horizontal(|ui| {
-                                            color_picker(ui, &mut self.remote.color, p);
-                                        });
-                                        ui.end_row();
                                     });
-                            },
-                        );
-                        egui::Frame::group(ui.style())
-                            .inner_margin(10)
-                            .fill(p.raised.gamma_multiply(0.45))
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.spacing_mut().item_spacing.y = 4.0;
-                                egui::CollapsingHeader::new(
-                                    RichText::new("高级设置").strong().size(14.0),
-                                )
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    egui::CollapsingHeader::new("ProxyJump 跳板机").show(
-                                        ui,
-                                        |ui| {
-                                            let mut enabled = self.remote.jump.is_some();
-                                            if ui.checkbox(&mut enabled, "启用一级跳板机").changed()
-                                            {
-                                                self.remote.jump = if enabled {
-                                                    Some(Box::new(RemoteProfile::default()))
-                                                } else {
-                                                    None
-                                                };
-                                            }
-                                            if let Some(j) = &mut self.remote.jump {
-                                                egui::Grid::new("jump-form")
-                                                    .spacing([12.0, 6.0])
-                                                    .min_col_width(48.0)
-                                                    .show(ui, |ui| {
-                                                        ui.label("地址");
-                                                        editing::field_with(
-                                                            ui,
-                                                            &mut j.host,
-                                                            |edit| edit.desired_width(full),
-                                                        );
-                                                        ui.end_row();
-                                                        ui.label("端口");
-                                                        ui.add_sized(
-                                                            egui::vec2(half, 20.0),
-                                                            egui::DragValue::new(&mut j.port)
-                                                                .range(1..=65535),
-                                                        );
-                                                        ui.end_row();
-                                                        ui.label("用户名");
-                                                        editing::field_with(
-                                                            ui,
-                                                            &mut j.user,
-                                                            |edit| edit.desired_width(full),
-                                                        );
-                                                        ui.end_row();
-                                                        ui.label("私钥");
-                                                        editing::field_with(
-                                                            ui,
-                                                            &mut j.identity,
-                                                            |edit| edit.desired_width(full),
-                                                        );
-                                                        ui.end_row();
-                                                    });
-                                            }
-                                        },
-                                    );
-                                    egui::CollapsingHeader::new("本地端口转发（监听 127.0.0.1）")
-                                        .show(ui, |ui| {
-                                            let mut remove = None;
-                                            for (i, f) in
-                                                self.remote.forwards.iter_mut().enumerate()
-                                            {
-                                                ui.horizontal(|ui| {
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut f.bind_port)
-                                                            .range(1..=65535),
-                                                    );
-                                                    ui.label("→");
-                                                    editing::field_with(
-                                                        ui,
-                                                        &mut f.target_host,
-                                                        |edit| edit.desired_width(half),
-                                                    );
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut f.target_port)
-                                                            .range(1..=65535),
-                                                    );
-                                                    if ui.small_button("×").clicked() {
-                                                        remove = Some(i);
-                                                    }
-                                                });
-                                            }
-                                            if let Some(i) = remove {
-                                                self.remote.forwards.remove(i);
-                                            }
-                                            if ui.small_button("+ 转发规则").clicked() {
-                                                self.remote.forwards.push(Forward {
-                                                    bind_port: 8080,
-                                                    target_host: "127.0.0.1".into(),
-                                                    target_port: 80,
-                                                });
-                                            }
-                                        });
-                                    ui.label(hint("密码在连接时输入，不保存。", p));
+                                    ui.end_row();
+                                    ui.label("标签颜色");
+                                    ui.horizontal(|ui| {
+                                        color_picker(ui, &mut self.remote.color, p);
+                                    });
+                                    ui.end_row();
                                 });
-                                if self.remote.jump.is_none() && self.remote.forwards.is_empty() {
-                                    ui.label(hint("代理、跳板机和本地端口转发", p));
+                        });
+                        crate::dialog::panel(ui, p, |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            let mut enabled = self.remote.jump.is_some();
+                            crate::dialog::subheading(ui, Icon::Host, "跳板机", p, |ui| {
+                                if crate::dialog::switch(ui, &mut enabled, p)
+                                    .on_hover_text("经由一台跳板机连接（ProxyJump，一级）")
+                                    .changed()
+                                {
+                                    self.remote.jump = if enabled {
+                                        Some(Box::new(RemoteProfile::default()))
+                                    } else {
+                                        None
+                                    };
                                 }
                             });
-                    }
-                    ProfileKind::Serial => {
-                        crate::dialog::card(
-                            ui,
-                            p,
-                            Icon::Connect,
-                            "串口连接",
-                            "选择设备端口并设置连接参数",
-                            |ui| {
-                                egui::Grid::new("serial-form")
+                            if let Some(j) = &mut self.remote.jump {
+                                egui::Grid::new("jump-form")
                                     .spacing([12.0, 6.0])
                                     .min_col_width(80.0)
                                     .show(ui, |ui| {
-                                        ui.label("串口");
-                                        let port = editing::field_with(
-                                            ui,
-                                            &mut self.serial.port,
-                                            |edit| {
-                                                edit.desired_width(full).hint_text(format!(
-                                                    "{} 或 auto",
-                                                    serial::PORT_EXAMPLE
-                                                ))
-                                            },
-                                        );
-                                        serial_focus.request(ui, &port);
-                                        ui.end_row();
-                                        ui.label("选择端口");
+                                        ui.label("地址");
                                         ui.horizontal(|ui| {
-                                            egui::ComboBox::from_id_salt("serial-port-pick")
-                                                .selected_text("选择端口")
-                                                .width(half)
-                                                .show_ui(ui, |ui| {
-                                                    ui.selectable_value(
-                                                        &mut self.serial.port,
-                                                        "auto".to_string(),
-                                                        "auto（自动）",
-                                                    );
-                                                    for port in &self.serial_ports {
-                                                        let label = if port.bluetooth {
-                                                            format!("{}（蓝牙）", port.name)
-                                                        } else {
-                                                            port.name.clone()
-                                                        };
-                                                        ui.selectable_value(
-                                                            &mut self.serial.port,
-                                                            port.name.clone(),
-                                                            label,
-                                                        );
-                                                    }
-                                                    if self.serial_ports.is_empty() {
-                                                        ui.label(hint("未检测到串口", p));
-                                                    }
-                                                });
-                                            if ui.small_button("刷新").clicked() {
-                                                refresh_ports = true;
-                                            }
+                                            editing::field_with(ui, &mut j.host, |edit| {
+                                                edit.hint_text("主机")
+                                                    .desired_width(full - half - 8.0)
+                                            });
+                                            ui.add_sized(
+                                                egui::vec2(half - 50.0, 28.0),
+                                                egui::DragValue::new(&mut j.port).range(1..=65535),
+                                            )
+                                            .on_hover_text("端口");
                                         });
                                         ui.end_row();
-                                        ui.label("波特率");
-                                        egui::ComboBox::from_id_salt("serial-baud")
-                                            .width(half)
-                                            .selected_text(self.serial.baud.to_string())
-                                            .show_ui(ui, |ui| {
-                                                for baud in BAUD_RATES {
-                                                    ui.selectable_value(
-                                                        &mut self.serial.baud,
-                                                        baud,
-                                                        baud.to_string(),
-                                                    );
-                                                }
-                                            });
-                                        ui.end_row();
-                                        ui.label("连接名称");
-                                        editing::field_with(ui, &mut self.serial.name, |edit| {
+                                        ui.label("用户名");
+                                        editing::field_with(ui, &mut j.user, |edit| {
                                             edit.desired_width(full)
                                         });
                                         ui.end_row();
-                                        ui.label("分组");
-                                        egui::ComboBox::from_id_salt("serial-group")
-                                            .width(half)
-                                            .selected_text(if self.serial.group.is_empty() {
-                                                "默认分组"
-                                            } else {
-                                                &self.serial.group
-                                            })
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut self.serial.group,
-                                                    String::new(),
-                                                    "默认分组",
-                                                );
-                                                for group in &self.settings.groups {
-                                                    ui.selectable_value(
-                                                        &mut self.serial.group,
-                                                        group.clone(),
-                                                        group,
-                                                    );
-                                                }
-                                            });
-                                        ui.end_row();
-                                        ui.label("标签颜色");
-                                        ui.horizontal(|ui| {
-                                            color_picker(ui, &mut self.serial.color, p);
+                                        ui.label("私钥");
+                                        editing::field_with(ui, &mut j.identity, |edit| {
+                                            edit.hint_text("可选").desired_width(full)
                                         });
                                         ui.end_row();
                                     });
-                            },
-                        );
-                        ui.label(hint("auto 优先选未占用的普通串口", p));
+                            }
+                            ui.separator();
+                            let add = crate::dialog::subheading(
+                                ui,
+                                Icon::Forward,
+                                "本地端口转发",
+                                p,
+                                |ui| {
+                                    icons::icon_button(ui, Icon::Plus, p, icons::Size::Row)
+                                        .on_hover_text("添加转发：本机 127.0.0.1:端口 → 远端地址")
+                                        .clicked()
+                                },
+                            );
+                            let mut remove = None;
+                            for (i, f) in self.remote.forwards.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        egui::vec2(64.0, 26.0),
+                                        egui::DragValue::new(&mut f.bind_port).range(1..=65535),
+                                    )
+                                    .on_hover_text("本机端口（127.0.0.1）");
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(16.0, 16.0),
+                                        Sense::hover(),
+                                    );
+                                    icons::draw(
+                                        ui.painter(),
+                                        rect,
+                                        Icon::ChevronRight,
+                                        p.muted,
+                                        1.4,
+                                    );
+                                    editing::field_with(ui, &mut f.target_host, |edit| {
+                                        edit.hint_text("目标主机").desired_width(half)
+                                    });
+                                    ui.add_sized(
+                                        egui::vec2(64.0, 26.0),
+                                        egui::DragValue::new(&mut f.target_port).range(1..=65535),
+                                    )
+                                    .on_hover_text("目标端口");
+                                    if icons::close_button(ui, p, "删除这条转发").clicked() {
+                                        remove = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(i) = remove {
+                                self.remote.forwards.remove(i);
+                            }
+                            if add {
+                                self.remote.forwards.push(Forward {
+                                    bind_port: 8080,
+                                    target_host: "127.0.0.1".into(),
+                                    target_port: 80,
+                                });
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
+                            icons::draw(ui.painter(), rect, Icon::Lock, p.muted, 1.3);
+                            ui.label(hint("密码不保存，连接时输入", p));
+                        });
+                    }
+                    ProfileKind::Serial => {
+                        crate::dialog::panel(ui, p, |ui| {
+                            egui::Grid::new("serial-form")
+                                .spacing([12.0, 6.0])
+                                .min_col_width(80.0)
+                                .show(ui, |ui| {
+                                    ui.label("串口");
+                                    let port =
+                                        editing::field_with(ui, &mut self.serial.port, |edit| {
+                                            edit.desired_width(full).hint_text(format!(
+                                                "{} 或 auto",
+                                                serial::PORT_EXAMPLE
+                                            ))
+                                        });
+                                    let port = port
+                                        .on_hover_text("auto：连接时自动选择一个未占用的普通串口");
+                                    serial_focus.request(ui, &port);
+                                    ui.end_row();
+                                    ui.label("选择端口");
+                                    ui.horizontal(|ui| {
+                                        egui::ComboBox::from_id_salt("serial-port-pick")
+                                            .selected_text("选择端口")
+                                            .width(half)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut self.serial.port,
+                                                    "auto".to_string(),
+                                                    "auto（自动）",
+                                                );
+                                                for port in &self.serial_ports {
+                                                    let label = if port.bluetooth {
+                                                        format!("{}（蓝牙）", port.name)
+                                                    } else {
+                                                        port.name.clone()
+                                                    };
+                                                    ui.selectable_value(
+                                                        &mut self.serial.port,
+                                                        port.name.clone(),
+                                                        label,
+                                                    );
+                                                }
+                                                if self.serial_ports.is_empty() {
+                                                    ui.label(hint("未检测到串口", p));
+                                                }
+                                            });
+                                        if icons::icon_button(
+                                            ui,
+                                            Icon::Refresh,
+                                            p,
+                                            icons::Size::Row,
+                                        )
+                                        .on_hover_text("重新检测串口")
+                                        .clicked()
+                                        {
+                                            refresh_ports = true;
+                                        }
+                                    });
+                                    ui.end_row();
+                                    ui.label("波特率");
+                                    egui::ComboBox::from_id_salt("serial-baud")
+                                        .width(half)
+                                        .selected_text(self.serial.baud.to_string())
+                                        .show_ui(ui, |ui| {
+                                            for baud in BAUD_RATES {
+                                                ui.selectable_value(
+                                                    &mut self.serial.baud,
+                                                    baud,
+                                                    baud.to_string(),
+                                                );
+                                            }
+                                        });
+                                    ui.end_row();
+                                    ui.label("连接名称");
+                                    editing::field_with(ui, &mut self.serial.name, |edit| {
+                                        edit.desired_width(full)
+                                    });
+                                    ui.end_row();
+                                    ui.label("分组");
+                                    egui::ComboBox::from_id_salt("serial-group")
+                                        .width(half)
+                                        .selected_text(if self.serial.group.is_empty() {
+                                            "默认分组"
+                                        } else {
+                                            &self.serial.group
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.serial.group,
+                                                String::new(),
+                                                "默认分组",
+                                            );
+                                            for group in &self.settings.groups {
+                                                ui.selectable_value(
+                                                    &mut self.serial.group,
+                                                    group.clone(),
+                                                    group,
+                                                );
+                                            }
+                                        });
+                                    ui.end_row();
+                                    ui.label("标签颜色");
+                                    ui.horizontal(|ui| {
+                                        color_picker(ui, &mut self.serial.color, p);
+                                    });
+                                    ui.end_row();
+                                });
+                        });
                     }
                 }
                 crate::dialog::footer(ui, |ui| {
                     if crate::dialog::secondary(ui, "取消").clicked() {
                         cancel_config = true;
                     }
-                    if crate::dialog::primary(ui, "保存并连接", p).clicked() {
+                    if crate::dialog::primary(ui, "保存并连接", p)
+                        .on_hover_text(accel("Ctrl+Enter"))
+                        .clicked()
+                    {
                         save = true;
                         connect = true;
                     }
                     ui.add_space((ui.available_width() - 80.0).max(0.0));
-                    if crate::dialog::secondary(ui, "保存").clicked() {
+                    if crate::dialog::secondary(ui, "保存")
+                        .on_hover_text("Enter")
+                        .clicked()
+                    {
                         save = true;
                     }
                 });
-                ui.label(hint("Enter 保存 · Ctrl+Enter 保存并连接", p));
                 if !cancel_config
                     && !egui::Popup::is_any_open(ui.ctx())
                     && !editing::ime_composing(ui.ctx())
@@ -635,19 +660,30 @@ impl App {
         let group_focus = editing::window_focus(ctx, "connection-groups", open);
         crate::dialog::Dialog::new("连接分组", Icon::Folder, p)
             .open(&mut open)
+            .default_width(540.0)
             .resizable(false)
             .show(ctx, |ui| {
                 let mut add_group = false;
                 ui.horizontal(|ui| {
-                    let width = (ui.available_width() - 150.0).max(160.0);
-                    let group = editing::field_with(ui, &mut self.new_group, |edit| {
-                        edit.desired_width(width).hint_text("新分组名称")
+                    ui.allocate_ui(egui::vec2(ui.available_width() - 42.0, 32.0), |ui| {
+                        let group = crate::dialog::icon_field(
+                            ui,
+                            Icon::NewFolder,
+                            "新分组名称",
+                            &mut self.new_group,
+                            false,
+                            p,
+                        );
+                        group_focus.request(ui, &group);
                     });
-                    group_focus.request(ui, &group);
-                    if crate::dialog::primary(ui, "添加", p).clicked() {
+                    if crate::dialog::primary_icon(ui, Icon::Plus, p)
+                        .on_hover_text("添加分组 (Enter)")
+                        .clicked()
+                    {
                         add_group = true;
                     }
                 });
+                ui.add_space(4.0);
                 if !egui::Popup::is_any_open(ui.ctx())
                     && !editing::ime_composing(ui.ctx())
                     && ui.input(|i| i.key_pressed(Key::Enter))
@@ -680,29 +716,34 @@ impl App {
                 for (i, group) in self.settings.groups.iter_mut().enumerate() {
                     let old = group.clone();
                     ui.push_id(i, |ui| {
-                        egui::Frame::group(ui.style())
-                            .inner_margin(10)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let width = (ui.available_width() - 90.0).max(150.0);
-                                    if editing::field_with(ui, group, |edit| {
-                                        edit.desired_width(width)
-                                    })
-                                    .changed()
-                                    {
-                                        rename = Some((old.clone(), group.clone()));
-                                    }
-                                    if ui.button("删除").clicked() {
-                                        remove = Some(i);
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label(hint("颜色", p));
-                                    if color_picker(ui, &mut colors[i], p) {
-                                        recolor = true;
-                                    }
-                                });
-                            })
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(34.0);
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::hover());
+                            icons::draw(
+                                ui.painter(),
+                                rect,
+                                Icon::Folder,
+                                parse_tag_color(&colors[i]).unwrap_or(p.muted),
+                                1.4,
+                            );
+                            if editing::field_with(ui, group, |edit| edit.desired_width(150.0))
+                                .changed()
+                            {
+                                rename = Some((old.clone(), group.clone()));
+                            }
+                            if color_picker(ui, &mut colors[i], p) {
+                                recolor = true;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if icons::icon_button(ui, Icon::Trash, p, icons::Size::Row)
+                                    .on_hover_text("删除分组（其中的连接移到默认分组）")
+                                    .clicked()
+                                {
+                                    remove = Some(i);
+                                }
+                            });
+                        });
                     });
                 }
                 if recolor {
@@ -748,7 +789,11 @@ impl App {
                     }
                     modified = true;
                 }
-                ui.label(hint("连接颜色优先于分组；删除分组不删除连接。", p));
+                if self.settings.groups.is_empty() {
+                    ui.label(hint("还没有分组", p));
+                }
+                ui.add_space(4.0);
+                ui.label(hint("连接自身的颜色优先于分组颜色", p));
             });
         self.groups_open = open;
         if modified {
@@ -791,38 +836,67 @@ impl App {
             let mut cancel = false;
             let mut refresh = false;
             if let Some(picker) = &mut self.serial_picker {
-                crate::dialog::Dialog::new("连接串口", Icon::Connect, p)
+                crate::dialog::Dialog::new("连接串口", Icon::Serial, p)
                     .open(&mut open)
                     .collapsible(false)
                     .resizable(false)
                     .default_width(400.0)
                     .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("串口");
-                            let port = editing::field_with(ui, &mut picker.port, |edit| {
-                                edit.desired_width(200.0)
-                                    .hint_text(format!("{} 或 auto", serial::PORT_EXAMPLE))
-                            });
-                            picker_focus.request(ui, &port);
-                        });
-                        if picker.ports.is_empty() {
-                            ui.label(hint("未检测到设备，可输入端口或 auto。", p));
-                        } else {
+                        let port = crate::dialog::icon_field(
+                            ui,
+                            Icon::Serial,
+                            &format!("端口，如 {} 或 auto", serial::PORT_EXAMPLE),
+                            &mut picker.port,
+                            false,
+                            p,
+                        );
+                        picker_focus.request(ui, &port);
+                        ui.add_space(4.0);
+                        crate::dialog::panel(ui, p, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            let mut rows =
+                                vec![("auto".to_string(), "auto · 自动选择".to_string())];
+                            rows.extend(picker.ports.iter().map(|port| {
+                                (
+                                    port.name.clone(),
+                                    if port.bluetooth {
+                                        format!("{} · 蓝牙", port.name)
+                                    } else {
+                                        port.name.clone()
+                                    },
+                                )
+                            }));
                             egui::ScrollArea::vertical()
-                                .max_height(220.0)
+                                .max_height(200.0)
                                 .show(ui, |ui| {
-                                    for port in &picker.ports {
-                                        let label = if port.bluetooth {
-                                            format!("{}（蓝牙）", port.name)
-                                        } else {
-                                            port.name.clone()
-                                        };
-                                        ui.radio_value(&mut picker.port, port.name.clone(), label);
+                                    for (name, label) in rows {
+                                        let row = ui
+                                            .push_id(&name, |ui| {
+                                                icons::navigation_row(
+                                                    ui,
+                                                    Icon::Serial,
+                                                    &label,
+                                                    picker.port.eq_ignore_ascii_case(&name),
+                                                    None,
+                                                    p,
+                                                )
+                                            })
+                                            .inner;
+                                        if row.clicked() {
+                                            picker.port = name.clone();
+                                        }
+                                        if row.double_clicked() {
+                                            picker.port = name;
+                                            connect = true;
+                                        }
                                     }
                                 });
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label("波特率");
+                            if picker.ports.is_empty() {
+                                ui.label(hint("未检测到串口设备", p));
+                            }
+                        });
+                        ui.add_space(4.0);
+                        crate::dialog::setting_row(ui, Icon::Forward, "波特率", None, p, |ui| {
                             egui::ComboBox::from_id_salt("picker-baud")
                                 .width(120.0)
                                 .selected_text(picker.baud.to_string())
@@ -843,14 +917,18 @@ impl App {
                             if crate::dialog::primary(ui, "连接", p).clicked() {
                                 connect = true;
                             }
-                            if crate::dialog::secondary(ui, "刷新").clicked() {
-                                refresh = true;
-                            }
-                            if crate::dialog::secondary(ui, "占用排查")
-                                .on_hover_text("查看哪个程序占着这个端口")
+                            ui.add_space((ui.available_width() - 60.0).max(0.0));
+                            if icons::icon_button(ui, Icon::Search, p, icons::Size::Button)
+                                .on_hover_text("占用排查：查看哪个程序占着这个端口")
                                 .clicked()
                             {
                                 inspect = true;
+                            }
+                            if icons::icon_button(ui, Icon::Refresh, p, icons::Size::Button)
+                                .on_hover_text("重新检测串口")
+                                .clicked()
+                            {
+                                refresh = true;
                             }
                         });
                         if !cancel
@@ -885,102 +963,125 @@ impl App {
                 self.serial_picker = None;
             }
         }
-        crate::dialog::Dialog::new("快捷键帮助", Icon::Help, p)
+        crate::dialog::Dialog::new("快捷键", Icon::Keyboard, p)
             .open(&mut self.help_open)
-            .default_width(480.0)
-            .default_height(480.0)
+            .default_width(620.0)
+            .default_height(520.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(
-                        RichText::new(concat!(
-                            "G-Terminal ",
-                            env!("CARGO_PKG_VERSION"),
-                            " · Native. Fast. Yours."
-                        ))
-                        .color(p.accent),
-                    );
-                    ui.hyperlink_to(
-                        "GitHub · 查看项目与帮助文档",
-                        "https://github.com/firmme/G-Terminal",
-                    );
-                    ui.add_space(6.0);
                     let copy_paste = if ACCEL == "Cmd" {
                         "Cmd+C / Cmd+V".to_string()
                     } else {
-                        accel("Ctrl+Shift+C / V")
+                        accel("Ctrl+Shift+C / Ctrl+Shift+V")
                     };
-                    for (key, description) in [
-                        (accel("Ctrl+Shift+T / W"), "新建标签 / 关闭窗格"),
-                        (accel("Ctrl+Shift+D / E"), "左右 / 上下分屏"),
-                        (
-                            format!("Ctrl+Tab / {}", alt_accel("Right")),
-                            "切换标签 / 窗格",
-                        ),
-                        (copy_paste, "复制 / 粘贴"),
-                        ("Ctrl+C".to_string(), "终端中断"),
-                        (
-                            format!("{} / {}", alt_accel("C"), alt_accel("R")),
-                            "断开 / 重连当前会话",
-                        ),
-                        (accel("Ctrl+Shift+F"), "全部保留历史查找"),
-                        (accel("Ctrl+Shift+B / Ctrl+,"), "导航栏 / 设置"),
-                        ("中键 / Shift+鼠标".to_string(), "粘贴 / 强制选择"),
-                        (accel("Ctrl+Plus / Minus / 0"), "字号放大 / 缩小 / 重置"),
-                    ] {
-                        ui.horizontal(|ui| {
-                            ui.monospace(key);
-                            ui.label(description);
-                        });
-                    }
-                    ui.separator();
+                    let rows: [(Icon, &str, String); 12] = [
+                        (Icon::Plus, "新建标签", accel("Ctrl+Shift+T")),
+                        (Icon::ClosePane, "关闭窗格", accel("Ctrl+Shift+W")),
+                        (Icon::SplitHorizontal, "左右分屏", accel("Ctrl+Shift+D")),
+                        (Icon::SplitVertical, "上下分屏", accel("Ctrl+Shift+E")),
+                        (Icon::ChevronRight, "下一个标签", "Ctrl+Tab".to_string()),
+                        (Icon::ChevronRight, "下一个窗格", alt_accel("Right")),
+                        (Icon::Close, "中断程序", "Ctrl+C".to_string()),
+                        (Icon::Disconnect, "断开", alt_accel("C")),
+                        (Icon::Reconnect, "重新连接", alt_accel("R")),
+                        (Icon::Search, "查找输出", accel("Ctrl+Shift+F")),
+                        (Icon::Sidebar, "导航栏", accel("Ctrl+Shift+B")),
+                        (Icon::Settings, "偏好设置", accel("Ctrl+,")),
+                    ];
+                    ui.columns(2, |columns| {
+                        for (index, (icon, description, keys)) in rows.iter().enumerate() {
+                            key_row(&mut columns[index % 2], Some(*icon), description, keys, p);
+                        }
+                    });
+                    // The long combinations get the full width.
+                    key_row(ui, Some(Icon::Copy), "复制 / 粘贴", &copy_paste, p);
+                    key_row(
+                        ui,
+                        Some(Icon::FileText),
+                        "字号 放大 / 缩小 / 还原",
+                        &accel("Ctrl+Plus / Ctrl+Minus / Ctrl+0"),
+                        p,
+                    );
+                    ui.columns(2, |columns| {
+                        key_row(
+                            &mut columns[0],
+                            Some(Icon::Copy),
+                            "中键粘贴",
+                            "MiddleClick",
+                            p,
+                        );
+                        key_row(
+                            &mut columns[1],
+                            Some(Icon::Terminal),
+                            "强制选择",
+                            "Shift+Drag",
+                            p,
+                        );
+                    });
                     if let Some(tab) = self.tabs.get(self.active) {
                         let session = &tab.panes[tab.focused].session;
                         let mut shell = shortcut_shell(&session.kind);
-                        ui.label(
-                            RichText::new(format!("当前会话：{}", session.kind.label()))
-                                .strong()
-                                .color(p.accent),
-                        );
-                        if matches!(shell, ShortcutShell::Unknown | ShortcutShell::Ssh) {
-                            if shell == ShortcutShell::Unknown {
-                                ui.label(hint("选择当前使用的 Shell", p));
-                            } else {
-                                ui.label(hint("SSH 默认使用 Unix 快捷键；可切换远端 Shell。", p));
-                            }
-                            let id = egui::Id::new(("help-shell", tab.panes[tab.focused].id));
-                            let mut selected = ui
-                                .ctx()
-                                .data_mut(|data| data.get_temp::<ShortcutShell>(id))
-                                .unwrap_or(shell);
-                            egui::ComboBox::from_id_salt(id)
-                                .selected_text(selected.label())
-                                .show_ui(ui, |ui| {
-                                    if shell == ShortcutShell::Ssh {
-                                        ui.selectable_value(
-                                            &mut selected,
-                                            ShortcutShell::Ssh,
-                                            ShortcutShell::Ssh.label(),
-                                        );
-                                    }
-                                    for candidate in [
-                                        ShortcutShell::Unix,
-                                        ShortcutShell::PowerShell,
-                                        ShortcutShell::Cmd,
-                                    ] {
-                                        ui.selectable_value(
-                                            &mut selected,
-                                            candidate,
-                                            candidate.label(),
-                                        );
-                                    }
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::hover());
+                            icons::draw(
+                                ui.painter(),
+                                rect,
+                                sidebar::kind_icon(&session.kind),
+                                p.accent,
+                                1.4,
+                            );
+                            ui.label(RichText::new(session.kind.label()).strong().color(p.text));
+                            if matches!(shell, ShortcutShell::Unknown | ShortcutShell::Ssh) {
+                                let id = egui::Id::new(("help-shell", tab.panes[tab.focused].id));
+                                let mut selected = ui
+                                    .ctx()
+                                    .data_mut(|data| data.get_temp::<ShortcutShell>(id))
+                                    .unwrap_or(shell);
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    egui::ComboBox::from_id_salt(id)
+                                        .selected_text(selected.label())
+                                        .show_ui(ui, |ui| {
+                                            if shell == ShortcutShell::Ssh {
+                                                ui.selectable_value(
+                                                    &mut selected,
+                                                    ShortcutShell::Ssh,
+                                                    ShortcutShell::Ssh.label(),
+                                                );
+                                            }
+                                            for candidate in [
+                                                ShortcutShell::Unix,
+                                                ShortcutShell::PowerShell,
+                                                ShortcutShell::Cmd,
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut selected,
+                                                    candidate,
+                                                    candidate.label(),
+                                                );
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text("远端或当前 Shell");
                                 });
-                            ui.ctx().data_mut(|data| data.insert_temp(id, selected));
-                            shell = selected;
-                        }
+                                ui.ctx().data_mut(|data| data.insert_temp(id, selected));
+                                shell = selected;
+                            }
+                        });
                         if shell != ShortcutShell::Unknown {
                             show_shell_shortcuts(ui, shell, p);
                         }
                     }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(hint(concat!("G-Terminal ", env!("CARGO_PKG_VERSION")), p));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.hyperlink_to("GitHub", "https://github.com/firmme/G-Terminal");
+                        });
+                    });
                 });
             });
         if let Some(login) = &mut self.login {
@@ -1109,38 +1210,87 @@ fn shortcut_shell(kind: &SessionKind) -> ShortcutShell {
     }
 }
 
-fn shortcut_rows(ui: &mut egui::Ui, rows: &[(&str, &str)]) {
-    egui::Grid::new(ui.next_auto_id())
-        .spacing([16.0, 5.0])
-        .show(ui, |ui| {
-            for &(key, description) in rows {
-                ui.monospace(key);
-                ui.label(description);
-                ui.end_row();
+/// A shortcut: what it does on the left, its keys drawn as keycaps on the
+/// right. `keys` is written `Ctrl+Shift+T`, alternatives separated by ` / `.
+fn key_row(ui: &mut egui::Ui, icon: Option<Icon>, description: &str, keys: &str, p: Palette) {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 28.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, 28.0));
+            if let Some(icon) = icon {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+                icons::draw(ui.painter(), rect, icon, p.muted, 1.3);
             }
-        });
+            ui.label(RichText::new(description).color(p.text));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                // Laid out right to left, so the pieces go in reverse.
+                let alternatives: Vec<&str> = keys.split(" / ").collect();
+                for (index, alternative) in alternatives.iter().rev().enumerate() {
+                    if index > 0 {
+                        ui.label(RichText::new("/").size(12.0).color(p.muted));
+                    }
+                    for key in alternative.split('+').rev() {
+                        keycap(ui, key, p);
+                    }
+                }
+            });
+        },
+    );
+}
+
+/// One key, drawn as a small raised cap.
+fn keycap(ui: &mut egui::Ui, key: &str, p: Palette) {
+    let label = match key {
+        "MiddleClick" => "中键",
+        "Drag" => "拖动",
+        "Plus" => "+",
+        "Minus" => "−",
+        "Right" => "→",
+        "Left" => "←",
+        "Up" => "↑",
+        "Down" => "↓",
+        other => other,
+    };
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), egui::FontId::monospace(11.5), p.text);
+    let size = egui::vec2((galley.size().x + 10.0).max(20.0), 20.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter()
+        .rect_filled(rect.translate(egui::vec2(0.0, 1.5)), 4, p.line);
+    ui.painter().rect_filled(rect, 4, p.raised);
+    ui.painter().rect_stroke(
+        rect,
+        4,
+        egui::Stroke::new(1.0_f32, p.line),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, p.text);
+}
+
+fn shortcut_rows(ui: &mut egui::Ui, rows: &[(&str, &str)], p: Palette) {
+    ui.columns(2, |columns| {
+        for (index, &(keys, description)) in rows.iter().enumerate() {
+            key_row(&mut columns[index % 2], None, description, keys, p);
+        }
+    });
 }
 
 fn shortcut_group(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)], p: Palette) {
-    ui.add_space(8.0);
-    ui.label(RichText::new(title).strong().color(p.accent));
-    shortcut_rows(ui, rows);
+    crate::dialog::group_title(ui, title, p);
+    shortcut_rows(ui, rows, p);
 }
 
 fn show_shell_shortcuts(ui: &mut egui::Ui, shell: ShortcutShell, p: Palette) {
     match shell {
         ShortcutShell::Unknown => {}
         ShortcutShell::Ssh | ShortcutShell::Unix => {
-            ui.label(
-                RichText::new(if shell == ShortcutShell::Ssh {
-                    "SSH · Bash / Zsh / Ksh"
-                } else {
-                    "Bash / Zsh / Ksh"
-                })
-                .strong(),
-            );
             ui.label(hint(
-                "适用于常见 Emacs/Readline 编辑模式；Vi 模式或自定义键位可能不同。",
+                "Emacs / Readline 键位；Vi 模式或自定义键位可能不同。",
                 p,
             ));
             shortcut_group(
@@ -1175,14 +1325,13 @@ fn show_shell_shortcuts(ui: &mut egui::Ui, shell: ShortcutShell, p: Palette) {
             );
         }
         ShortcutShell::PowerShell => {
-            ui.label(RichText::new("PowerShell（PSReadLine）").strong());
             shortcut_group(
                 ui,
                 "光标移动",
                 &[
                     ("Home / Ctrl+A", "跳到行首"),
                     ("End / Ctrl+E", "跳到行尾"),
-                    ("Ctrl+Left / Right", "向左 / 向右跳一个词"),
+                    ("Ctrl+Left / Ctrl+Right", "向左 / 向右跳一个词"),
                 ],
                 p,
             );
@@ -1193,7 +1342,7 @@ fn show_shell_shortcuts(ui: &mut egui::Ui, shell: ShortcutShell, p: Palette) {
                     ("Ctrl+Backspace", "向左删一个词"),
                     ("Ctrl+Delete", "向右删一个词"),
                     ("Esc", "清空整行"),
-                    ("Ctrl+Home / End", "删到行首 / 行尾"),
+                    ("Ctrl+Home / Ctrl+End", "删到行首 / 行尾"),
                     ("Shift+Enter", "换行输入"),
                 ],
                 p,
@@ -1213,13 +1362,12 @@ fn show_shell_shortcuts(ui: &mut egui::Ui, shell: ShortcutShell, p: Palette) {
             );
         }
         ShortcutShell::Cmd => {
-            ui.label(RichText::new("Windows CMD").strong());
             shortcut_group(
                 ui,
                 "光标移动与编辑",
                 &[
                     ("Home / End", "跳到行首 / 行尾"),
-                    ("Ctrl+Left / Right", "向左 / 向右跳一个词"),
+                    ("Ctrl+Left / Ctrl+Right", "向左 / 向右跳一个词"),
                     ("Esc", "清空整行"),
                 ],
                 p,
@@ -1239,9 +1387,8 @@ fn show_shell_shortcuts(ui: &mut egui::Ui, shell: ShortcutShell, p: Palette) {
             );
         }
         ShortcutShell::Serial => {
-            ui.label(RichText::new("串口终端").strong());
             ui.label(hint(
-                "串口没有统一的命令行快捷键；编辑行为由串口设备决定。",
+                "编辑行为由串口设备决定，以下为 G-Terminal 自身操作。",
                 p,
             ));
             let copy_paste = if ACCEL == "Cmd" {
@@ -1256,7 +1403,7 @@ fn show_shell_shortcuts(ui: &mut egui::Ui, shell: ShortcutShell, p: Palette) {
                 &[
                     ("Enter", "发送回车"),
                     (&copy_paste, "复制 / 粘贴终端文本"),
-                    ("Shift+PageUp / Down", "滚动终端历史"),
+                    ("Shift+PageUp / Shift+PageDown", "滚动终端历史"),
                     (&connection, "断开 / 重连串口"),
                 ],
                 p,

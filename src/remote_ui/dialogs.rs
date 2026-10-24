@@ -2,6 +2,7 @@
 //! confirmation, properties and the permission editor.
 
 use super::*;
+use g_terminal::LockExt;
 
 /// A checkbox for one permission bit.
 pub(super) fn bit_box(ui: &mut egui::Ui, mode: &mut u32, label: &str, mask: u32) -> egui::Response {
@@ -202,7 +203,7 @@ impl Files {
             } else {
                 std::fs::remove_file(&path)
             };
-            *state.lock().unwrap() = Some(match outcome {
+            *state.locked() = Some(match outcome {
                 Ok(()) => Ok(format!("已删除 {}", file_name_of(&path))),
                 Err(e) => Err(format!("删除失败：{e}")),
             });
@@ -244,14 +245,14 @@ impl Files {
         let wake = wake(ctx);
         remote::runtime().spawn(async move {
             let fail = |state: &Outcome, message: String| {
-                *state.lock().unwrap() = Some(Err(message));
+                *state.locked() = Some(Err(message));
             };
             if let Err(e) = remote::fetch(&connection, &remote, &local).await {
                 fail(&state, format!("{e:#}"));
                 wake();
                 return;
             }
-            *state.lock().unwrap() = Some(Ok(if edit {
+            *state.locked() = Some(Ok(if edit {
                 "已打开，保存后自动回传".into()
             } else {
                 "已下载并打开".into()
@@ -282,7 +283,7 @@ impl Files {
                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;
                 last = save_stamp(&local);
                 let outcome = remote::put(&connection, &remote, &local).await;
-                *state.lock().unwrap() = Some(match outcome {
+                *state.locked() = Some(match outcome {
                     Ok(()) => Ok("已回传".into()),
                     Err(e) => Err(format!("回传失败：{e:#}")),
                 });
@@ -308,7 +309,7 @@ impl Files {
                     let result = walk_local(&path)
                         .map(|paths| paths.len())
                         .map_err(|e| format!("{e:#}"));
-                    *state.lock().unwrap() = Some(result);
+                    *state.locked() = Some(result);
                     wake();
                 });
             }
@@ -320,7 +321,7 @@ impl Files {
                         Ok(remote::walk_remote(&sftp, &path).await?.len())
                     }
                     .await;
-                    *state.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+                    *state.locked() = Some(result.map_err(|e| format!("{e:#}")));
                     wake();
                 });
             }
@@ -333,7 +334,7 @@ impl Files {
         let Some(slot) = &self.counting else {
             return;
         };
-        let landed = slot.lock().unwrap().clone();
+        let landed = slot.locked().clone();
         let Some(landed) = landed else {
             return;
         };
@@ -367,7 +368,7 @@ impl Files {
                 let path = path.clone();
                 std::thread::spawn(move || {
                     let result = apply_local_mode(&path, mode, recursive, &progress, &wake);
-                    *outcome.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+                    *outcome.locked() = Some(result.map_err(|e| format!("{e:#}")));
                     wake();
                 });
             }
@@ -420,7 +421,7 @@ impl Files {
                         })
                     }
                     .await;
-                    *outcome.lock().unwrap() = Some(result.map_err(|e| format!("{e:#}")));
+                    *outcome.locked() = Some(result.map_err(|e| format!("{e:#}")));
                     wake();
                 });
             }

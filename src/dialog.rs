@@ -252,14 +252,8 @@ pub(crate) fn header(
     }
 }
 
-pub(crate) fn card<R>(
-    ui: &mut egui::Ui,
-    p: Palette,
-    icon: Icon,
-    title: &str,
-    description: &str,
-    body: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
+/// A plain inset panel for a form.
+pub(crate) fn panel<R>(ui: &mut egui::Ui, p: Palette, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
         .fill(p.bg.gamma_multiply(0.8))
         .stroke(Stroke::new(1.0_f32, p.line))
@@ -267,23 +261,206 @@ pub(crate) fn card<R>(
         .inner_margin(12)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 7, p.raised);
-                icons::draw(ui.painter(), rect.shrink(6.0), icon, p.accent, 1.4);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.label(RichText::new(title).strong().size(15.0).color(p.text));
-                    if !description.is_empty() {
-                        ui.label(RichText::new(description).size(12.0).color(p.muted));
-                    }
-                });
-            });
-            ui.separator();
             body(ui)
         })
         .inner
+}
+
+/// An icon and a title, with optional controls pushed to the right.
+pub(crate) fn subheading<R>(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    title: &str,
+    p: Palette,
+    trailing: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.horizontal(|ui| {
+        ui.set_min_height(28.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+        icons::draw(ui.painter(), rect, icon, p.muted, 1.3);
+        ui.label(RichText::new(title).strong().color(p.text));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing)
+            .inner
+    })
+    .inner
+}
+
+/// A small heading over a group of setting rows.
+pub(crate) fn group_title(ui: &mut egui::Ui, title: &str, p: Palette) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(title).size(12.0).strong().color(p.muted));
+    ui.add_space(2.0);
+}
+
+/// One setting: its icon and name on the left, its control on the right. The
+/// explanation, when there is one, is a tooltip rather than more text.
+pub(crate) fn setting_row<R>(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    tip: Option<&str>,
+    p: Palette,
+    control: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 32.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, 32.0));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+            icons::draw(ui.painter(), rect, icon, p.muted, 1.3);
+            let label = ui.label(RichText::new(label).color(if ui.is_enabled() {
+                p.text
+            } else {
+                p.muted
+            }));
+            if let Some(tip) = tip {
+                label.on_hover_text(tip);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control)
+                .inner
+        },
+    )
+    .inner
+}
+
+/// An on/off switch. Returns whether it was flipped.
+pub(crate) fn switch(ui: &mut egui::Ui, on: &mut bool, p: Palette) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(egui::vec2(36.0, 20.0), egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
+    });
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_with_time(response.id, *on, 0.12);
+        let enabled = ui.is_enabled();
+        // Off reads as a recessed grey track in both themes.
+        let off = p.raised.lerp_to_gamma(p.muted, 0.35);
+        let track = if enabled {
+            off.lerp_to_gamma(p.accent, t)
+        } else {
+            off.gamma_multiply(0.6)
+        };
+        ui.painter().rect_filled(rect, 10, track);
+        if response.hovered() && enabled {
+            ui.painter().rect_stroke(
+                rect,
+                10,
+                Stroke::new(1.0_f32, p.accent.gamma_multiply(0.6)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let x = egui::lerp(rect.left() + 10.0..=rect.right() - 10.0, t);
+        let knob = egui::pos2(x, rect.center().y);
+        ui.painter()
+            .circle_filled(knob, 7.0, if enabled { Color32::WHITE } else { p.panel });
+        ui.painter().circle_stroke(
+            knob,
+            7.0,
+            Stroke::new(1.0_f32, Color32::from_black_alpha(40)),
+        );
+    }
+    response
+}
+
+/// A row of mutually exclusive choices, each an icon and a short word.
+pub(crate) fn segmented(
+    ui: &mut egui::Ui,
+    options: &[(Icon, &str)],
+    selected: &mut usize,
+    p: Palette,
+) -> bool {
+    let mut changed = false;
+    let segment = egui::vec2(64.0, 26.0);
+    let (outer, _) = ui.allocate_exact_size(
+        egui::vec2(segment.x * options.len() as f32 + 4.0, segment.y + 4.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(outer, 8, p.field);
+    ui.painter().rect_stroke(
+        outer,
+        8,
+        Stroke::new(1.0_f32, p.line),
+        egui::StrokeKind::Inside,
+    );
+    for (index, (icon, label)) in options.iter().enumerate() {
+        let rect = egui::Rect::from_min_size(
+            outer.min + egui::vec2(2.0 + segment.x * index as f32, 2.0),
+            segment,
+        );
+        let response = ui.interact(rect, ui.id().with(("segment", index)), egui::Sense::click());
+        if response.clicked() && *selected != index {
+            *selected = index;
+            changed = true;
+        }
+        let active = *selected == index;
+        if active {
+            ui.painter().rect_filled(rect, 6, p.raised);
+        }
+        let color = if active || response.hovered() {
+            p.text
+        } else {
+            p.muted
+        };
+        icons::draw(
+            ui.painter(),
+            egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 16.0, rect.center().y),
+                egui::Vec2::splat(14.0),
+            ),
+            *icon,
+            if active { p.accent } else { color },
+            1.4,
+        );
+        ui.painter().text(
+            egui::pos2(rect.left() + 28.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            *label,
+            egui::FontId::proportional(13.0),
+            color,
+        );
+    }
+    changed
+}
+
+/// A text field led by an icon, with its name as placeholder text instead of
+/// a separate label.
+pub(crate) fn icon_field(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    placeholder: &str,
+    value: &mut String,
+    password: bool,
+    p: Palette,
+) -> egui::Response {
+    let width = ui.available_width();
+    egui::Frame::new()
+        .fill(p.field)
+        .stroke(Stroke::new(1.0_f32, p.line.linear_multiply(1.4)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.set_width(width - 18.0);
+            ui.horizontal(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                icons::draw(ui.painter(), rect, icon, p.muted, 1.3);
+                let field_width = ui.available_width();
+                crate::editing::field_with(ui, value, |edit| {
+                    edit.hint_text(placeholder)
+                        .password(password)
+                        .frame(false)
+                        .desired_width(field_width)
+                })
+            })
+            .inner
+        })
+        .inner
+        .on_hover_text(placeholder)
 }
 
 pub(crate) fn primary(ui: &mut egui::Ui, label: &str, p: Palette) -> egui::Response {
@@ -304,6 +481,32 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, icon: Icon, p: Palette) -> egui::Re
     response
 }
 
+/// A square accent button carrying only an icon, for a form's main action.
+pub(crate) fn primary_icon(ui: &mut egui::Ui, icon: Icon, p: Palette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(34.0, 32.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if response.hovered() {
+            p.accent.gamma_multiply(0.85)
+        } else {
+            p.accent
+        };
+        ui.painter().rect_filled(rect, 6, fill);
+        let ink = if p.panel.r() > 128 {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(7, 25, 32)
+        };
+        icons::draw(
+            ui.painter(),
+            egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(18.0)),
+            icon,
+            ink,
+            1.8,
+        );
+    }
+    response
+}
+
 pub(crate) fn secondary(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(egui::Button::new(label).min_size(egui::vec2(80.0, 32.0)))
 }
@@ -319,16 +522,38 @@ pub(crate) fn footer<R>(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui) -> R
     .inner
 }
 
-pub(crate) fn tab(ui: &mut egui::Ui, label: &str, selected: bool, p: Palette) -> egui::Response {
-    let response = ui.add_sized(
-        [76.0, 30.0],
-        egui::Button::new(RichText::new(label).size(15.0).color(if selected {
-            p.accent
+pub(crate) fn tab(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    selected: bool,
+    p: Palette,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(92.0, 32.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let color = if selected || response.hovered() {
+            if selected { p.accent } else { p.text }
         } else {
             p.muted
-        }))
-        .frame(false),
-    );
+        };
+        icons::draw(
+            ui.painter(),
+            egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 22.0, rect.center().y),
+                egui::Vec2::splat(16.0),
+            ),
+            icon,
+            color,
+            1.4,
+        );
+        ui.painter().text(
+            egui::pos2(rect.left() + 36.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(15.0),
+            color,
+        );
+    }
     if selected {
         ui.painter().hline(
             response.rect.x_range(),

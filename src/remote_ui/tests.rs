@@ -727,3 +727,16 @@ fn benchmark_ten_thousand_file_rows() {
         );
     }
 }
+
+/// Links come from terminal output, so only web links are handed to the OS;
+/// anything else is refused before a handler is launched.
+#[test]
+fn only_web_links_are_opened() {
+    for url in [
+        "file:///C:/Windows/System32/calc.exe",
+        "javascript:alert(1)",
+        "calc",
+    ] {
+        assert!(open_url(url).is_err(), "{url} should be refused");
+    }
+}

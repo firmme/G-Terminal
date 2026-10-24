@@ -1,6 +1,7 @@
 //! Remote directory listings.
 
 use super::*;
+use crate::LockExt;
 
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -64,7 +65,7 @@ pub fn list_directory(
             Ok((canonical, entries))
         }
         .await;
-        let mut s = output.lock().unwrap();
+        let mut s = output.locked();
         s.loading = false;
         match result {
             Ok((path, entries)) => {

@@ -38,6 +38,12 @@ pub struct Settings {
     /// copy in `settings.json`.
     #[serde(skip)]
     pub ssh_config_profiles: Vec<RemoteProfile>,
+    /// This window's view of the file as of its last load or save. Another
+    /// window may have saved since; [`merge`] uses this to tell what *this*
+    /// window changed, so only those changes are laid over the file.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub baseline: Option<serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -63,6 +69,7 @@ impl Default for Settings {
             auto_hide_sidebar: false,
             workspace: Vec::new(),
             ssh_config_profiles: Vec::new(),
+            baseline: None,
         }
     }
 }
@@ -83,62 +90,36 @@ impl Settings {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).context("设置不是有效的 JSON")?;
         let mut settings = Self::default();
-        if let Some(v) = read_field(&value, "font_size") {
-            settings.font_size = v;
+        // Every persisted field except `workspace`, which is read tab by tab below.
+        macro_rules! read_fields {
+            ($($field:ident),* $(,)?) => {$(
+                if let Some(v) = read_field(&value, stringify!($field)) {
+                    settings.$field = v;
+                }
+            )*};
         }
-        if let Some(v) = read_field(&value, "scrollback") {
-            settings.scrollback = v;
-        }
-        if let Some(v) = read_field(&value, "light_theme") {
-            settings.light_theme = v;
-        }
-        if let Some(v) = read_field(&value, "sidebar") {
-            settings.sidebar = v;
-        }
-        if let Some(v) = read_field(&value, "default_shell") {
-            settings.default_shell = v;
-        }
-        if let Some(v) = read_field(&value, "search_engine") {
-            settings.search_engine = v;
-        }
-        if let Some(v) = read_field(&value, "profiles") {
-            settings.profiles = v;
-        }
-        if let Some(v) = read_field(&value, "serial_profiles") {
-            settings.serial_profiles = v;
-        }
-        if let Some(v) = read_field(&value, "groups") {
-            settings.groups = v;
-        }
-        if let Some(v) = read_field(&value, "recent_connections") {
-            settings.recent_connections = v;
-        }
-        if let Some(v) = read_field(&value, "group_colors") {
-            settings.group_colors = v;
-        }
-        if let Some(v) = read_field(&value, "copy_on_select") {
-            settings.copy_on_select = v;
-        }
-        if let Some(v) = read_field(&value, "serial_background_timeout_enabled") {
-            settings.serial_background_timeout_enabled = v;
-        }
-        if let Some(v) = read_field(&value, "serial_background_timeout_minutes") {
-            settings.serial_background_timeout_minutes = v;
-        }
+        read_fields!(
+            font_size,
+            scrollback,
+            light_theme,
+            sidebar,
+            default_shell,
+            search_engine,
+            profiles,
+            serial_profiles,
+            groups,
+            recent_connections,
+            group_colors,
+            copy_on_select,
+            serial_background_timeout_enabled,
+            serial_background_timeout_minutes,
+            hide_dotfiles,
+            restore_tabs,
+            confirm_on_exit,
+            auto_hide_sidebar,
+        );
         settings.serial_background_timeout_minutes =
             settings.serial_background_timeout_minutes.clamp(1, 1440);
-        if let Some(v) = read_field(&value, "hide_dotfiles") {
-            settings.hide_dotfiles = v;
-        }
-        if let Some(v) = read_field(&value, "restore_tabs") {
-            settings.restore_tabs = v;
-        }
-        if let Some(v) = read_field(&value, "confirm_on_exit") {
-            settings.confirm_on_exit = v;
-        }
-        if let Some(v) = read_field(&value, "auto_hide_sidebar") {
-            settings.auto_hide_sidebar = v;
-        }
         if let Some(entries) = value.get("workspace").and_then(|v| v.as_array()) {
             // A tab that cannot be rebuilt is skipped; the others still are.
             settings.workspace = entries
@@ -174,19 +155,99 @@ impl Settings {
         // The SSH config is authoritative and never stored, so it is (re)read
         // here rather than parsed out of the settings file.
         settings.ssh_config_profiles = load_ssh_config();
+        settings.baseline = serde_json::to_value(&settings).ok();
         Ok(settings)
     }
 
-    pub fn save(&self) -> Result<()> {
+    /// Writes this window's changes over whatever is on disk now.
+    ///
+    /// Every window is its own process with its own copy of the settings. A
+    /// plain overwrite let one window's stale copy erase a connection another
+    /// window had just saved, so the file is re-read and only what changed
+    /// here since the last load or save is applied on top of it.
+    pub fn save(&mut self) -> Result<()> {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let mine = serde_json::to_value(&*self)?;
+        let merged = match (
+            &self.baseline,
+            std::fs::read(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok()),
+        ) {
+            (Some(base), Some(disk)) => merge(base, &mine, &disk),
+            _ => mine.clone(),
+        };
         // Stage a complete file before replacing the previous configuration.
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&temp, &path).context("无法保存设置")
+        // The pid keeps two windows saving at once from sharing a staging file.
+        let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&temp, serde_json::to_vec_pretty(&merged)?)?;
+        std::fs::rename(&temp, &path).context("无法保存设置")?;
+        self.baseline = Some(mine);
+        Ok(())
     }
+}
+
+/// Three-way merge of one window's settings onto the file. A field this window
+/// did not touch keeps the file's value; a list it did touch gets this
+/// window's additions and removals applied to the file's list, so connections
+/// saved by two windows both survive. Ordered or per-window fields
+/// (`recent_connections`, `workspace`) and plain values take this window's
+/// value when it changed them.
+pub(super) fn merge(
+    base: &serde_json::Value,
+    mine: &serde_json::Value,
+    disk: &serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let (Value::Object(mine_map), Value::Object(disk_map)) = (mine, disk) else {
+        return mine.clone();
+    };
+    let mut out = disk_map.clone();
+    for (key, mine_value) in mine_map {
+        let base_value = base.get(key);
+        if base_value == Some(mine_value) {
+            // Untouched here: whatever the file has wins, including a value
+            // another window wrote.
+            out.entry(key.clone()).or_insert_with(|| mine_value.clone());
+            continue;
+        }
+        let merged = match (key.as_str(), base_value, mine_value, disk_map.get(key)) {
+            ("recent_connections" | "workspace", ..) => mine_value.clone(),
+            (_, Some(Value::Array(base)), Value::Array(mine), Some(Value::Array(disk))) => {
+                let mut list: Vec<Value> = disk
+                    .iter()
+                    .filter(|item| mine.contains(item) || !base.contains(item))
+                    .cloned()
+                    .collect();
+                for item in mine {
+                    if !base.contains(item) && !list.contains(item) {
+                        list.push(item.clone());
+                    }
+                }
+                Value::Array(list)
+            }
+            (_, Some(Value::Object(base)), Value::Object(mine), Some(Value::Object(disk))) => {
+                let mut map = disk.clone();
+                for (k, v) in mine {
+                    if base.get(k) != Some(v) {
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
+                for k in base.keys() {
+                    if !mine.contains_key(k) {
+                        map.remove(k);
+                    }
+                }
+                Value::Object(map)
+            }
+            _ => mine_value.clone(),
+        };
+        out.insert(key.clone(), merged);
+    }
+    Value::Object(out)
 }
 
 /// One settings field, on its own. A failure is logged and the caller keeps

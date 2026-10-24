@@ -2,17 +2,18 @@
 
 use super::*;
 use crate::icons::Icon;
+use g_terminal::LockExt;
 
 impl App {
     /// Kicks off a background check and leaves the result in `update_status`.
     pub(super) fn check_updates(&mut self, ctx: &egui::Context) {
         self.update_open = true;
         let status = self.update_status.clone();
-        *status.lock().unwrap() = update::Status::Checking;
+        *status.locked() = update::Status::Checking;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let next = update::check().unwrap_or_else(update::Status::Failed);
-            *status.lock().unwrap() = next;
+            *status.locked() = next;
             ctx.request_repaint();
         });
     }
@@ -20,25 +21,27 @@ impl App {
     /// Downloads the release and lets `update::install` swap the bundle once
     /// this process is gone, then quits.
     pub(super) fn start_update(&mut self, ctx: &egui::Context, release: update::Release) {
-        let (Some(url), Some(name)) = (release.asset, release.asset_name) else {
+        let (Some(url), Some(name), Some(checksum)) =
+            (release.asset, release.asset_name, release.checksum)
+        else {
             return;
         };
         let status = self.update_status.clone();
-        *status.lock().unwrap() = update::Status::Downloading;
+        *status.locked() = update::Status::Downloading;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result =
-                update::download(&url, &name).and_then(|archive| update::install(&archive));
+            let result = update::download(&url, &name, &checksum)
+                .and_then(|archive| update::install(&archive));
             match result {
                 Ok(()) => {
-                    *status.lock().unwrap() = update::Status::Ready;
+                    *status.locked() = update::Status::Ready;
                     ctx.request_repaint();
                     // Let the "正在重启" note paint before the process goes away.
                     std::thread::sleep(std::time::Duration::from_millis(600));
                     std::process::exit(0);
                 }
                 Err(error) => {
-                    *status.lock().unwrap() = update::Status::Failed(error);
+                    *status.locked() = update::Status::Failed(error);
                     ctx.request_repaint();
                 }
             }
@@ -50,7 +53,7 @@ impl App {
         if !self.update_open {
             return;
         }
-        let status = self.update_status.lock().unwrap().clone();
+        let status = self.update_status.locked().clone();
         let mut open = true;
         let mut retry = false;
         let mut start = None;
@@ -91,12 +94,14 @@ impl App {
                     }
                     ui.separator();
                     crate::dialog::footer(ui, |ui| {
-                        if release.asset.is_some() {
+                        if release.asset.is_some() && release.checksum.is_some() {
                             if crate::dialog::primary(ui, "下载并更新", p).clicked() {
                                 start = Some(release.clone());
                             }
+                        } else if release.asset.is_some() {
+                            ui.label(hint("发布缺少校验文件，请在发布页手动下载。", p));
                         } else {
-                            ui.label(hint("当前平台没有预编译包，请打开发布页手动下载。", p));
+                            ui.label(hint("当前平台没有预编译包，请在发布页手动下载。", p));
                         }
                         if crate::dialog::secondary(ui, "打开发布页").clicked() {
                             let _ = crate::remote_ui::open_url(&release.url);

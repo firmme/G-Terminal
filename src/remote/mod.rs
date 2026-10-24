@@ -1,3 +1,4 @@
+use crate::LockExt;
 use crate::config::RemoteProfile;
 use anyhow::{Context, Result, bail, ensure};
 use russh::{
@@ -94,7 +95,7 @@ impl client::Handler for Client {
             )),
             Ok(false) => {
                 let (send, receive) = oneshot::channel();
-                self.state.lock().unwrap().trust = Some(TrustRequest {
+                self.state.locked().trust = Some(TrustRequest {
                     host: format!("{}:{}", self.host, self.port),
                     fingerprint: key.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
                     answer: Some(send),
@@ -129,20 +130,9 @@ pub struct Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        for task in self.forward_tasks.lock().unwrap().drain(..) {
+        for task in self.forward_tasks.locked().drain(..) {
             task.abort();
         }
-    }
-}
-
-/// `keys::load_secret_key` opens the path verbatim, while the OpenSSH backend
-/// hands it to `ssh.exe`, which expands `~`. Expand it here so both agree.
-fn expand_identity(path: &str) -> PathBuf {
-    let path = path.trim();
-    let rest = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"));
-    match (rest, directories::UserDirs::new()) {
-        (Some(rest), Some(dirs)) => dirs.home_dir().join(rest),
-        _ => PathBuf::from(path),
     }
 }
 
@@ -198,7 +188,7 @@ async fn authenticate(
     // OpenSSH client does without IdentitiesOnly.
     let mut candidates = Vec::new();
     if !profile.identity.trim().is_empty() {
-        candidates.push(expand_identity(&profile.identity));
+        candidates.push(crate::config::expand_home(&profile.identity));
     }
     for path in default_identities() {
         if !candidates.contains(&path) {
@@ -248,7 +238,7 @@ pub fn connect(profile: RemoteProfile, credentials: Credentials, wake: Wake) -> 
     let target = state.clone();
     let task = runtime().spawn(async move {
         let result = connect_inner(profile, credentials, target.clone(), wake.clone(), None).await;
-        let mut state = target.lock().unwrap();
+        let mut state = target.locked();
         state.trust = None;
         match result {
             Ok(connection) => state.ready = Some(connection),
@@ -369,14 +359,11 @@ impl Connection {
                 match tokio::net::TcpListener::bind(("127.0.0.1", forward.bind_port)).await {
                     Ok(listener) => listener,
                     Err(e) => {
-                        self.forwarding
-                            .lock()
-                            .unwrap()
-                            .push(format!("{label} 失败：{e}"));
+                        self.forwarding.locked().push(format!("{label} 失败：{e}"));
                         continue;
                     }
                 };
-            self.forwarding.lock().unwrap().push(label);
+            self.forwarding.locked().push(label);
             let handle = self.handle.clone();
             let jump = self.jump.clone();
             let f = forward.clone();
@@ -399,16 +386,16 @@ impl Connection {
                     }
                 }
             });
-            self.forward_tasks.lock().unwrap().push(task);
+            self.forward_tasks.locked().push(task);
         }
         wake();
     }
 
     pub fn stop_forwards(&self) {
-        for task in self.forward_tasks.lock().unwrap().drain(..) {
+        for task in self.forward_tasks.locked().drain(..) {
             task.abort();
         }
-        self.forwarding.lock().unwrap().clear();
+        self.forwarding.locked().clear();
     }
 }
 

@@ -172,7 +172,10 @@ Host no-hostname
     assert_eq!(profiles[0].host, "web.example.com");
     assert_eq!(profiles[0].user, "deploy");
     assert_eq!(profiles[0].port, 2222);
-    assert_eq!(profiles[0].identity, expand_home("~/.ssh/id_web"));
+    assert_eq!(
+        profiles[0].identity,
+        expand_home("~/.ssh/id_web").to_string_lossy()
+    );
     assert_eq!(profiles[1].name, "web-alias");
     assert_eq!(profiles[1].host, "web.example.com");
     // A global option before the first Host must not leak into the import.
@@ -247,4 +250,46 @@ fn serial_profiles_round_trip_through_settings_json() {
     assert_eq!(back.serial_profiles[0].port, "COM9");
     assert_eq!(back.serial_profiles[0].baud, 57600);
     assert_eq!(back.serial_profiles[0].group, "设备");
+}
+
+/// Two windows each add a connection. The second save must keep the first
+/// window's connection instead of overwriting the file with its stale copy.
+#[test]
+fn saves_from_two_windows_keep_both_windows_connections() {
+    let base = serde_json::json!({
+        "font_size": 15.0,
+        "profiles": [{"host": "a"}],
+        "group_colors": {"x": "#111111"},
+    });
+    // Window A already saved: it added "b" and set a group colour.
+    let disk = serde_json::json!({
+        "font_size": 15.0,
+        "profiles": [{"host": "a"}, {"host": "b"}],
+        "group_colors": {"x": "#111111", "y": "#222222"},
+    });
+    // Window B, still on the old baseline, removed "a", added "c" and changed
+    // the font.
+    let mine = serde_json::json!({
+        "font_size": 18.0,
+        "profiles": [{"host": "c"}],
+        "group_colors": {"x": "#111111"},
+    });
+    let merged = merge(&base, &mine, &disk);
+    assert_eq!(
+        merged["profiles"],
+        serde_json::json!([{"host": "b"}, {"host": "c"}])
+    );
+    assert_eq!(merged["font_size"], 18.0);
+    assert_eq!(merged["group_colors"]["y"], "#222222");
+}
+
+/// A field this window never touched keeps what another window wrote.
+#[test]
+fn an_untouched_field_keeps_the_other_windows_value() {
+    let base = serde_json::json!({"light_theme": false, "font_size": 15.0});
+    let disk = serde_json::json!({"light_theme": true, "font_size": 15.0});
+    let mine = serde_json::json!({"light_theme": false, "font_size": 16.0});
+    let merged = merge(&base, &mine, &disk);
+    assert_eq!(merged["light_theme"], true);
+    assert_eq!(merged["font_size"], 16.0);
 }

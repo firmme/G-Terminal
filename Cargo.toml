@@ -43,7 +43,7 @@ egui-directx11 = "=0.12.0"
 egui-winit = { version = "=0.33.3", default-features = false, features = ["clipboard", "links", "accesskit"] }
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
 accesskit_winit = "=0.29.2"
-windows = { version = "=0.62.2", features = ["Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "=0.62.2", features = ["Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Threading"] }
 # Serial-port discovery reads the device map, which is where a Bluetooth SPP
 # port is distinguishable from a physical one.
 winreg = "0.10"

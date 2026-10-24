@@ -18,4 +18,22 @@ mod tests;
 pub use profile::{BAUD_RATES, DEFAULT_BAUD, Forward, RemoteProfile, SerialProfile};
 pub use search::{DEFAULT_SEARCH_ENGINE, SEARCH_ENGINES, search_engine_label, search_url};
 pub use settings::Settings;
+/// Expands a leading `~` (`~`, `~/x`, `~\x`) to the home directory, as OpenSSH
+/// does for key paths. Surrounding whitespace is dropped; anything else is
+/// returned as written.
+pub fn expand_home(path: &str) -> PathBuf {
+    let path = path.trim();
+    let home = || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    if path == "~" {
+        return home().unwrap_or_else(|| PathBuf::from(path));
+    }
+    match (
+        path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")),
+        home(),
+    ) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(path),
+    }
+}
+
 pub use ssh::{load_ssh_config, parse_ssh_config, ssh_config_path};

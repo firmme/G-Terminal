@@ -818,20 +818,20 @@ fn auth_fixture(tag: &str) -> PathBuf {
 fn expand_identity_resolves_tilde_prefix() {
     if let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) {
         assert_eq!(
-            expand_identity("~/.ssh/id_ed25519"),
+            crate::config::expand_home("~/.ssh/id_ed25519"),
             home.join(".ssh/id_ed25519")
         );
         assert_eq!(
-            expand_identity(r"  ~\.ssh\id_rsa  "),
+            crate::config::expand_home(r"  ~\.ssh\id_rsa  "),
             home.join(r".ssh\id_rsa")
         );
     }
     // Anything else is left exactly as typed, trimmed.
     assert_eq!(
-        expand_identity(r"  C:\keys\id_rsa  "),
+        crate::config::expand_home(r"  C:\keys\id_rsa  "),
         PathBuf::from(r"C:\keys\id_rsa")
     );
-    assert_eq!(expand_identity(""), PathBuf::from(""));
+    assert_eq!(crate::config::expand_home(""), PathBuf::from(""));
 }
 
 #[test]
@@ -1776,4 +1776,18 @@ fn a_numeric_owner_is_used_as_is() {
         .await
         .unwrap();
     });
+}
+
+/// Names a server can announce must stay one plain file inside the target
+/// directory: trimmed dot-dots, drive prefixes and NTFS streams are refused.
+#[test]
+fn unsafe_local_names_are_refused() {
+    for name in [
+        "", "..", ".. ", "C:evil", "a:stream", "a/b", r"a\b", "CON", "com1.txt",
+    ] {
+        assert!(!safe_local_name(name), "{name:?} should be refused");
+    }
+    for name in ["report.txt", "a&b", ".bashrc"] {
+        assert!(safe_local_name(name), "{name:?} should be allowed");
+    }
 }

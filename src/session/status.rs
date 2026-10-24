@@ -2,6 +2,7 @@
 //! traffic counters.
 
 use super::*;
+use crate::LockExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -61,9 +62,6 @@ pub(super) fn report_end(
     terminal: &Arc<Mutex<Terminal>>,
     message: String,
 ) {
-    status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(message.clone());
-    terminal
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .note_error(&format!("[错误] {message}"));
+    status.locked().error = Some(message.clone());
+    terminal.locked().note_error(&format!("[错误] {message}"));
 }

@@ -9,7 +9,7 @@
 use crate::{editing, remote_ui::hint, theme::Palette};
 use eframe::egui::{self, RichText};
 use g_terminal::config::RemoteProfile;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The two prompt presets, kept verbatim so what runs is what was asked for.
 /// The outer heredoc is quoted, so none of this is expanded on the way out.
@@ -292,9 +292,9 @@ fn find_public_key(identity: &str) -> Option<String> {
     let identity = identity.trim();
     if !identity.is_empty() {
         if identity.ends_with(".pub") {
-            candidates.push(expand_home(identity));
+            candidates.push(g_terminal::config::expand_home(identity));
         } else {
-            candidates.push(expand_home(&format!("{identity}.pub")));
+            candidates.push(g_terminal::config::expand_home(&format!("{identity}.pub")));
         }
     }
     if let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) {
@@ -308,17 +308,6 @@ fn find_public_key(identity: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    let rest = path
-        .strip_prefix("~/")
-        .or_else(|| path.strip_prefix("~\\"))
-        .map(PathBuf::from);
-    match (rest, directories::UserDirs::new()) {
-        (Some(rest), Some(dirs)) => dirs.home_dir().join(rest),
-        _ => PathBuf::from(path),
-    }
 }
 
 /// One line, and safe to drop inside single quotes in the remote script.

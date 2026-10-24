@@ -1,6 +1,7 @@
 //! The titlebar: the frameless window's chrome, the brand menu and the tab strip.
 
 use super::*;
+use g_terminal::LockExt;
 
 impl App {
     pub(super) fn resize_grips(&self, ctx: &egui::Context) {
@@ -96,78 +97,76 @@ impl App {
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         let capture_menu = self.screenshot.is_some()
                             && std::env::var("GTERMINAL_SCREENSHOT_VIEW").as_deref() == Ok("menu");
-                        brand_menu_button(ui, p.accent, capture_menu, |ui| {
-                            menu_heading(ui, "新建", p);
-                            if icons::icon_row_primary(
-                                ui,
-                                icons::Icon::Terminal,
-                                "新建终端",
-                                Some(accel("Ctrl+Shift+T").as_str()),
-                                p,
-                            )
-                            .clicked()
-                            {
-                                *action = Some(Action::New(SessionKind::Local(
-                                    self.settings.default_shell.clone(),
-                                )));
-                                ui.close();
-                            }
-                            for (icon, text, a) in [
-                                (icons::Icon::Host, "新建 SSH 连接", Action::Remote),
-                                (
-                                    icons::Icon::Terminal,
-                                    "连接串口",
-                                    Action::SerialPicker,
-                                ),
-                            ] {
-                                if icons::icon_row(ui, icon, text, None, p).clicked() {
-                                    *action = Some(a);
-                                    ui.close();
+                        brand_menu_button(ui, p, capture_menu, |ui| {
+                            ui.set_width(292.0);
+                            // New sessions: the most used entries, as tiles.
+                            let local = Action::New(SessionKind::Local(
+                                self.settings.default_shell.clone(),
+                            ));
+                            let mut picked = None;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for (icon, caption, tip, a) in [
+                                    (
+                                        icons::Icon::Terminal,
+                                        "终端",
+                                        format!("新建终端 ({})", accel("Ctrl+Shift+T")),
+                                        local,
+                                    ),
+                                    (
+                                        icons::Icon::Host,
+                                        "SSH",
+                                        "新建 SSH 连接".to_string(),
+                                        Action::Remote,
+                                    ),
+                                    (
+                                        icons::Icon::Serial,
+                                        "串口",
+                                        "连接串口".to_string(),
+                                        Action::SerialPicker,
+                                    ),
+                                    (
+                                        icons::Icon::NewWindow,
+                                        "窗口",
+                                        "新建窗口".to_string(),
+                                        Action::NewWindow,
+                                    ),
+                                ] {
+                                    if icons::tile(ui, icon, caption, p).on_hover_text(tip).clicked() {
+                                        picked = Some(a);
+                                    }
                                 }
-                            }
-                            if icons::icon_row(ui, icons::Icon::Terminal, "新建窗口", None, p)
-                                .clicked()
-                            {
-                                *action = Some(Action::NewWindow);
-                                ui.close();
-                            }
-                            ui.separator();
+                            });
                             menu_heading(ui, "当前会话", p);
                             let live = self.active_link() == Some(SessionStatus::Live);
                             if live
                                 && icons::icon_row(
                                     ui,
                                     icons::Icon::Disconnect,
-                                    "断开当前连接",
+                                    "断开",
                                     Some(alt_accel("C").as_str()),
                                     p,
                                 )
                                 .clicked()
                             {
-                                *action = Some(Action::Disconnect);
-                                ui.close();
+                                picked = Some(Action::Disconnect);
                             }
                             if (!live || !self.active_is_remote())
                                 && icons::icon_row(
                                     ui,
                                     icons::Icon::Reconnect,
-                                    if live {
-                                        "重新连接 / 重启"
-                                    } else {
-                                        "重新连接"
-                                    },
+                                    if live { "重启" } else { "重新连接" },
                                     Some(alt_accel("R").as_str()),
                                     p,
                                 )
                                 .clicked()
                             {
-                                *action = Some(Action::Restart);
-                                ui.close();
+                                picked = Some(Action::Restart);
                             }
                             if icons::icon_row(
                                 ui,
                                 icons::Icon::Search,
-                                "查找历史",
+                                "查找输出",
                                 Some(accel("Ctrl+Shift+F").as_str()),
                                 p,
                             )
@@ -177,115 +176,122 @@ impl App {
                                 self.search_focus = true;
                                 ui.close();
                             }
-                            ui.menu_button("分屏与窗格", |ui| {
-                                for (icon, text, shortcut, a) in [
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for (icon, caption, tip, a) in [
                                     (
                                         icons::Icon::SplitHorizontal,
-                                        "左右分屏",
-                                        Some(accel("Ctrl+Shift+D")),
+                                        "左右",
+                                        format!("左右分屏 ({})", accel("Ctrl+Shift+D")),
                                         Action::Split(Axis::Horizontal),
                                     ),
                                     (
                                         icons::Icon::SplitVertical,
-                                        "上下分屏",
-                                        Some(accel("Ctrl+Shift+E")),
+                                        "上下",
+                                        format!("上下分屏 ({})", accel("Ctrl+Shift+E")),
                                         Action::Split(Axis::Vertical),
                                     ),
                                     (
                                         icons::Icon::ClosePane,
-                                        "关闭窗格",
-                                        Some(accel("Ctrl+Shift+W")),
+                                        "关闭",
+                                        format!("关闭窗格 ({})", accel("Ctrl+Shift+W")),
                                         Action::ClosePane,
                                     ),
                                 ] {
-                                    if icons::icon_row(ui, icon, text, shortcut.as_deref(), p)
-                                        .clicked()
-                                    {
-                                        *action = Some(a);
-                                        ui.close();
+                                    if icons::tile(ui, icon, caption, p).on_hover_text(tip).clicked() {
+                                        picked = Some(a);
                                     }
                                 }
                             });
-                            ui.separator();
-                            menu_heading(ui, "文件与连接", p);
-                            if icons::icon_row(ui, icons::Icon::File, "文件与传输队列", None, p)
+                            menu_heading(ui, "工具", p);
+                            if icons::icon_row(ui, icons::Icon::Folder, "文件与传输", None, p)
                                 .clicked()
                             {
-                                *action = Some(Action::Files);
-                                ui.close();
+                                picked = Some(Action::Files);
                             }
-                            ui.menu_button("连接管理与工具", |ui| {
-                                if icons::icon_row(ui, icons::Icon::Group, "连接分组管理", None, p)
-                                    .clicked()
-                                {
-                                    self.groups_open = true;
-                                    ui.close();
-                                }
-                                if icons::icon_row(ui, icons::Icon::Host, "串口占用排查", None, p)
-                                    .clicked()
-                                {
-                                    *action = Some(Action::FindPortOwner(self.port_owner_default()));
-                                    ui.close();
-                                }
-                                if icons::icon_row(ui, icons::Icon::Toolbox, "服务器工具箱", None, p)
-                                    .clicked()
-                                {
-                                    *action = Some(Action::Toolbox);
-                                    ui.close();
-                                }
-                            });
-                            ui.separator();
-                            menu_heading(ui, "应用", p);
-                            if ui.checkbox(&mut self.settings.sidebar, "显示导航栏").changed() {
-                                ui.close();
-                            }
-                            if icons::icon_row(
-                                ui,
-                                icons::Icon::Settings,
-                                "偏好设置",
-                                Some(accel("Ctrl+,").as_str()),
-                                p,
-                            )
-                            .clicked()
+                            if icons::icon_row(ui, icons::Icon::Group, "分组管理", None, p)
+                                .clicked()
                             {
-                                self.settings_open = true;
+                                self.groups_open = true;
                                 ui.close();
                             }
-                            ui.menu_button("帮助与更新", |ui| {
-                                if icons::icon_row(ui, icons::Icon::Help, "快捷键 / 关于", None, p)
-                                    .clicked()
-                                {
-                                    self.help_open = true;
-                                    ui.close();
-                                }
-                                if icons::icon_row(ui, icons::Icon::Refresh, "检查更新", None, p)
-                                    .clicked()
-                                {
-                                    *action = Some(Action::CheckUpdates);
-                                    ui.close();
-                                }
-                            });
+                            if icons::icon_row(ui, icons::Icon::Serial, "串口占用排查", None, p)
+                                .clicked()
+                            {
+                                picked = Some(Action::FindPortOwner(self.port_owner_default()));
+                            }
+                            if icons::icon_row(ui, icons::Icon::Toolbox, "服务器工具箱", None, p)
+                                .clicked()
+                            {
+                                picked = Some(Action::Toolbox);
+                            }
+                            ui.add_space(4.0);
                             ui.separator();
-                            ui.label(hint(concat!("G-Terminal ", env!("CARGO_PKG_VERSION")), p));
-                            if icons::icon_row(ui, icons::Icon::Restart, "退出", None, p).clicked() {
-                                *action = Some(Action::Exit);
+                            // App-level controls as a quiet icon bar.
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                if icons::icon_toggle(
+                                    ui,
+                                    icons::Icon::Sidebar,
+                                    self.settings.sidebar,
+                                    p,
+                                )
+                                .on_hover_text("显示导航栏")
+                                .clicked()
+                                {
+                                    self.settings.sidebar = !self.settings.sidebar;
+                                    ui.close();
+                                }
+                                for (icon, tip, target) in [
+                                    (
+                                        icons::Icon::Settings,
+                                        format!("偏好设置 ({})", accel("Ctrl+,")),
+                                        0,
+                                    ),
+                                    (icons::Icon::Keyboard, "快捷键与关于".to_string(), 1),
+                                    (icons::Icon::Refresh, "检查更新".to_string(), 2),
+                                ] {
+                                    if icons::icon_button(ui, icon, p, icons::Size::Button)
+                                        .on_hover_text(tip)
+                                        .clicked()
+                                    {
+                                        match target {
+                                            0 => self.settings_open = true,
+                                            1 => self.help_open = true,
+                                            _ => picked = Some(Action::CheckUpdates),
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if icons::icon_button(ui, icons::Icon::Power, p, icons::Size::Button)
+                                        .on_hover_text("退出")
+                                        .clicked()
+                                    {
+                                        picked = Some(Action::Exit);
+                                    }
+                                    ui.label(hint(concat!("v", env!("CARGO_PKG_VERSION")), p));
+                                });
+                            });
+                            if let Some(a) = picked {
+                                *action = Some(a);
                                 ui.close();
                             }
                         });
                         let auto_hide = self.settings.auto_hide_sidebar;
                         let docked = self.settings.sidebar && (!auto_hide || self.sidebar_pinned);
-                        let (icon, hover) = if auto_hide {
+                        let hover = if auto_hide {
                             if docked {
-                                (icons::Icon::ChevronLeft, "改为自动隐藏")
+                                "改为自动隐藏"
                             } else {
-                                (icons::Icon::ChevronRight, "固定展开导航栏")
+                                "固定展开导航栏"
                             }
                         } else if self.settings.sidebar {
-                            (icons::Icon::ChevronLeft, "收起导航栏")
+                            "收起导航栏"
                         } else {
-                            (icons::Icon::ChevronRight, "展开导航栏")
+                            "展开导航栏"
                         };
-                        if icons::icon_button(ui, icon, p, icons::Size::Button)
+                        if icons::icon_toggle(ui, icons::Icon::Sidebar, docked, p)
                             .on_hover_text(hover)
                             .clicked()
                         {
@@ -395,13 +401,23 @@ impl App {
                                                             );
                                                             if reconnect && state_response.hovered() {
                                                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                                                icons::draw(ui.painter(), dot.shrink(1.0), icons::Icon::Reconnect, p.accent, 1.3);
+                                                                icons::draw(ui.painter(), dot.shrink(1.0), icons::Icon::Reconnect, p.accent, 1.4);
                                                             } else {
-                                                            ui.painter().circle_filled(
-                                                                dot.center(),
-                                                                4.5,
-                                                                link_color(tab_link(t), p),
-                                                            );
+                                                                // What the tab is, with how it is doing as a badge.
+                                                                icons::draw(
+                                                                    ui.painter(),
+                                                                    dot.shrink(1.0),
+                                                                    sidebar::kind_icon(&t.panes[t.focused].session.kind),
+                                                                    if active { p.text } else { p.muted },
+                                                                    1.3,
+                                                                );
+                                                                let badge = dot.right_bottom() - egui::vec2(2.5, 2.5);
+                                                                ui.painter().circle_filled(badge, 4.0, fill);
+                                                                ui.painter().circle_filled(
+                                                                    badge,
+                                                                    2.8,
+                                                                    link_color(tab_link(t), p),
+                                                                );
                                                             }
                                                             if state_response.clicked() && reconnect {
                                                                 *action = Some(Action::ReconnectTab(i));
@@ -414,7 +430,7 @@ impl App {
                                                             {
                                                                 if index > 0 {
                                                                     ui.label(
-                                                                        RichText::new("|")
+                                                                        RichText::new("·")
                                                                             .color(p.muted),
                                                                     );
                                                                 }
@@ -448,7 +464,7 @@ impl App {
                                                                     label
                                                                 });
                                                                 if active && focused && pane.session.pending() {
-                                                                    ui.label(RichText::new("连接中").small().color(p.muted));
+                                                                    status::connecting_spinner(ui, p);
                                                                 }
                                                             }
                                                             if i != self.active
@@ -471,12 +487,7 @@ impl App {
                                                                     1.2,
                                                                 );
                                                             }
-                                                            let close = icons::glyph_button(
-                                                                ui,
-                                                                "×",
-                                                                p,
-                                                                "关闭标签",
-                                                            );
+                                                            let close = icons::close_button(ui, p, "关闭标签");
                                                             if close.clicked() {
                                                                 *action = Some(Action::CloseTab(i));
                                                             }
@@ -493,8 +504,7 @@ impl App {
                                                             let full_title = t.panes[t.focused]
                                                                 .session
                                                                 .terminal
-                                                                .lock()
-                                                                .unwrap_or_else(|e| e.into_inner())
+                                                                .locked()
                                                                 .title()
                                                                 .to_string();
                                                             let r = ui
@@ -523,48 +533,55 @@ impl App {
                                                                     tab_link(tab)
                                                                         == SessionStatus::Detached
                                                                 });
-                                                            for (text, enabled, a) in [
+                                                            for (icon, text, enabled, a) in [
                                                                 (
+                                                                    icons::Icon::SplitHorizontal,
                                                                     "左右分屏",
                                                                     true,
                                                                     Action::Split(Axis::Horizontal),
                                                                 ),
                                                                 (
+                                                                    icons::Icon::SplitVertical,
                                                                     "上下分屏",
                                                                     true,
                                                                     Action::Split(Axis::Vertical),
                                                                 ),
                                                                 (
+                                                                    icons::Icon::Plus,
                                                                     "复制会话",
                                                                     true,
                                                                     Action::DuplicateSession(i),
                                                                 ),
                                                                 (
-                                                                    "复制选项卡信息",
+                                                                    icons::Icon::Copy,
+                                                                    "复制标签信息",
                                                                     true,
                                                                     Action::CopyTabInfo(i),
                                                                 ),
                                                                 (
-                                                                    "关闭标签",
+                                                                    icons::Icon::Close,
+                                                                    "关闭",
                                                                     true,
                                                                     Action::CloseTab(i),
                                                                 ),
                                                                 (
-                                                                    "关闭其它标签页",
+                                                                    icons::Icon::Close,
+                                                                    "关闭其它",
                                                                     others,
                                                                     Action::CloseOtherTabs(i),
                                                                 ),
                                                                 (
-                                                                    "关闭断开的标签页",
+                                                                    icons::Icon::Disconnect,
+                                                                    "关闭已断开",
                                                                     disconnected,
                                                                     Action::CloseDisconnectedTabs,
                                                                 ),
                                                             ] {
                                                                 if ui
-                                                                    .add_enabled(
-                                                                        enabled,
-                                                                        egui::Button::new(text),
-                                                                    )
+                                                                    .add_enabled_ui(enabled, |ui| {
+                                                                        icons::icon_row(ui, icon, text, None, p)
+                                                                    })
+                                                                    .inner
                                                                     .clicked()
                                                                 {
                                                                     self.active = i;
@@ -637,13 +654,7 @@ impl App {
         }
         let shell = self.tabs.get(self.active).map(|tab| {
             let pane = &tab.panes[tab.focused];
-            let title = pane
-                .session
-                .terminal
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .title()
-                .to_string();
+            let title = pane.session.terminal.locked().title().to_string();
             if title.is_empty() {
                 pane.session.kind.label()
             } else {
@@ -651,7 +662,7 @@ impl App {
             }
         });
         let title = match shell {
-            Some(shell) if !shell.is_empty() => format!("{shell} 鈥?G-Terminal"),
+            Some(shell) if !shell.is_empty() => format!("{shell} — G-Terminal"),
             _ => "G-Terminal".to_string(),
         };
         if title != self.window_title {
@@ -682,53 +693,47 @@ pub(super) enum TitleButton {
 }
 
 fn menu_heading(ui: &mut egui::Ui, title: &str, p: Palette) {
-    ui.add_space(3.0);
+    ui.add_space(8.0);
     ui.label(egui::RichText::new(title).small().strong().color(p.muted));
     ui.add_space(2.0);
 }
 
 pub(super) fn brand_menu_button(
     ui: &mut egui::Ui,
-    color: egui::Color32,
+    p: Palette,
     capture_menu: bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> egui::Response {
-    let first = ui.fonts_mut(|fonts| {
-        fonts.layout_no_wrap("G".to_owned(), egui::FontId::proportional(23.0), color)
+    let mark = ui.fonts_mut(|fonts| {
+        fonts.layout_no_wrap("G".to_owned(), egui::FontId::proportional(22.0), p.accent)
     });
-    let rest = ui.fonts_mut(|fonts| {
-        fonts.layout_no_wrap("  菜单".to_owned(), egui::FontId::proportional(14.0), color)
-    });
-
-    let padding = ui.spacing().button_padding;
-    let size = egui::vec2(
-        first.size().x + rest.size().x + padding.x * 2.0,
-        (first.size().y.max(rest.size().y) + padding.y * 2.0).max(ui.spacing().interact_size.y),
-    );
+    let size = egui::vec2(mark.size().x + 30.0, 30.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let response = response.on_hover_text("菜单");
     if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact_selectable(&response, false);
-        if response.hovered() || response.is_pointer_button_down_on() {
-            ui.painter().rect(
-                rect,
-                visuals.corner_radius,
-                visuals.weak_bg_fill,
-                visuals.bg_stroke,
-                egui::StrokeKind::Inside,
-            );
+        let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+        if response.hovered() || open {
+            ui.painter()
+                .rect_filled(rect, 7, blend(p.panel, p.raised, 0.8));
         }
-
-        let ink_centre = |galley: &egui::Galley| {
-            galley.rows.first().map_or(galley.size().y / 2.0, |row| {
-                row.visuals.mesh_bounds.center().y
-            })
-        };
-        let middle = rect.center().y;
-        let first_pos = egui::pos2(rect.left() + padding.x, middle - ink_centre(&first));
-        let rest_pos = egui::pos2(first_pos.x + first.size().x, middle - ink_centre(&rest));
-        let painter = ui.painter();
-        painter.galley(first_pos, first, color);
-        painter.galley(rest_pos, rest, color);
+        let ink = mark.rows.first().map_or(mark.size().y / 2.0, |row| {
+            row.visuals.mesh_bounds.center().y
+        });
+        let mark_pos = egui::pos2(rect.left() + 9.0, rect.center().y - ink);
+        let chevron = Rect::from_center_size(
+            egui::pos2(rect.right() - 10.0, rect.center().y + 1.0),
+            egui::Vec2::splat(10.0),
+        );
+        let width = mark.size().x;
+        ui.painter().galley(mark_pos, mark, p.accent);
+        icons::draw(
+            ui.painter(),
+            chevron,
+            icons::Icon::ChevronDown,
+            if response.hovered() { p.text } else { p.muted },
+            1.5,
+        );
+        let _ = width;
     }
     let popup = egui::Popup::menu(&response);
     let popup = if capture_menu {

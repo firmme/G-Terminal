@@ -3,6 +3,7 @@
 //! Both directions run the same poll/submit loop; every step reports into a
 //! shared [`Handle`] so the UI can show progress and cancel, and a conflict in
 //! the receive path is resolved by asking the UI instead of failing.
+use crate::LockExt;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     path::{Path, PathBuf},
@@ -143,7 +144,7 @@ impl Handle {
     }
 
     fn shared(&self) -> std::sync::MutexGuard<'_, Progress> {
-        self.progress.lock().unwrap_or_else(|e| e.into_inner())
+        self.progress.locked()
     }
     fn begin(&self, total: u64, message: &str) {
         let mut p = self.shared();
@@ -383,12 +384,16 @@ async fn receive_loop<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Action::Event(Event::FileStarted(info)) => {
                 ensure!(!accepted, "一次仅允许接收一个文件");
+                // Trimmed before it is checked, and checked with the same rule
+                // as SFTP downloads: `".. "`, `C:x` or `name:stream` must not
+                // escape the chosen directory.
+                let name = String::from_utf8_lossy(info.name).trim().to_string();
                 ensure!(
-                    !info.name.contains(&b'/') && !info.name.contains(&b'\\') && info.name != b"..",
-                    "非法远程文件名"
+                    crate::remote::safe_local_name(&name),
+                    "非法远程文件名：{name}"
                 );
                 if incoming.target.as_os_str().is_empty() {
-                    incoming.target = path.join(String::from_utf8_lossy(info.name).trim());
+                    incoming.target = path.join(&name);
                 }
                 ensure!(!incoming.target.as_os_str().is_empty(), "无文件名");
                 total = info.size.map_or(0, |s| s.get() as u64);

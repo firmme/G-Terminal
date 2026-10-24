@@ -2,6 +2,7 @@
 //! permission changes, the editor round-trip and the timestamp formatting.
 
 use super::*;
+use g_terminal::LockExt;
 
 pub fn format_size(n: u64) -> String {
     if n >= 1024 * 1024 {
@@ -161,44 +162,61 @@ pub(super) fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// Opens a path with whatever the OS associates with it.
 pub(super) fn reveal(path: &Path) -> Result<(), String> {
-    open_command(path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("无法打开 {}：{e}", path.display()))
+    shell_open(path.as_os_str()).map_err(|e| format!("无法打开 {}：{e}", path.display()))
 }
 
-/// The command that hands a path to the OS default handler. On Windows the empty
-/// argument is required, otherwise `start` reads the path as a window title.
-pub(super) fn open_command(path: &Path) -> Command {
-    let mut command = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]);
-        c
-    } else if cfg!(target_os = "macos") {
-        Command::new("open")
-    } else {
-        Command::new("xdg-open")
-    };
-    command.arg(path);
-    command
-}
-
-/// Opens a URL in the OS default browser.
+/// Opens a URL in the OS default browser. Only `http(s)` is accepted: links come
+/// from terminal output, which the remote side controls.
 pub(crate) fn open_url(url: &str) -> Result<(), String> {
-    let mut command = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]);
-        c
-    } else if cfg!(target_os = "macos") {
-        Command::new("open")
-    } else {
-        Command::new("xdg-open")
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("只能打开 http/https 链接".into());
+    }
+    shell_open(std::ffi::OsStr::new(url.trim())).map_err(|e| format!("无法打开浏览器：{e}"))
+}
+
+/// Hands a path or URL to the OS default handler without a shell in between.
+///
+/// Windows used to go through `cmd /C start`, which re-parses its argument:
+/// a link such as `https://x/?a&calc` or a downloaded file named `a&calc` ran
+/// `calc`. `ShellExecuteW` takes the target verbatim.
+#[cfg(windows)]
+fn shell_open(target: &std::ffi::OsStr) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    use windows::core::{PCWSTR, w};
+    let wide: Vec<u16> = target.encode_wide().chain(Some(0)).collect();
+    // SAFETY: every pointer is a NUL-terminated UTF-16 string that outlives the call.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
     };
-    command
-        .arg(url)
+    // Values above 32 mean success; anything else is an error code.
+    if result.0 as usize > 32 {
+        Ok(())
+    } else {
+        Err(format!("系统错误 {}", result.0 as usize))
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_open(target: &std::ffi::OsStr) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    Command::new(program)
+        .arg(target)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("无法打开浏览器：{e}"))
+        .map_err(|e| e.to_string())
 }
 
 /// Opens a path in a text editor rather than in its associated application.
@@ -462,7 +480,7 @@ pub(super) fn spawn_delete_remote(
             remote::remove(&sftp, &path, is_dir).await
         }
         .await;
-        *state.lock().unwrap() = Some(
+        *state.locked() = Some(
             result
                 .map(|_| "已删除".to_string())
                 .map_err(|e| format!("{e:#}")),
@@ -485,7 +503,7 @@ pub(super) fn spawn_rename_remote(
             remote::rename(&sftp, &target.path, &to).await
         }
         .await;
-        *state.lock().unwrap() = Some(
+        *state.locked() = Some(
             result
                 .map(|_| "已重命名".to_string())
                 .map_err(|e| format!("{e:#}")),

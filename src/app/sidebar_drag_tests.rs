@@ -126,7 +126,7 @@ fn highlighted_group(output: &egui::FullOutput, pos: Pos2, p: Palette) -> bool {
 fn saved_ssh_and_serial_move_to_groups_without_touching_same_address_rows() {
     for source in ["saved-a", "serial-a"] {
         let mut h = Harness::new();
-        let group = h.position("工作 (1)");
+        let group = h.position("工作");
         h.start_drag(source);
         let (hover, action) = h.frame(vec![Event::PointerMoved(group)]);
         assert!(action.is_none());
@@ -184,7 +184,7 @@ fn an_empty_default_group_remains_a_drop_target() {
     h.app.settings.profiles[0].group = "工作".into();
     h.app.settings.serial_profiles[0].group = "工作".into();
     h.start_drag("saved-a");
-    let target = h.position("默认分组 (0)");
+    let target = h.position("默认分组");
     let action = h.release(target).expect("empty default group drop");
     h.app.execute(action, &h.ctx);
     assert!(h.app.settings.profiles[0].group.is_empty());
@@ -196,7 +196,7 @@ fn imported_hosts_and_local_shells_drag_to_the_console_but_ignore_groups() {
     let shell = local_shells()[0].label.clone();
     for source in ["imported-a", &shell] {
         let mut h = Harness::new();
-        let group = h.position("工作 (1)");
+        let group = h.position("工作");
         h.start_drag(source);
         let (hover, _) = h.frame(vec![Event::PointerMoved(group)]);
         assert!(!highlighted_group(&hover, group, h.app.palette));

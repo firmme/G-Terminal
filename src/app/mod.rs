@@ -6,6 +6,7 @@ use crate::{
     view::Pane,
 };
 use eframe::egui::{self, Align, Key, Layout, Rect, RichText, Sense};
+use g_terminal::LockExt;
 use g_terminal::{
     config::{
         BAUD_RATES, DEFAULT_BAUD, Forward, RemoteProfile, SEARCH_ENGINES, SerialProfile, Settings,
@@ -359,7 +360,8 @@ impl App {
             remote: RemoteProfile::default(),
             serial: SerialProfile::default(),
             serial_ports: Vec::new(),
-            serial_picker: None,
+            serial_picker: (capture_view.as_deref() == Some("serial-picker"))
+                .then(SerialPicker::new),
             port_owner: None,
             serial_probe: None,
             toolbox: None,
@@ -504,7 +506,7 @@ impl App {
         let Some(terminal) = self.terminal_of(tab_id, pane_id) else {
             return;
         };
-        let mut terminal = terminal.lock().unwrap_or_else(|e| e.into_inner());
+        let mut terminal = terminal.locked();
         if !terminal.parser.screen().contents().trim().is_empty() {
             terminal.separator();
         }
@@ -545,10 +547,7 @@ impl App {
     /// Writes a red line on a pane's screen: a cancelled or failed step.
     fn note_error(&self, tab_id: u64, pane_id: u64, line: &str) {
         if let Some(terminal) = self.terminal_of(tab_id, pane_id) {
-            terminal
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .note_error(line);
+            terminal.locked().note_error(line);
         }
     }
     /// Starts a session, optionally inheriting the screen of the one it
@@ -575,8 +574,7 @@ impl App {
                     // The failure belongs to the console of the pane it is
                     // about, not to a status line shared by every session.
                     Some(terminal) => terminal
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .locked()
                         .note_error(&format!("[错误] connect failed: {message}")),
                     None => self.error = Some(message),
                 }
@@ -1320,8 +1318,7 @@ impl App {
                 self.search_hits = t.panes[t.focused]
                     .session
                     .terminal
-                    .lock()
-                    .unwrap()
+                    .locked()
                     .find_all(&self.search);
                 self.search_index = 0;
             } else if !self.search_hits.is_empty() {
@@ -1331,8 +1328,7 @@ impl App {
                 t.panes[t.focused]
                     .session
                     .terminal
-                    .lock()
-                    .unwrap()
+                    .locked()
                     .parser
                     .screen_mut()
                     .set_scrollback(*offset);
@@ -1410,6 +1406,11 @@ impl App {
         sidebar::drag_preview(ctx, p);
         if let Some(action) = action {
             self.execute(action, ctx);
+        }
+        if self.screenshot.is_some()
+            && std::env::var("GTERMINAL_SCREENSHOT_VIEW").as_deref() == Ok("icons")
+        {
+            icon_gallery(ctx, p);
         }
         if let Some(path) = self.screenshot.clone() {
             for e in ctx.input(|i| i.events.clone()) {
@@ -1551,3 +1552,35 @@ mod helper_tests;
 mod sidebar_drag_tests;
 #[cfg(all(test, windows))]
 mod tests;
+
+/// Every glyph at the sizes the UI uses, for `--screenshot` review of the icon
+/// set (`GTERMINAL_SCREENSHOT_VIEW=icons`).
+fn icon_gallery(ctx: &egui::Context, p: Palette) {
+    egui::Area::new(egui::Id::new("icon-gallery"))
+        .fixed_pos(egui::pos2(380.0, 80.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            crate::dialog::frame(p).show(ui, |ui| {
+                for scale in [16.0_f32, 24.0, 40.0] {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.set_max_width(1100.0);
+                        for icon in icons::Icon::ALL {
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::Vec2::splat(scale + 8.0),
+                                Sense::hover(),
+                            );
+                            icons::draw(
+                                ui.painter(),
+                                rect.shrink(4.0),
+                                icon,
+                                p.text,
+                                1.4 * scale / 16.0,
+                            );
+                            response.on_hover_text(format!("{icon:?}"));
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
+            });
+        });
+}

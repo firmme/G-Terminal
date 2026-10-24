@@ -45,6 +45,51 @@ impl vt100::Callbacks for TerminalCallbacks {
     }
 }
 
+struct PendingImage {
+    bytes: Vec<u8>,
+    row: u16,
+    col: u16,
+    alternate: bool,
+    epoch: u64,
+}
+
+/// What one read produced besides the screen update.
+#[derive(Default)]
+pub struct Fed {
+    /// Answers to the program's queries (cursor position, device status).
+    pub replies: Vec<u8>,
+    /// A BEL arrived.
+    pub bell: bool,
+}
+
+/// Feeds one read from a session into its screen: the one path shared by
+/// local shells, serial ports and SSH channels. The screen lock is held only
+/// for parsing; inline images are decoded after it is released.
+pub fn feed(terminal: &std::sync::Mutex<Terminal>, bytes: &[u8]) -> Fed {
+    use crate::LockExt;
+    let (fed, images) = {
+        let mut terminal = terminal.locked();
+        let bell = terminal.process(bytes);
+        let replies = std::mem::take(&mut terminal.parser.callbacks_mut().replies);
+        let images = std::mem::take(&mut terminal.pending_images);
+        (Fed { replies, bell }, images)
+    };
+    if !images.is_empty() {
+        let decoded: Vec<_> = images
+            .into_iter()
+            .map(|image| {
+                let pixels = crate::graphics::decode(&image.bytes);
+                (image, pixels)
+            })
+            .collect();
+        let mut terminal = terminal.locked();
+        for (image, pixels) in decoded {
+            terminal.attach(image, pixels);
+        }
+    }
+    fed
+}
+
 pub struct Terminal {
     pub parser: vt100::Parser<TerminalCallbacks>,
     pub revision: u64,
@@ -55,6 +100,13 @@ pub struct Terminal {
     /// means the server ran `rz` and is waiting to receive, i.e. an upload;
     /// `Some(false)` means it ran `sz` and is about to send.
     pub zmodem_offer: Option<bool>,
+    /// Inline images read but not decoded yet, with where they were placed.
+    /// Decoding a large PNG takes long enough to stall drawing, so it happens
+    /// in [`feed`] after the screen lock is released.
+    pending_images: Vec<PendingImage>,
+    /// Bumped whenever the pictures are cleared, so an image decoded outside
+    /// the lock is not attached to a screen that was wiped in the meantime.
+    graphics_epoch: u64,
     scanner: crate::graphics::OscScanner,
     /// Tail of the last read, so a header split across reads is still seen.
     zmodem_probe: Vec<u8>,
@@ -75,6 +127,8 @@ impl Terminal {
             selection_epoch: 0,
             graphics: std::collections::VecDeque::new(),
             zmodem_offer: None,
+            pending_images: Vec::new(),
+            graphics_epoch: 0,
             scanner: crate::graphics::OscScanner::default(),
             zmodem_probe: Vec::new(),
             scrollback,
@@ -90,27 +144,48 @@ impl Terminal {
             match token {
                 crate::graphics::Token::Text(bytes) => {
                     if bytes.windows(4).any(|w| w == b"\x1b[2J") {
-                        self.graphics.clear();
+                        self.clear_graphics();
                     }
                     self.parser.process(&bytes);
                 }
                 crate::graphics::Token::Image(bytes) => {
-                    if let Some(pixels) = crate::graphics::decode(&bytes) {
-                        self.graphics.clear();
-                        let (row, col) = self.parser.screen().cursor_position();
-                        self.graphics.push_back(crate::graphics::Graphic {
-                            id: self.revision,
-                            pixels: std::sync::Arc::new(pixels),
-                            row,
-                            col,
-                            alternate: self.parser.screen().alternate_screen(),
-                        });
-                    }
+                    let (row, col) = self.parser.screen().cursor_position();
+                    self.pending_images.push(PendingImage {
+                        bytes,
+                        row,
+                        col,
+                        alternate: self.parser.screen().alternate_screen(),
+                        epoch: self.graphics_epoch,
+                    });
                 }
             }
         }
         self.revision = self.revision.wrapping_add(1);
         self.take_bell()
+    }
+
+    /// Drops every picture and invalidates any still being decoded.
+    pub fn clear_graphics(&mut self) {
+        self.graphics.clear();
+        self.pending_images.clear();
+        self.graphics_epoch = self.graphics_epoch.wrapping_add(1);
+    }
+
+    fn attach(&mut self, image: PendingImage, pixels: Option<image::RgbaImage>) {
+        let Some(pixels) = pixels else { return };
+        if image.epoch != self.graphics_epoch {
+            return;
+        }
+        // Only the latest picture is kept.
+        self.graphics.clear();
+        self.revision = self.revision.wrapping_add(1);
+        self.graphics.push_back(crate::graphics::Graphic {
+            id: self.revision,
+            pixels: std::sync::Arc::new(pixels),
+            row: image.row,
+            col: image.col,
+            alternate: image.alternate,
+        });
     }
 
     /// The shell's window title (OSC 0/2), trimmed. Empty when it set none.
@@ -238,7 +313,7 @@ impl Terminal {
             self.scrollback,
             TerminalCallbacks::default(),
         );
-        self.graphics.clear();
+        self.clear_graphics();
         self.zmodem_probe.clear();
         self.zmodem_offer = None;
         self.revision = self.revision.wrapping_add(1);
@@ -271,6 +346,9 @@ impl Terminal {
         let mut offset = total;
         loop {
             screen.set_scrollback(offset);
+            // One pass per page: `rows().nth(row)` inside the loop rebuilt every
+            // earlier row again, which made a long scrollback quadratic.
+            let texts: Vec<String> = screen.rows(0, cols).collect();
             for row in 0..rows {
                 let absolute = total - offset + row as usize;
                 if absolute < visited {
@@ -280,8 +358,9 @@ impl Terminal {
                 if logical.is_empty() {
                     anchor = (offset.saturating_sub(row as usize), 0);
                 }
-                let text = screen.rows(0, cols).nth(row as usize).unwrap_or_default();
-                logical.push_str(&text);
+                if let Some(text) = texts.get(row as usize) {
+                    logical.push_str(text);
+                }
                 if !screen.row_wrapped(row) {
                     for _ in logical.match_indices(query).take(10_000 - hits.len()) {
                         hits.push(anchor);
@@ -320,6 +399,30 @@ mod tests {
         assert!(hits[0].0 > 3);
         assert_eq!(t.parser.screen().scrollback(), before);
         assert_eq!(t.find_all("jklmnop").len(), 1);
+    }
+
+    /// A tiny PNG sent the way `imgcat` sends one.
+    fn inline_png() -> Vec<u8> {
+        use base64::Engine;
+        let mut png = Vec::new();
+        image::RgbaImage::new(2, 2)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        format!("\x1b]1337;File=inline=1:{encoded}\x07").into_bytes()
+    }
+
+    #[test]
+    fn images_are_decoded_after_the_lock_and_dropped_by_a_clear() {
+        let terminal = std::sync::Mutex::new(Terminal::new(10, 40, 100));
+        feed(&terminal, &inline_png());
+        assert_eq!(terminal.lock().unwrap().graphics.len(), 1);
+        // A clear in the same read as the image wins over the late decode.
+        let mut both = inline_png();
+        both.extend_from_slice(b"\x1b[2J");
+        let terminal = std::sync::Mutex::new(Terminal::new(10, 40, 100));
+        feed(&terminal, &both);
+        assert!(terminal.lock().unwrap().graphics.is_empty());
     }
 
     #[test]

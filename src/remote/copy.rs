@@ -2,6 +2,7 @@
 //! per-direction loops.
 
 use super::*;
+use crate::LockExt;
 
 /// Where a transfer will actually land, once any conflict is settled.
 pub(super) struct Resolved {
@@ -30,7 +31,7 @@ pub(super) async fn resolve_destination(
     // A rename can land on another existing name; give up rather than spin.
     for _ in 0..8 {
         let (overwrite_all, rename_all, skip_all, cancelled) = {
-            let policy = control.policy.lock().unwrap();
+            let policy = control.policy.locked();
             (
                 policy.overwrite_all,
                 policy.rename_all,
@@ -89,7 +90,7 @@ pub(super) async fn resolve_destination(
                 });
             }
             ConflictChoice::OverwriteAll => {
-                control.policy.lock().unwrap().overwrite_all = true;
+                control.policy.locked().overwrite_all = true;
                 return Ok(Resolved {
                     local,
                     remote,
@@ -100,7 +101,7 @@ pub(super) async fn resolve_destination(
                 rename_to_free_name(sftp, direction, &mut local, &mut remote).await?;
             }
             ConflictChoice::RenameAll => {
-                control.policy.lock().unwrap().rename_all = true;
+                control.policy.locked().rename_all = true;
                 rename_to_free_name(sftp, direction, &mut local, &mut remote).await?;
             }
             ConflictChoice::Skip => {
@@ -108,12 +109,12 @@ pub(super) async fn resolve_destination(
                 bail!("已跳过");
             }
             ConflictChoice::SkipAll => {
-                control.policy.lock().unwrap().skip_all = true;
+                control.policy.locked().skip_all = true;
                 control.skipped.store(true, Ordering::Release);
                 bail!("已跳过");
             }
             ConflictChoice::CancelRemaining => {
-                control.policy.lock().unwrap().cancel_remaining();
+                control.policy.locked().cancel_remaining();
                 control.cancel.store(true, Ordering::Release);
                 bail!("已取消");
             }
@@ -354,7 +355,7 @@ pub(super) async fn transfer_file(
         "断点文件大于源文件，请清理 .gterminal.part 后重试"
     );
     {
-        let mut s = state.lock().unwrap();
+        let mut s = state.locked();
         s.total = total;
         s.done = 0;
         s.message = "校验断点前缀".into();
@@ -382,7 +383,7 @@ pub(super) async fn transfer_file(
         destination.write_all(&buffer[..n]).await?;
         done += n as u64;
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.locked();
             s.done = done;
             s.message = "传输中".into();
         }

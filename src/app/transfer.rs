@@ -2,6 +2,7 @@
 //! the ZMODEM stream a terminal-initiated transfer takes over.
 
 use super::*;
+use g_terminal::LockExt;
 
 impl App {
     pub(super) fn begin_terminal_zmodem(
@@ -13,10 +14,7 @@ impl App {
     ) {
         if let Some(files) = &self.files
             && !Arc::ptr_eq(&files.connection, connection)
-            && files
-                .transfers
-                .iter()
-                .any(|t| t.state.lock().unwrap().running)
+            && files.transfers.iter().any(|t| t.state.locked().running)
         {
             self.error = Some("文件窗口还有其他连接的传输任务，请完成后再试".into());
             return;
@@ -71,7 +69,7 @@ impl App {
             if self
                 .files
                 .as_ref()
-                .is_some_and(|f| f.transfers.iter().any(|t| t.state.lock().unwrap().running))
+                .is_some_and(|f| f.transfers.iter().any(|t| t.state.locked().running))
             {
                 self.error = Some("文件窗口还有传输任务，请完成或暂停后切换连接".into());
                 return false;
@@ -153,8 +151,7 @@ impl App {
             let offer = self.tabs[self.active].panes[self.tabs[self.active].focused]
                 .session
                 .terminal
-                .lock()
-                .unwrap()
+                .locked()
                 .zmodem_offer;
             if let Some(upload) = offer {
                 // The picker opens straight away. The confirmation that used to sit
@@ -164,8 +161,7 @@ impl App {
                 self.tabs[self.active].panes[self.tabs[self.active].focused]
                     .session
                     .terminal
-                    .lock()
-                    .unwrap()
+                    .locked()
                     .zmodem_offer = None;
                 let local = if upload {
                     rfd::FileDialog::new().pick_file()

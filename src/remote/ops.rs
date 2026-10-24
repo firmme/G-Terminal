@@ -73,7 +73,12 @@ pub async fn resolve_gid(connection: &Arc<Connection>, name: &str) -> Result<u32
     }
     ensure!(!name.is_empty(), "请填写用户组");
     let quoted = quote_posix(name)?;
-    let command = format!("getent group {quoted} 2>/dev/null | cut -d: -f3 || id -g {quoted}");
+    // A pipeline's status is its last command's, so `getent … | cut … || id -g`
+    // never reached the fallback; test the captured value instead.
+    let command = format!(
+        "g=$(getent group {quoted} 2>/dev/null | cut -d: -f3); \
+         if [ -n \"$g\" ]; then echo \"$g\"; else id -g {quoted}; fi"
+    );
     let output = run_capture(connection, &command).await?;
     output
         .trim()

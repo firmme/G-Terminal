@@ -142,13 +142,99 @@ pub(super) fn drag_preview(ctx: &egui::Context, p: Palette) {
     }
 }
 
-fn navigation_heading(ui: &mut egui::Ui, icon: icons::Icon, title: &str, p: Palette) {
-    ui.horizontal(|ui| {
-        ui.set_min_height(22.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), Sense::hover());
-        icons::draw(ui.painter(), rect, icon, p.muted, 1.3);
-        ui.label(RichText::new(title).strong().color(p.text));
-    });
+/// A collapsible sidebar section: chevron, icon, title and a count badge, all
+/// one click target. `tag` tints the icon with the group's colour. Returns the
+/// header and, while open, the body.
+#[allow(clippy::too_many_arguments)]
+fn section<R>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    icon: icons::Icon,
+    title: &str,
+    count: Option<usize>,
+    tag: Option<egui::Color32>,
+    default_open: bool,
+    p: Palette,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> (egui::Response, Option<egui::InnerResponse<R>>) {
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), Sense::click());
+    if response.clicked() {
+        state.toggle(ui);
+    }
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, true, title));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(rect, 5, blend(p.panel, p.raised, 0.6));
+        }
+        let y = rect.center().y;
+        icons::draw(
+            painter,
+            Rect::from_center_size(egui::pos2(rect.left() + 8.0, y), egui::Vec2::splat(11.0)),
+            if state.is_open() {
+                icons::Icon::ChevronDown
+            } else {
+                icons::Icon::ChevronRight
+            },
+            p.muted,
+            1.4,
+        );
+        icons::draw(
+            painter,
+            Rect::from_center_size(egui::pos2(rect.left() + 26.0, y), egui::Vec2::splat(15.0)),
+            icon,
+            tag.unwrap_or(p.muted),
+            1.3,
+        );
+        let mut right = rect.right() - 4.0;
+        if let Some(count) = count {
+            let galley = painter.layout_no_wrap(
+                count.to_string(),
+                egui::FontId::proportional(11.5),
+                p.muted,
+            );
+            let pill = Rect::from_center_size(
+                egui::pos2(right - (galley.size().x + 12.0) * 0.5, y),
+                egui::vec2((galley.size().x + 12.0).max(20.0), 17.0),
+            );
+            painter.rect_filled(pill, 8.5, p.raised);
+            painter.galley(pill.center() - galley.size() * 0.5, galley, p.muted);
+            right = pill.left() - 6.0;
+        }
+        let mut job = egui::text::LayoutJob::simple(
+            title.to_owned(),
+            egui::FontId::proportional(13.5),
+            p.text,
+            (right - rect.left() - 38.0).max(0.0),
+        );
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = painter.layout_job(job);
+        painter.galley(
+            egui::pos2(rect.left() + 38.0, y - galley.size().y * 0.5),
+            galley,
+            p.text,
+        );
+    }
+    let body = state.show_body_indented(&response, ui, body);
+    (response, body)
+}
+
+/// The glyph for a connection: a prompt for local shells, a server for SSH and
+/// a plug for serial ports.
+pub(super) fn kind_icon(kind: &SessionKind) -> icons::Icon {
+    match kind {
+        SessionKind::Local(_) => icons::Icon::Terminal,
+        SessionKind::Serial(_) => icons::Icon::Serial,
+        SessionKind::Ssh(_) | SessionKind::Sftp(_) => icons::Icon::Host,
+    }
 }
 
 fn profile_matches(profile: &RemoteProfile, filter: &str) -> bool {
@@ -168,16 +254,19 @@ fn connection_row(
     kind: &SessionKind,
     row_id: egui::Id,
     selection: &mut Option<egui::Id>,
+    tag: Option<egui::Color32>,
     p: Palette,
 ) -> egui::Response {
-    let icon = if matches!(kind, SessionKind::Local(_) | SessionKind::Serial(_)) {
-        icons::Icon::Terminal
-    } else {
-        icons::Icon::Host
-    };
     let row = ui
         .push_id(row_id, |ui| {
-            icons::navigation_row(ui, icon, &kind.label(), *selection == Some(row_id), p)
+            icons::navigation_row(
+                ui,
+                kind_icon(kind),
+                &kind.label(),
+                *selection == Some(row_id),
+                tag,
+                p,
+            )
         })
         .inner;
     if row.clicked() || row.clicked_by(egui::PointerButton::Secondary) {
@@ -233,8 +322,7 @@ impl App {
                         .request_repaint_after(std::time::Duration::from_millis(16));
                 }
             }
-            navigation_heading(ui, icons::Icon::Toolbox, "工作区", p);
-            ui.add_space(3.0);
+            ui.add_space(2.0);
             let mut submitted = false;
             let mut connect_clicked = false;
             let mut search_focused = false;
@@ -357,13 +445,10 @@ impl App {
                         .push_id(("connection-candidate", index), |ui| {
                             icons::navigation_row(
                                 ui,
-                                if matches!(kind, SessionKind::Serial(_)) {
-                                    icons::Icon::Terminal
-                                } else {
-                                    icons::Icon::Host
-                                },
+                                kind_icon(kind),
                                 &kind.label(),
                                 self.connection_candidate == Some(index),
+                                None,
                                 p,
                             )
                         })
@@ -389,9 +474,16 @@ impl App {
                 ));
             }
             ui.add_space(6.0);
-            egui::CollapsingHeader::new(RichText::new("本地 Shell").color(p.text))
-                .default_open(true)
-                .show(ui, |ui| {
+            section(
+                ui,
+                egui::Id::new("local-shells"),
+                icons::Icon::Terminal,
+                "本机",
+                None,
+                None,
+                true,
+                p,
+                |ui| {
                     for shell in local_shells() {
                         // Double-click, like every other row in the
                         // sidebar, so a stray click cannot open a pane.
@@ -400,6 +492,7 @@ impl App {
                             &SessionKind::Local(shell.value.clone()),
                             egui::Id::new(("navigation-shell", &shell.value)),
                             &mut self.navigation_selection,
+                            None,
                             p,
                         );
                         drag_source(&row, SessionKind::Local(shell.value.clone()), None);
@@ -416,10 +509,11 @@ impl App {
                     }
                     let serial = icons::navigation_row(
                         ui,
-                        icons::Icon::Host,
-                        "连接串口…",
+                        icons::Icon::Serial,
+                        "串口…",
                         self.navigation_selection
                             == Some(egui::Id::new("navigation-serial-picker")),
+                        None,
                         p,
                     );
                     if serial.clicked() || serial.clicked_by(egui::PointerButton::Secondary) {
@@ -428,102 +522,113 @@ impl App {
                     if serial.double_clicked() {
                         *action = Some(Action::SerialPicker);
                     }
-                    serial.on_hover_text("双击打开串口选择");
-                });
+                    serial.on_hover_text("双击选择串口");
+                },
+            );
             if filter.is_empty() && !self.settings.recent_connections.is_empty() {
                 ui.add_space(4.0);
-                ui.separator();
-                let mut header_clicked = false;
-                let mut header = egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
+                let shown = self.settings.recent_connections.len().min(5);
+                section(
+                    ui,
                     egui::Id::new("recent-connections"),
+                    icons::Icon::History,
+                    "最近",
+                    Some(shown),
+                    None,
                     false,
-                )
-                .show_header(ui, |ui| {
-                    ui.set_min_height(22.0);
-                    let (rect, icon) =
-                        ui.allocate_exact_size(egui::vec2(15.0, 15.0), Sense::click());
-                    icons::draw(ui.painter(), rect, icons::Icon::History, p.muted, 1.3);
-                    let label = ui.add(
-                        egui::Label::new(RichText::new("最近连接").strong().color(p.text))
-                            .sense(Sense::click()),
-                    );
-                    header_clicked = icon.clicked() || label.clicked();
-                });
-                if header_clicked {
-                    header.toggle();
-                }
-                header.body(|ui| {
-                    let candidates: Vec<_> = self
-                        .recent_profiles
-                        .iter()
-                        .cloned()
-                        .chain(
-                            self.settings
-                                .profiles
-                                .iter()
-                                .chain(self.settings.ssh_config_profiles.iter())
-                                .cloned()
-                                .map(SessionKind::Ssh)
-                                .chain(
-                                    self.settings
-                                        .serial_profiles
-                                        .iter()
-                                        .cloned()
-                                        .map(SessionKind::Serial),
-                                ),
-                        )
-                        .chain(
-                            self.settings
-                                .recent_connections
-                                .iter()
-                                .filter_map(|key| quick_connect::from_recent_key(key)),
-                        )
-                        .collect();
-                    for key in self.settings.recent_connections.iter().take(5) {
-                        if let Some(kind) = candidates
+                    p,
+                    |ui| {
+                        let candidates: Vec<_> = self
+                            .recent_profiles
                             .iter()
-                            .find(|kind| recent_connection_key(kind).as_ref() == Some(key))
-                        {
-                            let row = connection_row(
-                                ui,
-                                kind,
-                                egui::Id::new(("navigation-recent", key)),
-                                &mut self.navigation_selection,
-                                p,
-                            );
-                            drag_source(&row, kind.clone(), None);
-                            if row.double_clicked() {
-                                *action = Some(Action::New(kind.clone()));
+                            .cloned()
+                            .chain(
+                                self.settings
+                                    .profiles
+                                    .iter()
+                                    .chain(self.settings.ssh_config_profiles.iter())
+                                    .cloned()
+                                    .map(SessionKind::Ssh)
+                                    .chain(
+                                        self.settings
+                                            .serial_profiles
+                                            .iter()
+                                            .cloned()
+                                            .map(SessionKind::Serial),
+                                    ),
+                            )
+                            .chain(
+                                self.settings
+                                    .recent_connections
+                                    .iter()
+                                    .filter_map(|key| quick_connect::from_recent_key(key)),
+                            )
+                            .collect();
+                        for key in self.settings.recent_connections.iter().take(5) {
+                            if let Some(kind) = candidates
+                                .iter()
+                                .find(|kind| recent_connection_key(kind).as_ref() == Some(key))
+                            {
+                                let row = connection_row(
+                                    ui,
+                                    kind,
+                                    egui::Id::new(("navigation-recent", key)),
+                                    &mut self.navigation_selection,
+                                    connection_color(kind, &self.settings.group_colors),
+                                    p,
+                                );
+                                drag_source(&row, kind.clone(), None);
+                                if row.double_clicked() {
+                                    *action = Some(Action::New(kind.clone()));
+                                }
+                                row.on_hover_text("单击选中 · 双击连接 / 右键管理")
+                                    .context_menu(|ui| {
+                                        if icons::icon_row(
+                                            ui,
+                                            icons::Icon::Plus,
+                                            "保存到连接列表",
+                                            None,
+                                            p,
+                                        )
+                                        .clicked()
+                                        {
+                                            *action = Some(Action::SaveConnection(kind.clone()));
+                                            ui.close();
+                                        }
+                                        if icons::icon_row(
+                                            ui,
+                                            icons::Icon::Copy,
+                                            "复制连接信息",
+                                            None,
+                                            p,
+                                        )
+                                        .clicked()
+                                        {
+                                            *action =
+                                                Some(Action::CopyConnectionInfo(kind.clone()));
+                                            ui.close();
+                                        }
+                                    });
                             }
-                            row.on_hover_text("单击选中 · 双击连接 / 右键管理")
-                                .context_menu(|ui| {
-                                    if ui.button("保存到连接列表").clicked() {
-                                        *action = Some(Action::SaveConnection(kind.clone()));
-                                        ui.close();
-                                    }
-                                    if ui.button("复制连接信息").clicked() {
-                                        *action = Some(Action::CopyConnectionInfo(kind.clone()));
-                                        ui.close();
-                                    }
-                                });
                         }
-                    }
-                });
+                    },
+                );
             }
-            ui.add_space(4.0);
-            ui.separator();
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), Sense::hover());
-                icons::draw(ui.painter(), rect, icons::Icon::Folder, p.muted, 1.2);
-                ui.label(RichText::new("所有连接").strong().color(p.text))
+                ui.set_min_height(24.0);
+                ui.add_space(4.0);
+                ui.label(RichText::new("连接").small().strong().color(p.muted))
                     .on_hover_text("右键复制完整连接列表")
                     .context_menu(|ui| {
                         let has_connections = !self.settings.profiles.is_empty()
                             || !self.settings.serial_profiles.is_empty()
                             || !self.settings.ssh_config_profiles.is_empty();
                         if ui
-                            .add_enabled(has_connections, egui::Button::new("复制连接列表"))
+                            .add_enabled_ui(has_connections, |ui| {
+                                icons::icon_row(ui, icons::Icon::Copy, "复制连接列表", None, p)
+                            })
+                            .inner
                             .clicked()
                         {
                             *action = Some(Action::CopyConnectionList);
@@ -596,123 +701,144 @@ impl App {
                 if group.is_empty() && count == 0 && !can_drop_in_group(ui.ctx()) {
                     continue;
                 }
-                let section = egui::CollapsingHeader::new(format!(
-                    "{} ({count})",
+                let group_tag = self
+                    .settings
+                    .group_colors
+                    .get(&group)
+                    .and_then(|hex| parse_tag_color(hex));
+                let (header, body) = section(
+                    ui,
+                    egui::Id::new((&group, "group")),
+                    icons::Icon::Folder,
                     if group.is_empty() {
                         "默认分组"
                     } else {
                         &group
-                    }
-                ))
-                .id_salt((&group, "group"))
-                .default_open(true)
-                .show(ui, |ui| {
-                    for (index, profile) in self
-                        .settings
-                        .profiles
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, p)| p.group == group && profile_matches(p, &filter))
-                    {
-                        let r = connection_row(
-                            ui,
-                            &SessionKind::Ssh(profile.clone()),
-                            egui::Id::new(("navigation-ssh", index)),
-                            &mut self.navigation_selection,
-                            p,
-                        );
-                        drag_source(
-                            &r,
-                            SessionKind::Ssh(profile.clone()),
-                            Some(SavedConnection::Ssh(index)),
-                        );
-                        if r.double_clicked() {
-                            *action = Some(Action::New(SessionKind::Ssh(profile.clone())));
-                        }
-                        r.on_hover_text(format!(
-                            "{}:{} · 双击连接 / 右键管理 · 可拖拽分组或新建会话",
-                            profile.destination(),
-                            profile.port
-                        ))
-                        .context_menu(|ui| {
-                            for (text, a) in [
-                                ("连接 SSH", Action::New(SessionKind::Ssh(profile.clone()))),
-                                ("编辑 / 跳板机 / 转发", Action::Edit(index)),
-                                (
-                                    "复制连接信息",
-                                    Action::CopyConnectionInfo(SessionKind::Ssh(profile.clone())),
-                                ),
-                                ("复制连接配置", Action::Duplicate(index)),
-                                ("删除连接", Action::Remove(index)),
-                            ] {
-                                if ui.button(text).clicked() {
-                                    *action = Some(a);
-                                    ui.close();
-                                }
+                    },
+                    Some(count),
+                    group_tag,
+                    true,
+                    p,
+                    |ui| {
+                        for (index, profile) in self
+                            .settings
+                            .profiles
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, p)| p.group == group && profile_matches(p, &filter))
+                        {
+                            let r = connection_row(
+                                ui,
+                                &SessionKind::Ssh(profile.clone()),
+                                egui::Id::new(("navigation-ssh", index)),
+                                &mut self.navigation_selection,
+                                parse_tag_color(&profile.color),
+                                p,
+                            );
+                            drag_source(
+                                &r,
+                                SessionKind::Ssh(profile.clone()),
+                                Some(SavedConnection::Ssh(index)),
+                            );
+                            if r.double_clicked() {
+                                *action = Some(Action::New(SessionKind::Ssh(profile.clone())));
                             }
-                        });
-                    }
-                    for (index, profile) in self
-                        .settings
-                        .serial_profiles
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, p)| p.group == group && serial_matches(p, &filter))
-                    {
-                        let r = connection_row(
-                            ui,
-                            &SessionKind::Serial(profile.clone()),
-                            egui::Id::new(("navigation-serial", index)),
-                            &mut self.navigation_selection,
-                            p,
-                        );
-                        drag_source(
-                            &r,
-                            SessionKind::Serial(profile.clone()),
-                            Some(SavedConnection::Serial(index)),
-                        );
-                        if r.double_clicked() {
-                            *action = Some(Action::New(SessionKind::Serial(profile.clone())));
-                        }
-                        r.on_hover_text(format!(
-                            "串口 {} · {} bps · 双击连接 / 右键管理 · 可拖拽分组或新建会话",
-                            if profile.auto() {
-                                "auto".to_string()
-                            } else {
-                                profile.port.clone()
-                            },
-                            profile.baud
-                        ))
-                        .context_menu(|ui| {
-                            for (text, a) in [
-                                (
-                                    "连接串口",
-                                    Action::New(SessionKind::Serial(profile.clone())),
-                                ),
-                                ("编辑串口连接", Action::EditSerial(index)),
-                                (
-                                    "复制连接信息",
-                                    Action::CopyConnectionInfo(SessionKind::Serial(
-                                        profile.clone(),
-                                    )),
-                                ),
-                                ("复制连接配置", Action::DuplicateSerial(index)),
-                                ("删除连接", Action::RemoveSerial(index)),
-                            ] {
-                                if ui.button(text).clicked() {
-                                    *action = Some(a);
-                                    ui.close();
+                            r.on_hover_text(format!(
+                                "{}:{} · 双击连接 / 右键管理 · 可拖拽分组或新建会话",
+                                profile.destination(),
+                                profile.port
+                            ))
+                            .context_menu(|ui| {
+                                for (icon, text, a) in [
+                                    (
+                                        icons::Icon::Connect,
+                                        "连接",
+                                        Action::New(SessionKind::Ssh(profile.clone())),
+                                    ),
+                                    (icons::Icon::Edit, "编辑", Action::Edit(index)),
+                                    (
+                                        icons::Icon::Copy,
+                                        "复制连接信息",
+                                        Action::CopyConnectionInfo(SessionKind::Ssh(
+                                            profile.clone(),
+                                        )),
+                                    ),
+                                    (icons::Icon::Plus, "复制为新连接", Action::Duplicate(index)),
+                                    (icons::Icon::Trash, "删除", Action::Remove(index)),
+                                ] {
+                                    if icons::icon_row(ui, icon, text, None, p).clicked() {
+                                        *action = Some(a);
+                                        ui.close();
+                                    }
                                 }
+                            });
+                        }
+                        for (index, profile) in self
+                            .settings
+                            .serial_profiles
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, p)| p.group == group && serial_matches(p, &filter))
+                        {
+                            let r = connection_row(
+                                ui,
+                                &SessionKind::Serial(profile.clone()),
+                                egui::Id::new(("navigation-serial", index)),
+                                &mut self.navigation_selection,
+                                parse_tag_color(&profile.color),
+                                p,
+                            );
+                            drag_source(
+                                &r,
+                                SessionKind::Serial(profile.clone()),
+                                Some(SavedConnection::Serial(index)),
+                            );
+                            if r.double_clicked() {
+                                *action = Some(Action::New(SessionKind::Serial(profile.clone())));
                             }
-                        });
-                    }
-                });
-                let rect = section
-                    .body_response
+                            r.on_hover_text(format!(
+                                "串口 {} · {} bps · 双击连接 / 右键管理 · 可拖拽分组或新建会话",
+                                if profile.auto() {
+                                    "auto".to_string()
+                                } else {
+                                    profile.port.clone()
+                                },
+                                profile.baud
+                            ))
+                            .context_menu(|ui| {
+                                for (icon, text, a) in [
+                                    (
+                                        icons::Icon::Connect,
+                                        "连接",
+                                        Action::New(SessionKind::Serial(profile.clone())),
+                                    ),
+                                    (icons::Icon::Edit, "编辑", Action::EditSerial(index)),
+                                    (
+                                        icons::Icon::Copy,
+                                        "复制连接信息",
+                                        Action::CopyConnectionInfo(SessionKind::Serial(
+                                            profile.clone(),
+                                        )),
+                                    ),
+                                    (
+                                        icons::Icon::Plus,
+                                        "复制为新连接",
+                                        Action::DuplicateSerial(index),
+                                    ),
+                                    (icons::Icon::Trash, "删除", Action::RemoveSerial(index)),
+                                ] {
+                                    if icons::icon_row(ui, icon, text, None, p).clicked() {
+                                        *action = Some(a);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                    },
+                );
+                let rect = body
                     .as_ref()
-                    .map_or(section.header_response.rect, |body| {
-                        section.header_response.rect.union(body.rect)
-                    });
+                    .map_or(header.rect, |body| header.rect.union(body.response.rect));
                 group_drop_target(ui, rect, Some(group), action, p);
             }
             // Hosts imported from ~/.ssh/config. They live outside the
@@ -729,16 +855,23 @@ impl App {
                     .collect();
                 let count = imported.len();
                 if count > 0 {
-                    egui::CollapsingHeader::new(format!("SSH-CONFIG ({count})"))
-                        .id_salt("ssh-config")
-                        .default_open(true)
-                        .show(ui, |ui| {
+                    section(
+                        ui,
+                        egui::Id::new("ssh-config"),
+                        icons::Icon::FileCode,
+                        "~/.ssh/config",
+                        Some(count),
+                        None,
+                        true,
+                        p,
+                        |ui| {
                             for (index, profile) in imported {
                                 let r = connection_row(
                                     ui,
                                     &SessionKind::Ssh(profile.clone()),
                                     egui::Id::new(("navigation-imported", index)),
                                     &mut self.navigation_selection,
+                                    None,
                                     p,
                                 );
                                 drag_source(&r, SessionKind::Ssh(profile.clone()), None);
@@ -751,24 +884,43 @@ impl App {
                                     profile.port
                                 ))
                                 .context_menu(|ui| {
-                                    if ui.button("连接 SSH").clicked() {
+                                    if icons::icon_row(ui, icons::Icon::Connect, "连接", None, p)
+                                        .clicked()
+                                    {
                                         *action =
                                             Some(Action::New(SessionKind::Ssh(profile.clone())));
                                         ui.close();
                                     }
-                                    if ui.button("复制连接信息").clicked() {
+                                    if icons::icon_row(
+                                        ui,
+                                        icons::Icon::Copy,
+                                        "复制连接信息",
+                                        None,
+                                        p,
+                                    )
+                                    .clicked()
+                                    {
                                         *action = Some(Action::CopyConnectionInfo(
                                             SessionKind::Ssh(profile.clone()),
                                         ));
                                         ui.close();
                                     }
-                                    if ui.button("保存到连接").clicked() {
+                                    if icons::icon_row(
+                                        ui,
+                                        icons::Icon::Plus,
+                                        "保存到连接列表",
+                                        None,
+                                        p,
+                                    )
+                                    .clicked()
+                                    {
                                         *action = Some(Action::AdoptSshConfig(profile.clone()));
                                         ui.close();
                                     }
                                 });
                             }
-                        });
+                        },
+                    );
                 }
             }
             if can_drop_in_group(ui.ctx()) {
@@ -778,6 +930,7 @@ impl App {
                     icons::Icon::NewFolder,
                     &format!("新建分组 · {}", next_group_name(&self.settings)),
                     false,
+                    None,
                     p,
                 );
                 group_drop_target(ui, row.rect, None, action, p);

@@ -1,6 +1,7 @@
 //! Local and remote file panes.
 
 use super::*;
+use g_terminal::LockExt;
 
 impl Files {
     pub(super) fn entry_color(
@@ -90,7 +91,7 @@ impl Files {
             });
         });
         let local = self.local.clone();
-        let local = local.lock().unwrap();
+        let local = local.locked();
         if local.loading {
             ui.spinner();
         }
@@ -227,6 +228,7 @@ impl Files {
                                             MenuAction::Properties(local_properties(entry, &path)),
                                         ),
                                     ],
+                                    p,
                                 );
                             });
                         }
@@ -242,7 +244,7 @@ impl Files {
         focus: editing::InitialFocus,
     ) {
         let (path, loading, error, entries) = {
-            let state = self.directory.lock().unwrap();
+            let state = self.directory.locked();
             (
                 state.path.clone(),
                 state.loading,
@@ -441,6 +443,7 @@ impl Files {
                                             )),
                                         ),
                                     ],
+                                    p,
                                 );
                             });
                         }

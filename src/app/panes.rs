@@ -26,31 +26,52 @@ impl App {
                     .resizable(false)
                     .default_width(360.0)
                     .show(ctx, |ui| {
-                        ui.label(hint(
-                            "已自动开启一个相同类型的会话，可选择其他会话替换。",
-                            p,
-                        ));
-                        for shell in local_shells() {
-                            let button = ui.button(format!("本地 {}", shell.label));
-                            focus.request(ui, &button);
-                            if button.clicked() {
-                                chosen = Some(SessionKind::Local(shell.value.clone()));
+                        ui.label(hint("新窗格已打开相同会话，可换成：", p));
+                        ui.add_space(2.0);
+                        let mut kinds: Vec<SessionKind> = local_shells()
+                            .iter()
+                            .map(|shell| SessionKind::Local(shell.value.clone()))
+                            .collect();
+                        kinds.extend(self.settings.profiles.iter().cloned().map(SessionKind::Ssh));
+                        kinds.extend(
+                            self.settings
+                                .serial_profiles
+                                .iter()
+                                .cloned()
+                                .map(SessionKind::Serial),
+                        );
+                        egui::ScrollArea::vertical()
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                                for (index, kind) in kinds.into_iter().enumerate() {
+                                    let row = ui
+                                        .push_id(index, |ui| {
+                                            icons::navigation_row(
+                                                ui,
+                                                sidebar::kind_icon(&kind),
+                                                &kind.label(),
+                                                false,
+                                                connection_color(
+                                                    &kind,
+                                                    &self.settings.group_colors,
+                                                ),
+                                                p,
+                                            )
+                                        })
+                                        .inner;
+                                    if index == 0 {
+                                        focus.request(ui, &row);
+                                    }
+                                    if row.clicked() {
+                                        chosen = Some(kind);
+                                    }
+                                }
+                            });
+                        crate::dialog::footer(ui, |ui| {
+                            if crate::dialog::secondary(ui, "保持不变").clicked() {
+                                keep = true;
                             }
-                        }
-                        ui.separator();
-                        for profile in &self.settings.profiles {
-                            if ui.button(format!("SSH · {}", profile.label())).clicked() {
-                                chosen = Some(SessionKind::Ssh(profile.clone()));
-                            }
-                        }
-                        for profile in &self.settings.serial_profiles {
-                            if ui.button(format!("串口 · {}", profile.label())).clicked() {
-                                chosen = Some(SessionKind::Serial(profile.clone()));
-                            }
-                        }
-                        if ui.button("保持当前会话").clicked() {
-                            keep = true;
-                        }
+                        });
                     });
                 if !open || keep {
                     // Closing the chooser keeps the auto-spawned session.
@@ -109,42 +130,76 @@ impl App {
             .frame(egui::Frame::new().fill(p.bg).inner_margin(0))
             .show(ctx, |ui| {
                 if self.search_open {
-                    ui.horizontal(|ui| {
-                        ui.label(hint("历史", p));
-                        let r = editing::field_with(ui, &mut self.search, |edit| {
-                            edit.desired_width(260.0)
+                    egui::Frame::new()
+                        .fill(p.panel)
+                        .inner_margin(egui::Margin::symmetric(10, 4))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let field = ui.allocate_ui(egui::vec2(300.0, 30.0), |ui| {
+                                    let r = crate::dialog::icon_field(
+                                        ui,
+                                        icons::Icon::Search,
+                                        "查找输出（含历史）",
+                                        &mut self.search,
+                                        false,
+                                        p,
+                                    );
+                                    if self.search_focus {
+                                        r.request_focus();
+                                        self.search_focus = false;
+                                    }
+                                    if r.has_focus()
+                                        && !editing::ime_composing(ui.ctx())
+                                        && ui.input(|i| i.key_pressed(Key::Enter))
+                                    {
+                                        self.find(false);
+                                    }
+                                    r.has_focus() || r.lost_focus()
+                                });
+                                let field_focused = field.inner;
+                                let found = !self.search_hits.is_empty();
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} / {}",
+                                        if found { self.search_index + 1 } else { 0 },
+                                        self.search_hits.len()
+                                    ))
+                                    .monospace()
+                                    .color(
+                                        if found || self.search.is_empty() {
+                                            p.muted
+                                        } else {
+                                            p.danger
+                                        },
+                                    ),
+                                );
+                                if icons::icon_button(ui, icons::Icon::Search, p, icons::Size::Row)
+                                    .on_hover_text("查找 (Enter)")
+                                    .clicked()
+                                {
+                                    self.find(false);
+                                }
+                                if icons::icon_button(
+                                    ui,
+                                    icons::Icon::ArrowDown,
+                                    p,
+                                    icons::Size::Row,
+                                )
+                                .on_hover_text("下一处")
+                                .clicked()
+                                {
+                                    self.find(true);
+                                }
+                                // Esc only while typing here: in the terminal it
+                                // belongs to the running program.
+                                if icons::close_button(ui, p, "关闭查找 (Esc)").clicked()
+                                    || (field_focused && ui.input(|i| i.key_pressed(Key::Escape)))
+                                {
+                                    self.search_open = false;
+                                }
+                            });
                         });
-                        if self.search_focus {
-                            r.request_focus();
-                            self.search_focus = false;
-                        }
-                        if ui.button("查找").clicked()
-                            || (r.has_focus()
-                                && !editing::ime_composing(ui.ctx())
-                                && ui.input(|i| i.key_pressed(Key::Enter)))
-                        {
-                            self.find(false);
-                        }
-                        if ui.button("下一处").clicked() {
-                            self.find(true);
-                        }
-                        ui.label(hint(
-                            &format!(
-                                "{} / {}",
-                                if self.search_hits.is_empty() {
-                                    0
-                                } else {
-                                    self.search_index + 1
-                                },
-                                self.search_hits.len()
-                            ),
-                            p,
-                        ));
-                        if ui.small_button("×").clicked() {
-                            self.search_open = false;
-                            r.surrender_focus();
-                        }
-                    });
                 }
                 let workspace_available = !self.settings_open
                     && !self.remote_open
