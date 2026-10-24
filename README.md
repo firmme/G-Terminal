@@ -2,7 +2,7 @@
 
 原生 GPU 终端，Rust + egui。Windows 默认 Direct3D 11 渲染，其余平台走 wgpu；无 Electron / Chromium / WebView。
 
-当前版本 **0.4.10**。交付 Windows x64 与 macOS arm64 便携版；Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
+当前版本 **0.4.11**，本次发布 Windows x64 便携版；macOS arm64 最新预编译包为 **0.4.10**。Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
 
 ## 截图
 
