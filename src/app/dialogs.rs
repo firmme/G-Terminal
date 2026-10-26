@@ -213,6 +213,8 @@ impl App {
                 });
                 ui.add_space(8.0);
                 ui.separator();
+                self.cloud_sync_settings(ui, ctx, p);
+                ui.separator();
                 ui.horizontal(|ui| {
                     let path = Settings::path().to_string_lossy().into_owned();
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
@@ -951,6 +953,7 @@ impl App {
             }
             if connect && let Some(picker) = &self.serial_picker {
                 *action = Some(Action::New(SessionKind::Serial(SerialProfile {
+                    sync_id: String::new(),
                     name: picker.port.clone(),
                     port: picker.port.clone(),
                     baud: picker.baud,
@@ -1131,6 +1134,7 @@ impl App {
         let focus = editing::window_focus(ctx, "exit-confirm", self.confirm_exit);
         if self.confirm_exit {
             let mut open = true;
+            let mut keep_tabs_changed = false;
             crate::dialog::Dialog::new("确认退出", Icon::Warning, self.palette)
                 .open(&mut open)
                 .default_width(360.0)
@@ -1140,6 +1144,11 @@ impl App {
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.label("仍有未断开的连接，确定要退出吗？");
+                    ui.add_space(8.0);
+                    keep_tabs_changed = ui
+                        .checkbox(&mut self.settings.restore_tabs, "保留当前选项卡")
+                        .on_hover_text("下次启动恢复选项卡和分屏，连接保持断开")
+                        .changed();
                     ui.add_space(12.0);
                     crate::dialog::footer(ui, |ui| {
                         if crate::dialog::primary(ui, "退出", self.palette).clicked() {
@@ -1154,6 +1163,9 @@ impl App {
                         }
                     });
                 });
+            if keep_tabs_changed {
+                self.persist();
+            }
             if !open {
                 self.confirm_exit = false;
             }

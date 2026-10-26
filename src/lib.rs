@@ -6,6 +6,7 @@ pub mod port_owner;
 pub mod remote;
 pub mod serial;
 pub mod session;
+pub mod sync;
 pub mod terminal;
 pub mod ztransfer;
 

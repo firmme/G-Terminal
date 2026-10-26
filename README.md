@@ -2,7 +2,7 @@
 
 原生 GPU 终端，Rust + egui。Windows 默认 Direct3D 11 渲染，其余平台走 wgpu；无 Electron / Chromium / WebView。
 
-当前版本 **0.4.11**，本次发布 Windows x64 便携版；macOS arm64 最新预编译包为 **0.4.10**。Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
+当前版本 **0.4.12**，本次发布 Windows x64 便携版；macOS arm64 最新预编译包为 **0.4.10**。Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
 
 ## 截图
 
@@ -30,9 +30,11 @@ G 菜单按新建、当前会话、文件与连接、应用分区；分屏 / 连
 - 任意嵌套分屏（每标签 ≤ 32 窗格）；标签页右键：分屏 / 复制会话 / 关闭其它 / 关闭断开；菜单「新建窗口」。
 - 连接和分组可配标签颜色，**连接色优先于分组色**；有颜色的会话给标签页铺底色。
 - 连接导航：搜索框支持 `user:pass@host[:port]` 快速连接；保存的连接可拖入分组、拖到控制台新建会话；右键复制连接配置或整份列表。
+- 新连接复用当前未连接的窗格，保留其余分屏；复制会话时新建标签。
 - 标签：后台新输出加下划线、响铃显示铃铛；shell 的 OSC 0/2 标题用于窗口标题。
 - 输入：文本框右键菜单（复制 / 剪切 / 粘贴 / 全选）；终端链接 `Cmd/Ctrl+点击` 打开；选中文本浏览器搜索（引擎可切换）；拖放文件上传 SFTP。
 - 记住上次标签（按断开状态还原）；串口可设后台自动断开。
+- 退出确认可选择“保留当前选项卡”，记住选择并与“恢复上次标签”设置同步。
 
 **SSH / 文件 / 传输**
 
@@ -93,6 +95,12 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 ## 配置与架构
 
+OneDrive 连接列表同步：已内置官方应用 Client ID，在偏好设置中登录个人微软账号，支持手动 / 自动同步连接与分组。普通用户无需注册应用或安装 OneDrive 客户端。配置、同步范围与限制见 [OneDrive 接入说明](docs/onedrive-sync.md)。
+
+状态栏云朵显示同步状态：未登录带斜杠，失败时红色，其余状态保持低调；点击展开同步操作。错误消息以可关闭的浮层显示，不占用终端行数，长错误可展开并复制详情。
+
+服务器工具箱：免密公钥、别名与提示符写入连接用户名对应的账号，无需先切换 root；安装工具、修改时区等系统操作单独调用 sudo。
+
 配置：Windows `%APPDATA%\gterminal\G-Terminal\config\settings.json`，macOS `~/Library/Application Support/dev.gterminal.G-Terminal/settings.json`（以设置页显示的实际路径为准）；旧配置自动补充新字段。
 
 渲染：Windows 走 `native_dx11.rs`（D3D11），其余平台走 eframe / wgpu。界面在 `app/`，分屏树 `layout.rs`；终端解析 `terminal.rs` / `graphics.rs`，绘制 `view/` / `shaping.rs`；会话 `session/`；SSH / SFTP `remote/` 与 `remote_ui/`；ZMODEM `ztransfer.rs`。
@@ -108,6 +116,6 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（120+ 项：真实 ConPTY、SSH / SFTP、ZMODEM、图标与手势等）。
 
-截图冒烟：`g-terminal --screenshot <png>`（约 4 秒后截图退出，不加载 / 写入工作区）；可用 `GTERMINAL_SCREENSHOT_VIEW=menu|settings|connection|serial|login|help|groups|confirm` 打开对应弹窗，`GTERMINAL_SCREENSHOT_LIGHT=1` 检查浅色主题。
+截图冒烟：`g-terminal --screenshot <png>`（约 4 秒后截图退出，不加载 / 写入工作区）；可用 `GTERMINAL_SCREENSHOT_VIEW=menu|settings|connection|serial|login|help|groups|confirm|error|sync-off|sync-error` 打开对应弹窗或状态预览，`GTERMINAL_SCREENSHOT_LIGHT=1` 检查浅色主题。
 
 Windows 启动内存约 50 MiB（Release、一个 PowerShell、D3D11 + 字体按需映射），复测脚本 `scripts/measure-memory.ps1`。数据为启动烟测，不含子进程与显存。

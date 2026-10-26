@@ -120,6 +120,7 @@ impl SshConfigBlock {
                 continue;
             }
             profiles.push(RemoteProfile {
+                sync_id: String::new(),
                 name: alias,
                 host: hostname.clone(),
                 user: self.user.clone().unwrap_or_default(),

@@ -174,13 +174,7 @@ async fn authenticate(
     password: &str,
     passphrase: &str,
 ) -> Result<()> {
-    let user = if profile.user.is_empty() {
-        std::env::var("USERNAME")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_else(|_| "root".into())
-    } else {
-        profile.user.clone()
-    };
+    let user = profile.login_user();
     if handle.authenticate_none(&user).await?.success() {
         return Ok(());
     }

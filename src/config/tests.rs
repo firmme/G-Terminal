@@ -275,10 +275,13 @@ fn saves_from_two_windows_keep_both_windows_connections() {
         "group_colors": {"x": "#111111"},
     });
     let merged = merge(&base, &mine, &disk);
-    assert_eq!(
-        merged["profiles"],
-        serde_json::json!([{"host": "b"}, {"host": "c"}])
-    );
+    let hosts: Vec<_> = merged["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["host"].as_str().unwrap())
+        .collect();
+    assert_eq!(hosts, ["b", "c"]);
     assert_eq!(merged["font_size"], 18.0);
     assert_eq!(merged["group_colors"]["y"], "#222222");
 }
@@ -292,4 +295,17 @@ fn an_untouched_field_keeps_the_other_windows_value() {
     let merged = merge(&base, &mine, &disk);
     assert_eq!(merged["light_theme"], true);
     assert_eq!(merged["font_size"], 16.0);
+}
+
+#[test]
+fn two_windows_editing_same_id_keep_one_profile_and_both_changed_fields() {
+    let base = serde_json::json!({"profiles": [{"sync_id": "one", "host": "example.com", "name": "old", "port":22}]});
+    let mut mine = base.clone();
+    let mut disk = base.clone();
+    mine["profiles"][0]["name"] = serde_json::json!("renamed");
+    disk["profiles"][0]["port"] = serde_json::json!(2222);
+    let merged = merge(&base, &mine, &disk);
+    assert_eq!(merged["profiles"].as_array().unwrap().len(), 1);
+    assert_eq!(merged["profiles"][0]["name"], "renamed");
+    assert_eq!(merged["profiles"][0]["port"], 2222);
 }

@@ -5,6 +5,8 @@ use super::*;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RemoteProfile {
+    /// Stable identity for synchronisation; old configurations are migrated on save.
+    pub sync_id: String,
     pub name: String,
     pub host: String,
     pub user: String,
@@ -27,6 +29,7 @@ pub struct Forward {
 impl Default for RemoteProfile {
     fn default() -> Self {
         Self {
+            sync_id: String::new(),
             name: String::new(),
             host: String::new(),
             user: String::new(),
@@ -41,6 +44,16 @@ impl Default for RemoteProfile {
 }
 
 impl RemoteProfile {
+    pub fn login_user(&self) -> String {
+        if self.user.is_empty() {
+            std::env::var("USERNAME")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_else(|_| "root".into())
+        } else {
+            self.user.clone()
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.host.is_empty()
             || self.host.starts_with('-')
@@ -116,6 +129,7 @@ pub const DEFAULT_BAUD: u32 = 115_200;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SerialProfile {
+    pub sync_id: String,
     pub name: String,
     pub port: String,
     pub baud: u32,
@@ -127,6 +141,7 @@ pub struct SerialProfile {
 impl Default for SerialProfile {
     fn default() -> Self {
         Self {
+            sync_id: String::new(),
             name: String::new(),
             port: "auto".into(),
             baud: DEFAULT_BAUD,

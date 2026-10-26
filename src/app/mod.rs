@@ -38,7 +38,9 @@ pub(crate) fn accel(shortcut: &str) -> String {
     }
 }
 
+mod cloud_sync;
 mod dialogs;
+mod notifications;
 mod panes;
 mod port_owner;
 use port_owner::*;
@@ -252,6 +254,7 @@ impl SerialPicker {
 }
 
 pub struct App {
+    cloud_sync: cloud_sync::CloudSync,
     settings: Settings,
     palette: Palette,
     tabs: Vec<Tab>,
@@ -348,6 +351,7 @@ impl App {
         load_fonts(ctx);
         palette.apply(ctx, settings.light_theme);
         let mut app = Self {
+            cloud_sync: cloud_sync::CloudSync::default(),
             settings,
             palette,
             tabs: vec![],
@@ -422,6 +426,15 @@ impl App {
             );
             login.prepare_quick(None, true);
             app.login = Some(login);
+        }
+        match capture_view.as_deref() {
+            Some("error") => app.error = Some(
+                "连接失败，请检查服务器地址或网络后重试。\n无法连接到 example.com:22：连接超时。"
+                    .into(),
+            ),
+            Some("sync-error") => app.preview_cloud_status(true),
+            Some("sync-off") => app.preview_cloud_status(false),
+            _ => {}
         }
         app
     }
@@ -498,6 +511,53 @@ impl App {
         });
         self.active = self.tabs.len() - 1;
         ids
+    }
+
+    /// A new destination can use the focused disconnected pane. Keep the tab's
+    /// identity and split tree, but start a fresh screen for the new host.
+    fn new_connection_target(&mut self, kind: SessionKind, reuse: bool) -> (u64, u64) {
+        if reuse
+            && !matches!(kind, SessionKind::Local(_))
+            && let Some(tab) = self.tabs.get_mut(self.active)
+            && let Some(pane) = tab.panes.get_mut(tab.focused)
+            && !pane.session.pending()
+            && pane.session.link() != SessionStatus::Live
+            && self.login_target != Some((tab.id, pane.id))
+        {
+            let ids = (tab.id, pane.id);
+            *pane = Pane::new(pane.id, Session::connecting(kind, self.settings.scrollback));
+            tab.seen_output = tab_output(tab);
+            return ids;
+        }
+        self.open_connecting_tab(kind)
+    }
+
+    fn new_session(&mut self, kind: SessionKind, ctx: &egui::Context, reuse: bool) {
+        if let Some(key) = recent_connection_key(&kind) {
+            self.recent_profiles
+                .retain(|profile| recent_connection_key(profile).as_ref() != Some(&key));
+            self.recent_profiles.insert(0, kind.clone());
+            self.recent_profiles.truncate(8);
+            self.settings
+                .recent_connections
+                .retain(|saved| saved != &key);
+            self.settings.recent_connections.insert(0, key);
+            self.settings.recent_connections.truncate(8);
+            self.persist();
+        }
+        let (tab_id, pane_id) = self.new_connection_target(kind.clone(), reuse);
+        match kind {
+            SessionKind::Ssh(profile) | SessionKind::Sftp(profile) => {
+                self.login_target = Some((tab_id, pane_id));
+                self.announce(
+                    tab_id,
+                    pane_id,
+                    Some(&format!("{}:{}", profile.destination(), profile.port)),
+                );
+                self.login = Some(Login::new(profile, self.terminal_of(tab_id, pane_id)));
+            }
+            kind => self.connect_pane(tab_id, pane_id, kind, ctx),
+        }
     }
     /// States what is about to be connected to, after blank lines that keep it
     /// apart from the previous run of output. A screen with nothing on it is
@@ -905,7 +965,7 @@ impl App {
             Action::DuplicateSession(i) => {
                 if let Some(tab) = self.tabs.get(i) {
                     let kind = tab.panes[tab.focused].session.kind.clone();
-                    self.execute(Action::New(kind), ctx);
+                    self.new_session(kind, ctx, false);
                 }
             }
             Action::CopyTabInfo(i) => {
@@ -925,36 +985,7 @@ impl App {
                     self.notify("已复制连接列表");
                 }
             }
-            Action::New(kind) => {
-                if let Some(key) = recent_connection_key(&kind) {
-                    self.recent_profiles
-                        .retain(|profile| recent_connection_key(profile).as_ref() != Some(&key));
-                    self.recent_profiles.insert(0, kind.clone());
-                    self.recent_profiles.truncate(8);
-                    self.settings
-                        .recent_connections
-                        .retain(|saved| saved != &key);
-                    self.settings.recent_connections.insert(0, key);
-                    self.settings.recent_connections.truncate(8);
-                    self.persist();
-                }
-                // The tab exists before the connection does, so the connection's
-                // notices and failures land in its own console.
-                let (tab_id, pane_id) = self.open_connecting_tab(kind.clone());
-                match kind {
-                    SessionKind::Ssh(p) | SessionKind::Sftp(p) => {
-                        self.login_target = Some((tab_id, pane_id));
-                        self.announce(
-                            tab_id,
-                            pane_id,
-                            Some(&format!("{}:{}", p.destination(), p.port)),
-                        );
-                        let console = self.terminal_of(tab_id, pane_id);
-                        self.login = Some(Login::new(p, console));
-                    }
-                    kind => self.connect_pane(tab_id, pane_id, kind, ctx),
-                }
-            }
+            Action::New(kind) => self.new_session(kind, ctx, true),
             Action::Split(axis) => {
                 if self
                     .tabs
@@ -1144,6 +1175,7 @@ impl App {
                         profile.name.clone()
                     };
                     let mut copy = profile;
+                    copy.sync_id = uuid::Uuid::new_v4().to_string();
                     copy.name = unique_copy_name(&base, &taken);
                     self.settings.profiles.push(copy);
                     self.persist();
@@ -1163,6 +1195,7 @@ impl App {
                         profile.name.clone()
                     };
                     let mut copy = profile;
+                    copy.sync_id = uuid::Uuid::new_v4().to_string();
                     copy.name = unique_copy_name(&base, &taken);
                     self.settings.serial_profiles.push(copy);
                     self.persist();
@@ -1336,6 +1369,7 @@ impl App {
         }
     }
     pub(crate) fn render(&mut self, ctx: &egui::Context) {
+        self.tick_cloud_sync(ctx);
         let p = self.palette;
         // While a candidate list is open the Enter belongs to the IME, not to
         // the widget underneath. Letting it through made a text field surrender
@@ -1407,6 +1441,7 @@ impl App {
         if let Some(action) = action {
             self.execute(action, ctx);
         }
+        self.error_notification(ctx, p);
         if self.screenshot.is_some()
             && std::env::var("GTERMINAL_SCREENSHOT_VIEW").as_deref() == Ok("icons")
         {

@@ -5,6 +5,9 @@ use super::*;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Device-local switch. Credentials are kept in the OS credential store.
+    pub onedrive_enabled: bool,
+    pub onedrive_auto_sync: bool,
     pub font_size: f32,
     pub scrollback: usize,
     pub light_theme: bool,
@@ -49,6 +52,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            onedrive_enabled: false,
+            onedrive_auto_sync: true,
             font_size: 15.0,
             scrollback: 10_000,
             light_theme: false,
@@ -99,6 +104,8 @@ impl Settings {
             )*};
         }
         read_fields!(
+            onedrive_enabled,
+            onedrive_auto_sync,
             font_size,
             scrollback,
             light_theme,
@@ -166,10 +173,20 @@ impl Settings {
     /// window had just saved, so the file is re-read and only what changed
     /// here since the last load or save is applied on top of it.
     pub fn save(&mut self) -> Result<()> {
+        crate::sync::ensure_ids(self);
         let path = Self::path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Serialize the read/merge/replace sequence across application windows.
+        // Atomic rename alone does not prevent two stale readers losing updates.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("json.lock"))?;
+        fs2::FileExt::lock_exclusive(&lock)?;
         let mine = serde_json::to_value(&*self)?;
         let merged = match (
             &self.baseline,
@@ -185,7 +202,10 @@ impl Settings {
         let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&temp, serde_json::to_vec_pretty(&merged)?)?;
         std::fs::rename(&temp, &path).context("无法保存设置")?;
-        self.baseline = Some(mine);
+        let mut updated = Self::parse(&serde_json::to_vec(&merged)?)?;
+        updated.ssh_config_profiles = std::mem::take(&mut self.ssh_config_profiles);
+        updated.baseline = Some(serde_json::to_value(&updated)?);
+        *self = updated;
         Ok(())
     }
 }
@@ -216,6 +236,12 @@ pub(super) fn merge(
         }
         let merged = match (key.as_str(), base_value, mine_value, disk_map.get(key)) {
             ("recent_connections" | "workspace", ..) => mine_value.clone(),
+            (
+                "profiles" | "serial_profiles",
+                Some(Value::Array(base)),
+                Value::Array(mine),
+                Some(Value::Array(disk)),
+            ) => merge_profiles(key, base, mine, disk),
             (_, Some(Value::Array(base)), Value::Array(mine), Some(Value::Array(disk))) => {
                 let mut list: Vec<Value> = disk
                     .iter()
@@ -248,6 +274,67 @@ pub(super) fn merge(
         out.insert(key.clone(), merged);
     }
     Value::Object(out)
+}
+
+/// Merge connections by stable ID instead of treating an edit as deletion plus
+/// insertion, which could leave two versions of the same connection on disk.
+fn merge_profiles(
+    key: &str,
+    base: &[serde_json::Value],
+    mine: &[serde_json::Value],
+    disk: &[serde_json::Value],
+) -> serde_json::Value {
+    use serde_json::Value;
+    let normalize = |values: &[Value]| -> Option<Vec<Value>> {
+        let mut settings = Settings::default();
+        if key == "profiles" {
+            settings.profiles = serde_json::from_value(Value::Array(values.to_vec())).ok()?;
+        } else {
+            settings.serial_profiles =
+                serde_json::from_value(Value::Array(values.to_vec())).ok()?;
+        }
+        crate::sync::ensure_ids(&mut settings);
+        let value = if key == "profiles" {
+            serde_json::to_value(settings.profiles).ok()?
+        } else {
+            serde_json::to_value(settings.serial_profiles).ok()?
+        };
+        value.as_array().cloned()
+    };
+    let (Some(base), Some(mine), Some(disk)) = (normalize(base), normalize(mine), normalize(disk))
+    else {
+        return Value::Array(mine.to_vec());
+    };
+    let id = |value: &Value| {
+        value
+            .get("sync_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let mut result = disk.clone();
+    for old in &base {
+        if !mine.iter().any(|value| id(value) == id(old)) {
+            result.retain(|value| id(value) != id(old));
+        }
+    }
+    for value in &mine {
+        let old = base.iter().find(|old| id(old) == id(value));
+        if old == Some(value) {
+            continue;
+        }
+        if let Some(index) = result.iter().position(|entry| id(entry) == id(value)) {
+            // Existing object merge preserves fields changed only by the other
+            // window (including this machine's identity path or serial port).
+            result[index] = match old {
+                Some(old) => merge(old, value, &result[index]),
+                None => value.clone(),
+            };
+        } else {
+            result.push(value.clone());
+        }
+    }
+    Value::Array(result)
 }
 
 /// One settings field, on its own. A failure is logged and the caller keeps

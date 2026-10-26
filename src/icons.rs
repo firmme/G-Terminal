@@ -20,6 +20,8 @@ pub enum Icon {
     FolderUp,
     Home,
     Refresh,
+    Cloud,
+    CloudOff,
     Group,
     Settings,
     Toolbox,
@@ -75,7 +77,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Icon; 59] = [
+    pub const ALL: [Icon; 61] = [
         Icon::Terminal,
         Icon::Host,
         Icon::Connect,
@@ -84,6 +86,8 @@ impl Icon {
         Icon::FolderUp,
         Icon::Home,
         Icon::Refresh,
+        Icon::Cloud,
+        Icon::CloudOff,
         Icon::Group,
         Icon::Settings,
         Icon::Toolbox,
@@ -343,6 +347,18 @@ pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, wid
             arc.push(pen.at(20.5, 8.5));
             pen.path(arc);
             pen.line(&[(20.5, 3.5), (20.5, 8.5), (15.5, 8.5)]);
+        }
+        Icon::Cloud | Icon::CloudOff => {
+            // Three overlapping lobes, one continuous outline on the same grid
+            // and stroke as the rest of the status bar's glyphs.
+            let mut outline = pen.arc_points(7.0, 14.5, 4.5, 90.0, 250.0);
+            outline.extend(pen.arc_points(11.5, 10.5, 6.0, 185.0, 352.0));
+            outline.extend(pen.arc_points(17.5, 14.5, 4.5, 265.0, 450.0));
+            outline.push(pen.at(7.0, 19.0));
+            pen.path(outline);
+            if icon == Icon::CloudOff {
+                pen.line(&[(3.0, 3.0), (21.0, 21.0)]);
+            }
         }
         Icon::Restart => {
             let mut arc = pen.arc_points(12.0, 12.0, 8.5, 180.0, -138.0);

@@ -61,6 +61,219 @@ fn settings_and_confirmation_fit_their_content() {
 }
 
 #[test]
+fn error_notification_preserves_terminal_grid_and_can_be_dismissed() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    let screen = Vec2::new(1000.0, 700.0);
+    for _ in 0..3 {
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, screen);
+    }
+    let grid = app.tabs[0].panes[0].session.size;
+    app.error = Some(format!(
+        "连接失败，请检查网络。\n{}",
+        "详细错误信息，包含多行诊断。\n".repeat(80)
+    ));
+    for _ in 0..3 {
+        frame(&mut app, &ctx, vec![], Modifiers::NONE, screen);
+    }
+    assert_eq!(
+        app.tabs[0].panes[0].session.size, grid,
+        "a notification must not resize the PTY"
+    );
+    let bounds = egui::AreaState::load(&ctx, egui::Id::new("error-notification"))
+        .unwrap()
+        .rect();
+    assert!(
+        bounds.width() <= 442.0 && bounds.height() < 160.0,
+        "long error must start compact: {bounds:?}"
+    );
+    assert!(
+        bounds.bottom() < screen.y - 32.0,
+        "notification covers the status bar"
+    );
+    let close_rect = ctx
+        .data(|data| data.get_temp::<Rect>(egui::Id::new("error-notification-close")))
+        .unwrap();
+    assert!(
+        bounds.contains_rect(close_rect),
+        "close control escaped notification: {close_rect:?} vs {bounds:?}"
+    );
+    let close = close_rect.center();
+    frame(
+        &mut app,
+        &ctx,
+        vec![Event::PointerMoved(close)],
+        Modifiers::NONE,
+        screen,
+    );
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(close, true)],
+        Modifiers::NONE,
+        screen,
+    );
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(close, false)],
+        Modifiers::NONE,
+        screen,
+    );
+    assert!(
+        app.error.is_none(),
+        "close control must dismiss the notification"
+    );
+    assert_eq!(app.tabs[0].panes[0].session.size, grid);
+}
+
+#[test]
+fn new_remote_connection_reuses_only_the_focused_disconnected_pane() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    app.execute(Action::Split(Axis::Horizontal), &ctx);
+    let tab_id = app.tabs[0].id;
+    let focused = app.tabs[0].focused;
+    let pane_id = app.tabs[0].panes[focused].id;
+    let other = 1 - focused;
+    let other_screen = app.tabs[0].panes[other].session.terminal.clone();
+    let old = SessionKind::Ssh(RemoteProfile {
+        host: "old.example.com".into(),
+        ..Default::default()
+    });
+    app.tabs[0].panes[focused].session = Session::disconnected(old, app.settings.scrollback);
+    let old_screen = app.tabs[0].panes[focused].session.terminal.clone();
+    app.execute(
+        Action::New(SessionKind::Ssh(RemoteProfile {
+            host: "new.example.com".into(),
+            ..Default::default()
+        })),
+        &ctx,
+    );
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(app.tabs[0].id, tab_id);
+    assert_eq!(app.tabs[0].panes.len(), 2);
+    assert!(app.tabs[0].layout.valid(2));
+    assert_eq!(app.login_target, Some((tab_id, pane_id)));
+    assert_eq!(app.login.as_ref().unwrap().profile.host, "new.example.com");
+    assert!(app.tabs[0].panes[focused].session.pending());
+    assert!(!Arc::ptr_eq(
+        &old_screen,
+        &app.tabs[0].panes[focused].session.terminal
+    ));
+    assert!(Arc::ptr_eq(
+        &other_screen,
+        &app.tabs[0].panes[other].session.terminal
+    ));
+    assert_eq!(app.tabs[0].panes[other].session.link(), SessionStatus::Live);
+}
+
+#[test]
+fn new_connection_keeps_live_pending_and_explicit_duplicate_tabs() {
+    let remote = || {
+        SessionKind::Ssh(RemoteProfile {
+            host: "example.com".into(),
+            ..Default::default()
+        })
+    };
+    for pending in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+        if pending {
+            app.tabs[0].panes[0].session = Session::connecting(remote(), app.settings.scrollback);
+        }
+        let original = app.tabs[0].panes[0].session.terminal.clone();
+        app.execute(Action::New(remote()), &ctx);
+        assert_eq!(app.tabs.len(), 2);
+        assert!(Arc::ptr_eq(
+            &original,
+            &app.tabs[0].panes[0].session.terminal
+        ));
+    }
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(&ctx, Settings::default(), None, None);
+    app.tabs[0].panes[0].session = Session::disconnected(remote(), app.settings.scrollback);
+    app.execute(Action::DuplicateSession(0), &ctx);
+    assert_eq!(
+        app.tabs.len(),
+        2,
+        "explicit duplicate always opens another tab"
+    );
+}
+
+#[test]
+fn exit_keep_tabs_choice_is_remembered_and_restores_disconnected_tabs() {
+    let ctx = egui::Context::default();
+    let mut app = App::from_settings(
+        &ctx,
+        Settings {
+            restore_tabs: false,
+            ..Default::default()
+        },
+        None,
+        None,
+    );
+    app.execute(
+        Action::New(SessionKind::Local(app.settings.default_shell.clone())),
+        &ctx,
+    );
+    app.confirm_exit = true;
+    let raw = |events| RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(1280.0, 800.0),
+        )),
+        events,
+        ..Default::default()
+    };
+    for _ in 0..3 {
+        let _ = ctx.run(raw(vec![]), |ctx| app.exit_confirm(ctx));
+    }
+    let output = ctx.run(raw(vec![]), |ctx| app.exit_confirm(ctx));
+    let checkbox = output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape
+                && text.galley.text() == "保留当前选项卡"
+            {
+                Some(text.pos + egui::vec2(4.0, 4.0))
+            } else {
+                None
+            }
+        })
+        .expect("exit dialog must offer keeping tabs");
+    for events in [
+        vec![Event::PointerMoved(checkbox)],
+        vec![press(checkbox, true)],
+        vec![press(checkbox, false)],
+    ] {
+        let _ = ctx.run(raw(events), |ctx| app.exit_confirm(ctx));
+    }
+    assert!(app.settings.restore_tabs);
+    let saved: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
+    assert!(saved.restore_tabs);
+    assert_eq!(saved.workspace.len(), 2);
+    app.confirm_exit = false;
+    app.request_exit(&ctx);
+    assert!(app.confirm_exit);
+    assert!(
+        app.settings.restore_tabs,
+        "reopening confirmation must retain the choice"
+    );
+    let restored = App::from_settings(&egui::Context::default(), saved, None, None);
+    assert_eq!(restored.tabs.len(), 2);
+    assert!(
+        restored
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .all(|pane| !pane.session.pending() && pane.session.link() == SessionStatus::Detached)
+    );
+}
+
+#[test]
 fn login_opens_on_username_and_allows_tabbing_to_password() {
     let ctx = egui::Context::default();
     let mut app = App::from_settings(&ctx, Settings::default(), None, None);

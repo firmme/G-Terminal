@@ -19,7 +19,7 @@ const MINIMAL_PROMPT: &str = r##"\[\e[32m\]\u@\h:\[\e[34m\]\w\[\e[0m\]\$ "##;
 const DEFAULT_TIMEZONE: &str = "Asia/Shanghai";
 
 /// The file the payload is uploaded to before it runs.
-const REMOTE_SCRIPT: &str = "/tmp/g-terminal-toolbox.sh";
+const REMOTE_SCRIPT: &str = "\"$GT_SCRIPT\"";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Prompt {
@@ -93,6 +93,7 @@ impl Tool {
 }
 
 pub struct Toolbox {
+    user: String,
     aliases: bool,
     key_login: bool,
     /// The local public key to install, when one was found.
@@ -108,6 +109,7 @@ pub struct Toolbox {
 impl Toolbox {
     pub fn new(profile: &RemoteProfile) -> Self {
         Self {
+            user: profile.login_user(),
             aliases: false,
             key_login: false,
             key: find_public_key(&profile.identity),
@@ -147,33 +149,48 @@ impl Toolbox {
     /// reads it from a file, so the commands are expanded remotely and the
     /// literal pieces (prompt, aliases) stay literal.
     pub fn script(&self) -> String {
-        let mut body = String::from(
-            "echo '=== G-Terminal 服务器初始化 ==='\n\
-             [ \"$(id -u)\" = 0 ] || echo '提示：当前不是 root，部分操作可能失败（可先 sudo -i 后重试）'\n",
+        let mut body = String::from("echo '=== G-Terminal 服务器工具箱 ==='\n");
+        let mut user_body = String::from(
+            "GT_HOME=$(getent passwd \"$(id -un)\" 2>/dev/null | cut -d: -f6)\n\
+             if [ -n \"$GT_HOME\" ]; then HOME=$GT_HOME; export HOME; fi\n",
         );
         if self.aliases {
-            body.push_str(ALIASES);
+            user_body.push_str(ALIASES);
         }
         if self.key_login
             && let Some(key) = &self.key
         {
-            body.push_str(&key_section(key));
+            user_body.push_str(&key_section(key));
         }
         if let Some(prompt) = self.prompt.text() {
-            body.push_str(&prompt_section(prompt));
+            user_body.push_str(&prompt_section(prompt));
         }
+        if self.aliases || self.key_login || self.prompt != Prompt::Keep {
+            body.push_str(&user_section(&self.user, &user_body));
+        }
+        let mut system_body = String::new();
         if self.timezone_on && self.timezone_ok() {
-            body.push_str(&timezone_section(self.timezone.trim()));
+            system_body.push_str(&timezone_section(self.timezone.trim()));
         }
         if self.ipv6 {
-            body.push_str(IPV6);
+            system_body.push_str(IPV6);
         }
         let tools = self.selected_tools();
         if !tools.is_empty() {
-            body.push_str(&tools_section(&tools));
+            system_body.push_str(&tools_section(&tools));
+        }
+        if !system_body.is_empty() {
+            // Elevate only this child process, never change the interactive
+            // login shell or the account receiving authorized_keys.
+            let quoted = shell_quote(&system_body);
+            body.push_str(&format!(
+                "if [ \"$(id -u)\" = 0 ]; then sh -c {quoted}\n\
+                 elif command -v sudo >/dev/null 2>&1; then sudo -- sh -c {quoted}\n\
+                 else echo '系统操作需要 sudo 权限，已跳过；用户配置不受影响'; fi\n"
+            ));
         }
         format!(
-            "cat > {REMOTE_SCRIPT} <<'GT_TOOLBOX'\n{body}GT_TOOLBOX\n\
+            "GT_SCRIPT=$(mktemp /tmp/g-terminal-toolbox.XXXXXX) && cat > {REMOTE_SCRIPT} <<'GT_TOOLBOX'\n{body}GT_TOOLBOX\n\
              sh {REMOTE_SCRIPT}\nrm -f {REMOTE_SCRIPT}\n"
         )
     }
@@ -195,7 +212,14 @@ impl Toolbox {
             .default_width(480.0)
             .show(ctx, |ui| {
                 ui.label(RichText::new(format!("目标：{target}")).color(p.accent));
-                ui.label(hint("仅执行已勾选的项目，使用当前登录用户权限。", p));
+                ui.label(hint(
+                    &format!("用户配置目标：{}（连接用户名）", self.user),
+                    p,
+                ));
+                ui.label(hint(
+                    "免密登录无需 root；系统操作单独通过 sudo 提权，不切换登录用户。",
+                    p,
+                ));
                 ui.separator();
                 egui::CollapsingHeader::new("初始化服务器")
                     .default_open(true)
@@ -205,7 +229,10 @@ impl Toolbox {
                         ui.horizontal(|ui| {
                             let has_key = self.key.is_some();
                             ui.add_enabled_ui(has_key, |ui| {
-                                ui.checkbox(&mut self.key_login, "免密登录（写入本机公钥）");
+                                ui.checkbox(
+                                    &mut self.key_login,
+                                    "免密登录（为连接用户写入本机公钥）",
+                                );
                             });
                             if !has_key {
                                 ui.label(hint("未找到本机公钥（~/.ssh/id_ed25519.pub 等）", p));
@@ -296,6 +323,8 @@ fn find_public_key(identity: &str) -> Option<String> {
         } else {
             candidates.push(g_terminal::config::expand_home(&format!("{identity}.pub")));
         }
+        // Never install an unrelated fallback key for an explicit identity.
+        return candidates.iter().find_map(|path| read_public_key(path));
     }
     if let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) {
         for name in ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"] {
@@ -340,11 +369,32 @@ echo '已写入常用别名到 ~/.bashrc'
 
 fn key_section(key: &str) -> String {
     format!(
-        "mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\"\n\
+        "(set -e\n\
+         umask 077\n\
+         mkdir -p \"$HOME/.ssh\"\n\
+         chmod 700 \"$HOME/.ssh\"\n\
          touch \"$HOME/.ssh/authorized_keys\"\n\
-         grep -qxF '{key}' \"$HOME/.ssh/authorized_keys\" 2>/dev/null || echo '{key}' >> \"$HOME/.ssh/authorized_keys\"\n\
+         grep -qxF -- '{key}' \"$HOME/.ssh/authorized_keys\" 2>/dev/null || printf '%s\\n' '{key}' >> \"$HOME/.ssh/authorized_keys\"\n\
          chmod 600 \"$HOME/.ssh/authorized_keys\"\n\
-         echo '已写入公钥到 ~/.ssh/authorized_keys'\n"
+         printf '已为 %s 配置公钥：%s/.ssh/authorized_keys\\n' \"$(id -un)\" \"$HOME\"\n\
+         ) || echo '公钥配置失败，请检查目录所有权和写入权限'\n"
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn user_section(user: &str, script: &str) -> String {
+    let user = shell_quote(user);
+    let script = shell_quote(script);
+    format!(
+        "GT_USER={user}\n\
+         if [ \"$(id -un)\" = \"$GT_USER\" ]; then sh -c {script}\n\
+         elif [ \"$(id -u)\" = 0 ]; then\n\
+         \x20 if command -v runuser >/dev/null 2>&1; then runuser -u \"$GT_USER\" -- sh -c {script}\n\
+         \x20 else su -s /bin/sh -c {script} -- \"$GT_USER\"; fi\n\
+         else echo '当前终端用户与连接用户名不一致，请退出 su/sudo 后重试用户配置'; fi\n"
     )
 }
 
@@ -435,6 +485,7 @@ mod tests {
 
     fn toolbox() -> Toolbox {
         Toolbox {
+            user: "deploy".into(),
             focus_first: true,
             aliases: false,
             key_login: false,
@@ -452,7 +503,7 @@ mod tests {
         let toolbox = toolbox();
         assert!(!toolbox.anything_selected());
         let script = toolbox.script();
-        assert!(script.contains("cat > /tmp/g-terminal-toolbox.sh"));
+        assert!(script.contains("mktemp /tmp/g-terminal-toolbox.XXXXXX"));
         assert!(!script.contains("alias ll="));
         assert!(!script.contains("PS1="));
         assert!(!script.contains("install_pkgs"));
@@ -468,9 +519,9 @@ mod tests {
         toolbox.ipv6 = true;
         toolbox.tools.iter_mut().for_each(|(_, on)| *on = true);
         let script = toolbox.script();
-        assert!(script.contains("alias ll='ls -alF'"));
+        assert!(script.contains(&"alias ll='ls -alF'".replace('\'', "'\\''")));
         assert!(script.contains("ssh-ed25519 AAAA test@host"));
-        assert!(script.contains("PS1='\\[\\e[32m\\]\\u@\\h:"));
+        assert!(script.contains(&"PS1='\\[\\e[32m\\]\\u@\\h:".replace('\'', "'\\''")));
         assert!(script.contains("timedatectl set-timezone Asia/Shanghai"));
         assert!(script.contains("disable_ipv6"));
         for package in ["htop", "vim", "lrzsz", "git", "nodejs npm", "nginx"] {
@@ -543,5 +594,91 @@ mod tests {
             read_public_key(&good).as_deref(),
             Some("ssh-ed25519 AAAAC3Nza user@host")
         );
+    }
+
+    #[test]
+    fn key_only_never_requests_root_and_targets_connection_user() {
+        let mut toolbox = toolbox();
+        toolbox.key_login = true;
+        let script = toolbox.script();
+        assert!(script.contains("GT_USER='deploy'"));
+        assert!(script.contains("runuser -u \"$GT_USER\" -- sh -c"));
+        assert!(!script.contains("sudo --"));
+        assert!(!script.contains("sudo -i"));
+        assert!(script.contains("authorized_keys"));
+        assert!(script.contains("umask 077"));
+    }
+
+    #[test]
+    fn system_tools_elevate_child_only_and_explicit_key_has_no_fallback() {
+        let mut toolbox = toolbox();
+        toolbox.timezone_on = true;
+        let script = toolbox.script();
+        assert!(script.contains("sudo -- sh -c"));
+        assert!(!script.contains("sudo -i"));
+        assert!(find_public_key("/nonexistent/g-terminal-explicit-key").is_none());
+    }
+
+    #[test]
+    fn key_install_runs_as_connection_user_even_from_a_root_shell() {
+        let bash = if cfg!(windows) {
+            "C:/Program Files/Git/bin/bash.exe"
+        } else {
+            "/bin/bash"
+        };
+        if !Path::new(bash).is_file() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("gterminal-toolbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        let mocks = [
+            (
+                "id",
+                "#!/bin/sh\ncase \"$1\" in -un) echo \"${GT_RUN_AS:-root}\";; -u) if [ \"${GT_RUN_AS:-root}\" = root ]; then echo 0; else echo 1000; fi;; esac\n",
+            ),
+            (
+                "getent",
+                "#!/bin/sh\nprintf 'deploy:x:1000:1000::%s:/bin/sh\\n' \"$GT_TEST_HOME\"\n",
+            ),
+            (
+                "runuser",
+                "#!/bin/sh\n[ \"$1\" = -u ] && [ \"$2\" = deploy ] && [ \"$3\" = -- ] || exit 90\nshift 3\nexec env GT_RUN_AS=deploy \"$@\"\n",
+            ),
+            (
+                "sudo",
+                "#!/bin/sh\necho 'unexpected elevation' >&2\nexit 91\n",
+            ),
+        ];
+        for (name, content) in mocks {
+            let path = dir.join("bin").join(name);
+            std::fs::write(&path, content).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let mut toolbox = toolbox();
+        toolbox.key_login = true;
+        std::fs::write(dir.join("payload.sh"), toolbox.script()).unwrap();
+        for login_user in ["root", "deploy"] {
+            let output = std::process::Command::new(bash).args(["--noprofile", "--norc", "-c",
+                "if command -v cygpath >/dev/null 2>&1; then GT_TEST_DIR=$(cygpath -u \"$GT_TEST_DIR\"); fi; export GT_TEST_HOME=\"$GT_TEST_DIR/home\"; export PATH=\"$GT_TEST_DIR/bin:$PATH\"; sh \"$GT_TEST_DIR/payload.sh\""])
+                .env("GT_TEST_DIR", &dir).env("GT_RUN_AS", login_user).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("已为 deploy 配置公钥"), "{stdout}");
+        }
+        let installed = std::fs::read_to_string(dir.join("home/.ssh/authorized_keys")).unwrap();
+        assert_eq!(installed.lines().count(), 1, "install must be idempotent");
+        assert_eq!(installed.trim(), "ssh-ed25519 AAAA test@host");
+        // Only remove the unique directory created by this test.
+        assert!(dir.starts_with(std::env::temp_dir()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

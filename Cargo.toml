@@ -1,6 +1,6 @@
 [package]
 name = "g-terminal"
-version = "0.4.11"
+version = "0.4.12"
 edition = "2024"
 rust-version = "1.88"
 description = "A native GPU terminal, built for Windows and designed for multiple platforms"
@@ -24,6 +24,10 @@ russh-sftp = "=2.1.1"
 zeroize = "1"
 sha2 = "0.10"
 base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+keyring = { version = "=3.6.3", features = ["windows-native", "apple-native", "sync-secret-service", "crypto-rust"] }
+uuid = { version = "1", features = ["v4"] }
+fs2 = "0.4"
 memmap2 = "0.9"
 cosmic-text = { version = "=0.17.0", default-features = false, features = ["std", "swash"] }
 zmodem2 = "=0.7.2"

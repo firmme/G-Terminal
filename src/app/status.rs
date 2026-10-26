@@ -35,7 +35,7 @@ impl App {
                 !i.viewport().fullscreen.unwrap_or(false)
                     && !i.viewport().maximized.unwrap_or(false)
             });
-        egui::TopBottomPanel::bottom("status")
+        let status = egui::TopBottomPanel::bottom("status")
             .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin {
                 left: 12,
                 right: if resizable { 24 } else { 12 },
@@ -43,17 +43,6 @@ impl App {
                 bottom: 5,
             }))
             .show(ctx, |ui| {
-                if let Some(error) = self.error.clone() {
-                    ui.horizontal_wrapped(|ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
-                        icons::draw(ui.painter(), rect, icons::Icon::Warning, p.danger, 1.3);
-                        ui.colored_label(p.danger, error);
-                        if icons::close_button(ui, p, "关闭").clicked() {
-                            self.error = None;
-                        }
-                    });
-                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if let Some(t) = self.tabs.get(self.active) {
@@ -112,7 +101,20 @@ impl App {
                             .on_hover_text("当前窗格 / 窗格总数");
                         }
                         if let Some(e) = &state.error {
-                            ui.colored_label(p.danger, e);
+                            let mut warning = p;
+                            warning.muted = p.danger;
+                            warning.text = p.danger;
+                            if icons::icon_button(
+                                ui,
+                                icons::Icon::Warning,
+                                warning,
+                                icons::Size::Row,
+                            )
+                            .on_hover_text(e)
+                            .clicked()
+                            {
+                                self.error = Some(e.clone());
+                            }
                         }
                         if let Some(c) = &s.remote {
                             let forwards = c.forwarding.locked().clone();
@@ -183,6 +185,7 @@ impl App {
                         {
                             self.settings_open = true;
                         }
+                        self.cloud_status_button(ui, p);
                         if icons::icon_button(ui, icons::Icon::Keyboard, p, icons::Size::Row)
                             .on_hover_text("快捷键")
                             .clicked()
@@ -290,6 +293,12 @@ impl App {
                     ctx.request_repaint_after(std::time::Duration::from_millis(150));
                 }
             });
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("status-bar-height"),
+                status.response.rect.height(),
+            )
+        });
         if resizable {
             egui::Area::new(egui::Id::new("window-resize-grip"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, egui::Vec2::ZERO)

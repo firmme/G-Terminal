@@ -4,7 +4,11 @@ param(
     [switch]$BenchUi,
     # Optional rustup toolchain name, e.g. 'stable-x86_64-pc-windows-gnu'. When omitted, the
     # active default toolchain decides which environment (MSVC or GNU) gets prepared.
-    [string]$Toolchain = ''
+    [string]$Toolchain = '',
+    # Developer diagnostics; ordinary builds continue to build G-Terminal.
+    [string]$Example = '',
+    # Target the UI test harness without rebuilding a running desktop executable.
+    [string]$Bin = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
@@ -132,6 +136,8 @@ switch -Regex ($hostTriple) {
 $cargoArgs = @()
 if ($Toolchain) { $cargoArgs += "+$Toolchain" }
 $cargoArgs += $Action, '--locked'
+if ($Example) { $cargoArgs += @('--example', $Example) }
+if ($Bin) { $cargoArgs += @('--bin', $Bin) }
 if ($Release) { $cargoArgs += '--release' }
 if ($BenchUi) { $cargoArgs += @('benchmark_', '--', '--ignored', '--nocapture', '--test-threads=1') }
 if ($Action -eq 'clippy') { $cargoArgs += @('--all-targets', '--', '-D', 'warnings') }
