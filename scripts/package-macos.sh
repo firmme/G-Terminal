@@ -78,6 +78,11 @@ for extra in ("README.md", "LICENSE"):
         shutil.copy2(extra, root)
         shutil.copy2(extra, resources)
 
+for destination in (root, resources):
+    docs_dir = os.path.join(destination, "docs")
+    os.makedirs(docs_dir, exist_ok=True)
+    shutil.copy2("docs/onedrive-sync.md", docs_dir)
+
 notices = [
     "G-Terminal third-party dependencies (Cargo.lock, including platform-specific build dependencies).",
     "License text files are included in licenses/ when provided at the crate root.",
