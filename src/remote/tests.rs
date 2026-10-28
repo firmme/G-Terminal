@@ -823,7 +823,7 @@ fn expand_identity_resolves_tilde_prefix() {
         );
         assert_eq!(
             crate::config::expand_home(r"  ~\.ssh\id_rsa  "),
-            home.join(r".ssh\id_rsa")
+            home.join(".ssh/id_rsa")
         );
     }
     // Anything else is left exactly as typed, trimmed.
