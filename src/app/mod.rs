@@ -45,6 +45,7 @@ mod panes;
 mod port_owner;
 use port_owner::*;
 mod quick_connect;
+mod screenshot_demo;
 mod sidebar;
 mod status;
 mod titlebar;
@@ -327,9 +328,15 @@ impl App {
         Self::new_context(&cc.egui_ctx, screenshot)
     }
     pub(crate) fn new_context(ctx: &egui::Context, screenshot: Option<std::path::PathBuf>) -> Self {
-        let (settings, error) = match Settings::load() {
-            Ok(s) => (s, None),
-            Err(e) => (Settings::default(), Some(e.to_string())),
+        let demo = screenshot.is_some()
+            && std::env::var("GTERMINAL_SCREENSHOT_DEMO").as_deref() == Ok("1");
+        let (settings, error) = if demo {
+            (screenshot_demo::settings(), None)
+        } else {
+            match Settings::load() {
+                Ok(s) => (s, None),
+                Err(e) => (Settings::default(), Some(e.to_string())),
+            }
         };
         Self::from_settings(ctx, settings, error, screenshot)
     }
@@ -417,6 +424,11 @@ impl App {
         };
         if app.settings.restore_tabs && app.screenshot.is_none() {
             app.restore();
+        }
+        if app.screenshot.is_some()
+            && std::env::var("GTERMINAL_SCREENSHOT_DEMO").as_deref() == Ok("1")
+        {
+            app.populate_screenshot_demo();
         }
         if app.tabs.is_empty() {
             app.execute(

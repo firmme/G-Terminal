@@ -6,13 +6,15 @@
 
 ## 截图
 
+以下截图使用独立演示数据：连接地址、用户名、路径和终端输出均为示例，不读取个人配置或启动真实会话。
+
 ![主界面](docs/screenshots/main.png)
 
 本地 Shell 与分组连接；状态栏含历史查找、上下行速率和缩放手柄。
 
 ![菜单](docs/screenshots/menu.png)
 
-G 菜单按新建、当前会话、文件与连接、应用分区；分屏 / 连接工具 / 帮助更新收在子菜单。
+G 菜单顶部可新建终端、SSH、串口或窗口；当前会话区提供重连、查找与分屏，工具区集中收纳文件传输、分组和服务器工具箱。
 
 ![串口连接](docs/screenshots/serial-connection.png)
 
@@ -122,6 +124,8 @@ OneDrive 连接列表同步：已内置官方应用 Client ID，在偏好设置�
 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（120+ 项：真实 ConPTY、SSH / SFTP、ZMODEM、图标与手势等）。
 
 截图冒烟：`g-terminal --screenshot <png>`（约 4 秒后截图退出，不加载 / 写入工作区）；可用 `GTERMINAL_SCREENSHOT_VIEW=menu|settings|connection|serial|login|help|groups|confirm|error|sync-off|sync-error` 打开对应弹窗或状态预览，`GTERMINAL_SCREENSHOT_LIGHT=1` 检查浅色主题。
+
+更新 README 截图（Windows）：构建 Release 后运行 `./scripts/update-readme-screenshots.ps1`。脚本启用 `GTERMINAL_SCREENSHOT_DEMO=1`，跳过个人设置与 SSH 配置，只绘制固定示例内容；不启动 Shell、不连接服务器、不写入个人配置。普通截图冒烟仍使用当前偏好设置。
 
 Windows 启动内存约 50 MiB（Release、一个 PowerShell、D3D11 + 字体按需映射），复测脚本 `scripts/measure-memory.ps1`。数据为启动烟测，不含子进程与显存。
 
