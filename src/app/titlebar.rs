@@ -263,6 +263,18 @@ impl App {
                                         ui.close();
                                     }
                                 }
+                                let github = icons::icon_button(
+                                    ui, icons::Icon::GitHub, p, icons::Size::Button,
+                                ).on_hover_text("GitHub 项目主页");
+                                github.widget_info(|| egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button, ui.is_enabled(), "GitHub 项目主页",
+                                ));
+                                if github.clicked() {
+                                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                                        "https://github.com/firmme/G-Terminal",
+                                    ));
+                                    ui.close();
+                                }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if icons::icon_button(ui, icons::Icon::Power, p, icons::Size::Button)
                                         .on_hover_text("退出")

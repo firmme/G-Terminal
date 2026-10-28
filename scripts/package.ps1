@@ -22,7 +22,7 @@ Copy-Item -LiteralPath $Executable -Destination (Join-Path $packageDir 'g-termin
 Copy-Item -LiteralPath "$projectRoot\README.md", "$projectRoot\LICENSE" -Destination $packageDir -Force
 $docsDir = Join-Path $packageDir 'docs'
 New-Item -ItemType Directory -Path $docsDir -Force | Out-Null
-Copy-Item -LiteralPath "$projectRoot\docs\onedrive-sync.md" -Destination $docsDir -Force
+Copy-Item -LiteralPath "$projectRoot\docs\onedrive-sync.md", "$projectRoot\docs\macos-signing.md" -Destination $docsDir -Force
 $notices = [System.Collections.Generic.List[string]]::new()
 $notices.Add('G-Terminal third-party dependencies (Cargo.lock, including platform-specific build dependencies).')
 $notices.Add('License text files are included in licenses/ when provided at the crate root.')

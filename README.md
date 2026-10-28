@@ -2,7 +2,7 @@
 
 原生 GPU 终端，Rust + egui。Windows 默认 Direct3D 11 渲染，其余平台走 wgpu；无 Electron / Chromium / WebView。
 
-当前版本 **0.4.13**，提供 Windows x64 便携版与 macOS arm64 应用包，修复长时间运行时的多余重绘和缓存占用。Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
+当前版本 **0.4.14**，提供 Windows x64 便携版与 macOS arm64 应用包，新增菜单 GitHub 入口，macOS 改用固定自签名身份与完整应用包签名。Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
 
 ## 截图
 
@@ -88,10 +88,15 @@ macOS（只需 Command Line Tools 和 rustup，直接用 cargo）：
 ```sh
 cargo run --release
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
-./scripts/package-macos.sh   # 产出 .app 与 tar.gz + SHA256
+python3 scripts/sign-macos.py --init  # 发布机器首次配置，后续复用同一证书
+./scripts/package-macos.sh   # 产出已自签名的 .app 与 tar.gz + SHA256
 ```
 
 发布包内含第三方许可，旁附 SHA256 校验文件。
+
+macOS 自签名包尚未经过 Apple 公证，下载后首次打开仍可能受到 Gatekeeper 检查。
+从旧版迁移时可能需要再次授权钥匙串访问；后续版本固定签名身份。
+证书备份与验证方式见 [macOS 签名说明](docs/macos-signing.md)。
 
 ## 配置与架构
 

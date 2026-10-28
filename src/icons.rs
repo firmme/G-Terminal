@@ -20,6 +20,7 @@ pub enum Icon {
     FolderUp,
     Home,
     Refresh,
+    GitHub,
     Cloud,
     CloudOff,
     Group,
@@ -77,7 +78,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Icon; 61] = [
+    pub const ALL: [Icon; 62] = [
         Icon::Terminal,
         Icon::Host,
         Icon::Connect,
@@ -86,6 +87,7 @@ impl Icon {
         Icon::FolderUp,
         Icon::Home,
         Icon::Refresh,
+        Icon::GitHub,
         Icon::Cloud,
         Icon::CloudOff,
         Icon::Group,
@@ -347,6 +349,38 @@ pub fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, wid
             arc.push(pen.at(20.5, 8.5));
             pen.path(arc);
             pen.line(&[(20.5, 3.5), (20.5, 8.5), (15.5, 8.5)]);
+        }
+        Icon::GitHub => {
+            // The cat silhouette, kept as native strokes like the other glyphs.
+            let mut outline = vec![pen.at(9.0, 21.0), pen.at(9.0, 18.0)];
+            let mut curve = |start: (f32, f32), a: (f32, f32), b: (f32, f32), end: (f32, f32)| {
+                for step in 1..=10 {
+                    let t = step as f32 / 10.0;
+                    let s = 1.0 - t;
+                    outline.push(pen.at(
+                        s.powi(3) * start.0
+                            + 3.0 * s * s * t * a.0
+                            + 3.0 * s * t * t * b.0
+                            + t.powi(3) * end.0,
+                        s.powi(3) * start.1
+                            + 3.0 * s * s * t * a.1
+                            + 3.0 * s * t * t * b.1
+                            + t.powi(3) * end.1,
+                    ));
+                }
+            };
+            curve((9.0, 18.0), (9.0, 17.0), (9.3, 16.5), (9.7, 16.0));
+            curve((9.7, 16.0), (4.0, 15.5), (3.5, 11.0), (5.5, 8.0));
+            curve((5.5, 8.0), (5.0, 6.5), (5.0, 4.8), (5.5, 3.5));
+            curve((5.5, 3.5), (7.0, 3.5), (8.5, 4.5), (9.0, 5.0));
+            curve((9.0, 5.0), (11.0, 4.5), (13.0, 4.5), (15.0, 5.0));
+            curve((15.0, 5.0), (15.5, 4.5), (17.0, 3.5), (18.5, 3.5));
+            curve((18.5, 3.5), (19.0, 4.8), (19.0, 6.5), (18.5, 8.0));
+            curve((18.5, 8.0), (20.5, 11.0), (20.0, 15.5), (14.3, 16.0));
+            curve((14.3, 16.0), (14.7, 16.5), (15.0, 17.0), (15.0, 18.0));
+            outline.push(pen.at(15.0, 21.0));
+            pen.path(outline);
+            pen.line(&[(9.0, 19.0), (6.0, 19.0), (4.5, 17.5), (3.0, 17.0)]);
         }
         Icon::Cloud | Icon::CloudOff => {
             // Three overlapping lobes, one continuous outline on the same grid

@@ -11,6 +11,9 @@ set -euo pipefail
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
 
+# Fail before compiling or replacing output if signing has not been configured.
+python3 scripts/sign-macos.py --check
+
 if [[ "${1:-}" != "--skip-build" ]]; then
   cargo build --release --locked
 fi
@@ -24,7 +27,8 @@ meta = json.loads(
 )
 version = next(p["version"] for p in meta["packages"] if p["name"] == "g-terminal")
 name = f"G-Terminal-{version}-macos-{arch}"
-root = os.path.join("dist", name)
+dist_dir = os.environ.get("GTERMINAL_DIST_DIR", "dist")
+root = os.path.join(dist_dir, name)
 shutil.rmtree(root, ignore_errors=True)
 os.makedirs(root, exist_ok=True)
 
@@ -42,7 +46,7 @@ os.chmod(binary, 0o755)
 
 # The Finder / Dock icon. The mark is code-drawn, so the app itself exports the
 # PNG set and `iconutil` packs it into the bundle's `.icns`.
-iconset = os.path.join("dist", name + ".iconset")
+iconset = os.path.join(dist_dir, name + ".iconset")
 shutil.rmtree(iconset, ignore_errors=True)
 subprocess.check_call([binary, "--export-iconset", iconset])
 subprocess.check_call(
@@ -81,7 +85,8 @@ for extra in ("README.md", "LICENSE"):
 for destination in (root, resources):
     docs_dir = os.path.join(destination, "docs")
     os.makedirs(docs_dir, exist_ok=True)
-    shutil.copy2("docs/onedrive-sync.md", docs_dir)
+    for document in ("onedrive-sync.md", "macos-signing.md"):
+        shutil.copy2(os.path.join("docs", document), docs_dir)
 
 notices = [
     "G-Terminal third-party dependencies (Cargo.lock, including platform-specific build dependencies).",
@@ -113,7 +118,11 @@ for package in sorted(meta["packages"], key=lambda p: (p["name"], p["version"]))
 with open(os.path.join(resources, "THIRD-PARTY-NOTICES.txt"), "w") as handle:
     handle.write("\n".join(notices) + "\n")
 
-archive = os.path.join("dist", name + ".tar.gz")
+# Sign only after all bundle resources are final. Do not ship the linker's
+# ad-hoc executable signature as if it were a complete application signature.
+subprocess.check_call([sys.executable, "scripts/sign-macos.py", bundle])
+
+archive = os.path.join(dist_dir, name + ".tar.gz")
 with tarfile.open(archive, "w:gz") as tar:
     tar.add(root, arcname=name)
 digest = hashlib.sha256(open(archive, "rb").read()).hexdigest()
