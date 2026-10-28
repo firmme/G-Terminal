@@ -12,6 +12,9 @@ pub struct RemoteProfile {
     pub user: String,
     pub port: u16,
     pub identity: String,
+    /// Portable cloud path retained when this device uses an external-path override.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub synced_identity: String,
     pub group: String,
     /// Tab tag colour, `#rrggbb`; empty means none. Beats the group's colour.
     pub color: String,
@@ -35,6 +38,7 @@ impl Default for RemoteProfile {
             user: String::new(),
             port: 22,
             identity: String::new(),
+            synced_identity: String::new(),
             group: String::new(),
             color: String::new(),
             jump: None,

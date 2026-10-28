@@ -86,6 +86,41 @@ fn true_options() -> ViewOptions<'static> {
 }
 
 #[test]
+fn clearing_an_inline_image_releases_the_panes_texture() {
+    let ctx = egui::Context::default();
+    let session = Session::disconnected(g_terminal::session::SessionKind::Local("cmd".into()), 100);
+    session
+        .terminal
+        .lock()
+        .unwrap()
+        .graphics
+        .push_back(g_terminal::graphics::Graphic {
+            id: 42,
+            pixels: std::sync::Arc::new(image::RgbaImage::new(2, 2)),
+            row: 0,
+            col: 0,
+            alternate: false,
+        });
+    let mut pane = Pane::new(901, session);
+    let render = |pane: &mut Pane| {
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                pane.show(ui, true_options());
+            });
+        })
+    };
+    let _ = render(&mut pane);
+    let id = pane.graphic.as_ref().expect("image was uploaded").1.id();
+    pane.session.terminal.lock().unwrap().clear_graphics();
+    let output = render(&mut pane);
+    assert!(pane.graphic.is_none());
+    assert!(
+        output.textures_delta.free.contains(&id),
+        "GPU texture must be freed too"
+    );
+}
+
+#[test]
 fn terminal_caret_and_ime_follow_input_focus() {
     let ctx = egui::Context::default();
     let session = Session::disconnected(g_terminal::session::SessionKind::Local("cmd".into()), 100);

@@ -18,20 +18,76 @@ mod tests;
 pub use profile::{BAUD_RATES, DEFAULT_BAUD, Forward, RemoteProfile, SerialProfile};
 pub use search::{DEFAULT_SEARCH_ENGINE, SEARCH_ENGINES, search_engine_label, search_url};
 pub use settings::Settings;
-/// Expands a leading `~` (`~`, `~/x`, `~\x`) to the home directory, as OpenSSH
-/// does for key paths. Surrounding whitespace is dropped; anything else is
-/// returned as written.
+pub const HOME_TOKEN: &str = "$USERPROFILE$";
+
+/// A portable home-relative path may never escape the receiving user's home.
+fn home_relative(path: &str) -> Option<String> {
+    let path = path.trim();
+    let rest = if path == "~" {
+        ""
+    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        rest
+    } else if path
+        .get(..HOME_TOKEN.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(HOME_TOKEN))
+    {
+        let rest = &path[HOME_TOKEN.len()..];
+        if rest.is_empty() {
+            rest
+        } else {
+            rest.strip_prefix(['/', '\\'])?
+        }
+    } else {
+        return None;
+    };
+    let rest = rest.replace('\\', "/");
+    if rest.starts_with('/')
+        || rest.contains(':')
+        || rest.chars().any(char::is_control)
+        || rest.split('/').any(|part| part == "..")
+    {
+        return None;
+    }
+    Some(
+        rest.split('/')
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// Convert only paths inside this user's home to a portable, canonical token.
+/// No filesystem access is needed: missing keys can still be synced and repaired.
+pub fn portable_identity(path: &str) -> Option<String> {
+    let relative = home_relative(path).or_else(|| {
+        let dirs = directories::UserDirs::new()?;
+        let home = dirs.home_dir().to_string_lossy().replace('\\', "/");
+        let path = path.trim().replace('\\', "/");
+        let home = home.trim_end_matches('/');
+        let prefix = path.get(..home.len())?;
+        let matches = if cfg!(windows) {
+            prefix.eq_ignore_ascii_case(home)
+        } else {
+            prefix == home
+        };
+        if !matches {
+            return None;
+        }
+        let rest = path.get(home.len()..)?.strip_prefix('/')?;
+        home_relative(&format!("{HOME_TOKEN}/{rest}"))
+    })?;
+    Some(if relative.is_empty() {
+        HOME_TOKEN.into()
+    } else {
+        format!("{HOME_TOKEN}/{relative}")
+    })
+}
+
+/// Expand `~` or `$USERPROFILE$` using this machine's home on every platform.
 pub fn expand_home(path: &str) -> PathBuf {
     let path = path.trim();
-    let home = || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
-    if path == "~" {
-        return home().unwrap_or_else(|| PathBuf::from(path));
-    }
-    match (
-        path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")),
-        home(),
-    ) {
-        (Some(rest), Some(home)) => home.join(rest),
+    match (home_relative(path), directories::UserDirs::new()) {
+        (Some(rest), Some(home)) => home.home_dir().join(rest),
         _ => PathBuf::from(path),
     }
 }

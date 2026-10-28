@@ -193,12 +193,10 @@ impl Login {
                     true,
                     p,
                 );
-                crate::dialog::icon_field(
+                crate::dialog::private_key_field(
                     ui,
-                    crate::icons::Icon::Key,
-                    "私钥路径（可选）",
                     &mut self.profile.identity,
-                    false,
+                    ui.available_width(),
                     p,
                 );
                 crate::dialog::icon_field(
@@ -209,7 +207,14 @@ impl Login {
                     true,
                     p,
                 );
-                if self.profile.jump.is_some() {
+                if let Some(jump) = &mut self.profile.jump {
+                    ui.label(hint("跳板机私钥", p));
+                    crate::dialog::private_key_field(
+                        ui,
+                        &mut jump.identity,
+                        ui.available_width(),
+                        p,
+                    );
                     crate::dialog::icon_field(
                         ui,
                         crate::icons::Icon::Host,

@@ -23,6 +23,80 @@ fn settings() -> Settings {
 }
 
 #[test]
+fn home_paths_sync_and_device_overrides_do_not_erase_cloud_paths() {
+    let mut first = settings();
+    first.profiles[0].identity = directories::UserDirs::new()
+        .unwrap()
+        .home_dir()
+        .join(".ssh/target.key")
+        .to_string_lossy()
+        .into_owned();
+    first.profiles[0].jump = Some(Box::new(RemoteProfile {
+        host: "jump.example.com".into(),
+        identity: "~/.ssh/jump.key".into(),
+        ..Default::default()
+    }));
+    let cloud = Catalog::from_settings(&first);
+    cloud.validate().unwrap();
+    let sync_id = first.profiles[0].sync_id.clone();
+    let id = &sync_id;
+    assert_eq!(cloud.ssh[id]["identity"], "$USERPROFILE$/.ssh/target.key");
+    assert_eq!(
+        cloud.ssh[id]["jump"]["identity"],
+        "$USERPROFILE$/.ssh/jump.key"
+    );
+    assert!(
+        !serde_json::to_string(&cloud)
+            .unwrap()
+            .contains("synced_identity")
+    );
+    let mut second = Settings::default();
+    cloud.apply(&mut second).unwrap();
+    assert_eq!(second.profiles[0].identity, "$USERPROFILE$/.ssh/target.key");
+    second.profiles[0].identity = "device-specific-key".into();
+    cloud.apply(&mut second).unwrap();
+    assert_eq!(second.profiles[0].identity, "device-specific-key");
+    assert_eq!(Catalog::from_settings(&second), cloud);
+    let mut changed = cloud.clone();
+    changed.ssh.get_mut(id).unwrap()["identity"] = json!("$USERPROFILE$/.ssh/new.key");
+    changed.apply(&mut second).unwrap();
+    assert_eq!(second.profiles[0].identity, "device-specific-key");
+    assert_eq!(Catalog::from_settings(&second), changed);
+    changed.apply(&mut first).unwrap();
+    assert_eq!(first.profiles[0].identity, "$USERPROFILE$/.ssh/new.key");
+    second.profiles[0].identity.clear();
+    assert_eq!(Catalog::from_settings(&second).ssh[id]["identity"], "");
+}
+
+#[test]
+fn cloud_rejects_absolute_paths_and_home_traversal_including_jump_keys() {
+    let mut settings = settings();
+    settings.profiles[0].jump = Some(Box::new(RemoteProfile {
+        host: "jump.example.com".into(),
+        ..Default::default()
+    }));
+    let original = Catalog::from_settings(&settings);
+    let id = original.ssh.keys().next().unwrap();
+    for path in [
+        "C:/private/key",
+        "/home/other/key",
+        "$USERPROFILE$/../key",
+        r"$USERPROFILE$\..\key",
+    ] {
+        for jump in [false, true] {
+            let mut invalid = original.clone();
+            let profile = invalid.ssh.get_mut(id).unwrap();
+            if jump {
+                profile["jump"]["identity"] = json!(path);
+            } else {
+                profile["identity"] = json!(path);
+            }
+            assert!(invalid.validate().is_err(), "accepted {path}");
+        }
+    }
+}
+
+#[test]
 fn portable_catalog_excludes_local_paths_ports_and_workspace() {
     let mut settings = settings();
     settings.profiles[0].jump = Some(Box::new(RemoteProfile {

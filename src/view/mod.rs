@@ -648,6 +648,17 @@ impl Pane {
             }
         }
         let (row, col) = screen.cursor_position();
+        // A cleared/replaced image must not stay alive in the pane's GPU cache.
+        // Scrolling or entering the alternate screen may hide it temporarily;
+        // only the terminal dropping that image invalidates its cached texture.
+        if self.graphic.as_ref().is_some_and(|(id, _)| {
+            terminal
+                .graphics
+                .back()
+                .is_none_or(|graphic| graphic.id != *id)
+        }) {
+            self.graphic = None;
+        }
         if screen.scrollback() == 0
             && let Some(g) = terminal
                 .graphics

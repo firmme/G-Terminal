@@ -27,6 +27,9 @@ pub(super) struct CloudSync {
     failures: u32,
     inspect_at: Instant,
     login_pending: bool,
+    focused: bool,
+    background_round: u32,
+    last_started: Option<Instant>,
 }
 
 impl Default for CloudSync {
@@ -43,6 +46,9 @@ impl Default for CloudSync {
             failures: 0,
             inspect_at: Instant::now(),
             login_pending: false,
+            focused: true,
+            background_round: 0,
+            last_started: None,
         }
     }
 }
@@ -54,6 +60,37 @@ impl Drop for CloudSync {
 }
 
 impl CloudSync {
+    fn update_focus(&mut self, focused: bool, now: Instant) {
+        if self.focused == focused {
+            return;
+        }
+        self.focused = focused;
+        self.background_round = 0;
+        if focused {
+            let earliest = self
+                .last_started
+                .map_or(now, |last| (last + Duration::from_secs(30)).max(now));
+            self.next_check = if self.failed {
+                self.next_check.max(earliest)
+            } else {
+                earliest
+            };
+        }
+    }
+
+    fn periodic_interval(&self) -> Duration {
+        Duration::from_secs(if self.focused {
+            120
+        } else {
+            (120u64 << self.background_round.min(4)).min(1800)
+        })
+    }
+
+    fn auto_allowed(&self, now: Instant) -> bool {
+        self.last_started
+            .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(30))
+    }
+
     fn spawn(
         &mut self,
         ctx: &egui::Context,
@@ -221,6 +258,7 @@ impl App {
         }
         sync::ensure_ids(&mut self.settings);
         let input = Catalog::from_settings(&self.settings);
+        self.cloud_sync.last_started = Some(Instant::now());
         self.cloud_sync.dirty_at = None;
         self.cloud_sync.observed = Some(input.clone());
         self.cloud_sync.spawn(ctx, "正在同步连接列表…", move |_| {
@@ -232,6 +270,11 @@ impl App {
         if self.screenshot.is_some() || cfg!(test) {
             return;
         }
+        let focused = ctx.input(|input| {
+            let viewport = input.viewport();
+            viewport.focused.unwrap_or(true) && !viewport.minimized.unwrap_or(false)
+        });
+        self.cloud_sync.update_focus(focused, Instant::now());
         // Keep an open connection/group editor's draft stable. Once it closes,
         // rebase any saved edits over the worker's result before applying it.
         if (self.remote_open || self.groups_open) && self.cloud_sync.receiver.is_some() {
@@ -278,7 +321,16 @@ impl App {
                 self.cloud_sync.next_check = Instant::now()
                     + Duration::from_secs(
                         (30u64 * 2u64.pow(self.cloud_sync.failures.min(5))).min(900),
-                    );
+                    )
+                    .max(if self.cloud_sync.focused {
+                        Duration::ZERO
+                    } else {
+                        self.cloud_sync.periodic_interval()
+                    });
+                if !self.cloud_sync.focused {
+                    self.cloud_sync.background_round =
+                        self.cloud_sync.background_round.saturating_add(1);
+                }
             }
         }
         if !self.settings.onedrive_enabled
@@ -313,6 +365,7 @@ impl App {
         if self.settings.onedrive_auto_sync
             && !self.cloud_sync.conflict
             && ((changed && !self.cloud_sync.failed) || initial)
+            && self.cloud_sync.auto_allowed(Instant::now())
             && sync::client_id().is_some()
         {
             self.start_cloud_sync(ctx, Preference::Ask);
@@ -368,7 +421,10 @@ impl App {
         self.cloud_sync.failures = 0;
         self.cloud_sync.observed = Some(rebased.clone());
         self.cloud_sync.dirty_at = (rebased != outcome.merged).then(Instant::now);
-        self.cloud_sync.next_check = Instant::now() + Duration::from_secs(120);
+        self.cloud_sync.next_check = Instant::now() + self.cloud_sync.periodic_interval();
+        if !self.cloud_sync.focused {
+            self.cloud_sync.background_round = self.cloud_sync.background_round.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -416,7 +472,7 @@ impl App {
             if self.settings.onedrive_enabled {
                 if ui
                     .checkbox(&mut self.settings.onedrive_auto_sync, "自动同步")
-                    .on_hover_text("修改后上传，每 2 分钟检查云端")
+                    .on_hover_text("修改后上传；前台每 2 分钟检查，后台逐步延长至 30 分钟；自动请求至少间隔 30 秒")
                     .changed()
                 {
                     self.persist();
@@ -454,5 +510,39 @@ impl App {
         } else if sync_now {
             self.start_cloud_sync(ctx, preference);
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn background_backoff_caps_and_foreground_respects_minimum_interval() {
+        let now = Instant::now();
+        let mut state = CloudSync::default();
+        state.last_started = Some(now);
+        state.update_focus(false, now);
+        for (round, seconds) in [
+            (0, 120),
+            (1, 240),
+            (2, 480),
+            (3, 960),
+            (4, 1800),
+            (50, 1800),
+        ] {
+            state.background_round = round;
+            assert_eq!(state.periodic_interval(), Duration::from_secs(seconds));
+        }
+        state.update_focus(true, now + Duration::from_secs(5));
+        assert_eq!(state.periodic_interval(), Duration::from_secs(120));
+        assert_eq!(state.next_check, now + Duration::from_secs(30));
+        assert!(!state.auto_allowed(now + Duration::from_secs(29)));
+        assert!(state.auto_allowed(now + Duration::from_secs(30)));
+        state.update_focus(false, now + Duration::from_secs(31));
+        state.failed = true;
+        state.next_check = now + Duration::from_secs(900);
+        state.update_focus(true, now + Duration::from_secs(32));
+        assert_eq!(state.next_check, now + Duration::from_secs(900));
     }
 }

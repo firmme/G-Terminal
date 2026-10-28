@@ -3,6 +3,26 @@ use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Sw
 use eframe::egui::{self, Color32, TextureHandle};
 use std::collections::{HashMap, VecDeque};
 
+const MAX_GLYPH_CACHE_ENTRIES: usize = 4096;
+const MAX_GLYPH_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Swash keeps CPU glyph bitmaps independently of our bounded GPU run cache.
+/// New glyphs, font sizes and DPI scales must not accumulate for the lifetime
+/// of the UI thread. Reset the scaler too so its allocations are released.
+fn trim_glyph_cache(swash: &mut SwashCache) {
+    if swash.image_cache.len() > MAX_GLYPH_CACHE_ENTRIES
+        || swash
+            .image_cache
+            .values()
+            .flatten()
+            .map(|image| image.data.len())
+            .sum::<usize>()
+            > MAX_GLYPH_CACHE_BYTES
+    {
+        *swash = SwashCache::new();
+    }
+}
+
 pub struct TextRenderer {
     fonts: FontSystem,
     swash: SwashCache,
@@ -81,6 +101,7 @@ impl TextRenderer {
                 }
             },
         );
+        trim_glyph_cache(&mut self.swash);
         let texture = ctx.load_texture(
             "shaped-run",
             egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels),
@@ -131,4 +152,47 @@ pub fn needs_shaping(text: &str) -> bool {
     text.chars().any(
         |c| matches!(c as u32,0x0300..=0x036f|0x0590..=0x109f|0x1780..=0x17ff|0x1f000..=0x1faff),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(glyph: u16) -> cosmic_text::CacheKey {
+        cosmic_text::CacheKey::new(
+            cosmic_text::fontdb::ID::default(),
+            glyph,
+            16.0,
+            (0.0, 0.0),
+            cosmic_text::fontdb::Weight::NORMAL,
+            cosmic_text::CacheKeyFlags::empty(),
+        )
+        .0
+    }
+
+    #[test]
+    fn glyph_cache_releases_bitmap_memory_and_negative_entries() {
+        let mut cache = SwashCache::new();
+        let mut image = cosmic_text::SwashImage::new();
+        image.data = vec![0; MAX_GLYPH_CACHE_BYTES];
+        cache.image_cache.insert(key(0), Some(image));
+        trim_glyph_cache(&mut cache);
+        assert_eq!(cache.image_cache.len(), 1, "keep a cache within budget");
+        let mut image = cosmic_text::SwashImage::new();
+        image.data = vec![0; 1];
+        cache.image_cache.insert(key(1), Some(image));
+        trim_glyph_cache(&mut cache);
+        assert!(
+            cache.image_cache.is_empty(),
+            "bitmap memory must be released"
+        );
+        for glyph in 0..=MAX_GLYPH_CACHE_ENTRIES as u16 {
+            cache.image_cache.insert(key(glyph), None);
+        }
+        trim_glyph_cache(&mut cache);
+        assert!(
+            cache.image_cache.is_empty(),
+            "missing glyphs must also be bounded"
+        );
+    }
 }

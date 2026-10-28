@@ -2,7 +2,7 @@
 
 原生 GPU 终端，Rust + egui。Windows 默认 Direct3D 11 渲染，其余平台走 wgpu；无 Electron / Chromium / WebView。
 
-当前版本 **0.4.12**，提供 Windows x64 便携版与 macOS arm64 应用包。Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
+当前版本 **0.4.13**，本次发布 Windows x64 便携版，修复长时间运行时的多余重绘和缓存占用；macOS arm64 最新预编译包为 **0.4.12**。Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
 
 ## 截图
 
@@ -119,3 +119,5 @@ OneDrive 连接列表同步：已内置官方应用 Client ID，在偏好设置�
 截图冒烟：`g-terminal --screenshot <png>`（约 4 秒后截图退出，不加载 / 写入工作区）；可用 `GTERMINAL_SCREENSHOT_VIEW=menu|settings|connection|serial|login|help|groups|confirm|error|sync-off|sync-error` 打开对应弹窗或状态预览，`GTERMINAL_SCREENSHOT_LIGHT=1` 检查浅色主题。
 
 Windows 启动内存约 50 MiB（Release、一个 PowerShell、D3D11 + 字体按需映射），复测脚本 `scripts/measure-memory.ps1`。数据为启动烟测，不含子进程与显存。
+
+空闲驻留复测：`./scripts/measure-idle.ps1 -DurationSeconds 60 -Csv idle.csv`（最长 3600 秒）。脚本启动独立 PowerShell 测试窗口，不恢复或保存工作区，每两秒记录 CPU、私有提交量、工作集与句柄，结束后截图并退出。CPU 按整机逻辑处理器数量归一化；提交量与工作集分别比较，截图读回不计入驻留采样。Windows 原生事件循环回归：`cargo test --bin g-terminal native_idle -- --ignored --nocapture --test-threads=1`，需可用桌面与 D3D11。

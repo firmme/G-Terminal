@@ -126,6 +126,7 @@ impl SshConfigBlock {
                 user: self.user.clone().unwrap_or_default(),
                 port: self.port.unwrap_or(22),
                 identity: self.identity.clone().unwrap_or_default(),
+                synced_identity: String::new(),
                 group: String::new(),
                 color: String::new(),
                 jump: self.jump.clone().map(Box::new),

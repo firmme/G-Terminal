@@ -1,4 +1,4 @@
-use crate::config::{RemoteProfile, SerialProfile, Settings};
+use crate::config::{RemoteProfile, SerialProfile, Settings, portable_identity};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,16 +68,48 @@ fn legacy_id(kind: &str, value: &impl Serialize) -> String {
 
 fn strip_identity(profile: &mut RemoteProfile) {
     profile.identity.clear();
+    profile.synced_identity.clear();
     if let Some(jump) = &mut profile.jump {
         strip_identity(jump);
     }
 }
 
 fn restore_identity(profile: &mut RemoteProfile, old: &RemoteProfile) {
-    profile.identity.clone_from(&old.identity);
+    // Device-specific overrides stay local; portable paths follow cloud edits.
+    if !old.identity.is_empty() && portable_identity(&old.identity).is_none() {
+        profile.synced_identity = profile.identity.clone();
+        profile.identity.clone_from(&old.identity);
+    }
     if let (Some(jump), Some(old_jump)) = (&mut profile.jump, &old.jump) {
         restore_identity(jump, old_jump);
     }
+}
+
+fn portable_identities(profile: &mut RemoteProfile) {
+    profile.identity = portable_identity(&profile.identity)
+        .or_else(|| {
+            if profile.identity.is_empty() {
+                None
+            } else {
+                portable_identity(&profile.synced_identity)
+            }
+        })
+        .unwrap_or_default();
+    profile.synced_identity.clear();
+    if let Some(jump) = &mut profile.jump {
+        portable_identities(jump);
+    }
+}
+
+fn valid_identities(profile: &RemoteProfile) -> bool {
+    profile.synced_identity.is_empty()
+        && (profile.identity.is_empty()
+            || portable_identity(&profile.identity).as_deref() == Some(profile.identity.as_str())
+                && profile.identity.starts_with(crate::config::HOME_TOKEN))
+        && profile
+            .jump
+            .as_ref()
+            .is_none_or(|jump| valid_identities(jump))
 }
 
 impl Catalog {
@@ -85,7 +117,7 @@ impl Catalog {
         let mut result = Self::default();
         for profile in &settings.profiles {
             let mut profile = profile.clone();
-            strip_identity(&mut profile);
+            portable_identities(&mut profile);
             result.ssh.insert(
                 profile.sync_id.clone(),
                 serde_json::to_value(profile).unwrap(),
@@ -127,11 +159,7 @@ impl Catalog {
             if id.is_empty()
                 || id.len() > 128
                 || &profile.sync_id != id
-                || !profile.identity.is_empty()
-                || profile
-                    .jump
-                    .as_ref()
-                    .is_some_and(|jump| !jump.identity.is_empty())
+                || !valid_identities(&profile)
             {
                 bail!("云端 SSH 连接格式不正确");
             }

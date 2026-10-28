@@ -5,6 +5,36 @@ use super::ssh::*;
 use super::*;
 
 #[test]
+fn home_key_paths_round_trip_without_requiring_the_file() {
+    let home = directories::UserDirs::new()
+        .unwrap()
+        .home_dir()
+        .to_path_buf();
+    let key = home.join(".ssh/does-not-need-to-exist.key");
+    let portable = portable_identity(&key.to_string_lossy()).unwrap();
+    assert_eq!(portable, "$USERPROFILE$/.ssh/does-not-need-to-exist.key");
+    assert_eq!(expand_home(&portable), key);
+    assert_eq!(
+        expand_home(r"$userprofile$\.ssh\does-not-need-to-exist.key"),
+        key
+    );
+    assert_eq!(
+        portable_identity(r"~\.ssh\key"),
+        Some("$USERPROFILE$/.ssh/key".into())
+    );
+    assert!(portable_identity(&format!("{}-other/.ssh/key", home.display())).is_none());
+    for path in [
+        "$USERPROFILE$/../secret",
+        r"$USERPROFILE$\..\secret",
+        "$USERPROFILE$//etc/key",
+        "$USERPROFILE$/C:/key",
+        "$USERPROFILE$extra/key",
+    ] {
+        assert!(portable_identity(path).is_none(), "accepted {path}");
+    }
+}
+
+#[test]
 fn serial_background_timeout_defaults_off_and_loads_old_settings() {
     let settings = Settings::parse(br#"{"font_size":16}"#).unwrap();
     assert!(!settings.serial_background_timeout_enabled);

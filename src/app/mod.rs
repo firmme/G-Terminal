@@ -300,6 +300,7 @@ pub struct App {
     files_open: bool,
     split_chooser: Option<(u64, u64)>,
     screenshot: Option<std::path::PathBuf>,
+    screenshot_delay: std::time::Duration,
     started: std::time::Instant,
     screenshot_requested: bool,
     /// In auto-hide mode, whether the bar has been pinned open by the topbar
@@ -395,6 +396,13 @@ impl App {
             files_open: false,
             split_chooser: None,
             screenshot,
+            screenshot_delay: std::time::Duration::from_secs(
+                std::env::var("GTERMINAL_SCREENSHOT_DELAY_SECONDS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(4)
+                    .clamp(4, 3600),
+            ),
             started: std::time::Instant::now(),
             screenshot_requested: false,
             sidebar_pinned: false,
@@ -1462,14 +1470,21 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
-            if !self.screenshot_requested && self.started.elapsed().as_secs_f32() > 4.0 {
+            let elapsed = self.started.elapsed();
+            if !self.screenshot_requested && elapsed >= self.screenshot_delay {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
                 self.screenshot_requested = true;
             }
-            if self.started.elapsed().as_secs() > 20 {
+            let timeout = self.screenshot_delay + std::time::Duration::from_secs(16);
+            if elapsed > timeout {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            let next = if self.screenshot_requested {
+                timeout
+            } else {
+                self.screenshot_delay
+            };
+            ctx.request_repaint_after(next.saturating_sub(elapsed));
         }
         // Last, so every Enter check above saw the composition state as it was
         // when the frame started rather than after this frame's commit.

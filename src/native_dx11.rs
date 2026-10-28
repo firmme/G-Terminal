@@ -39,7 +39,17 @@ impl From<accesskit_winit::Event> for Event {
 }
 
 pub fn run(screenshot: Option<PathBuf>) -> Result<()> {
-    let event_loop = EventLoop::<Event>::with_user_event().build()?;
+    run_counted(screenshot).map(|_| ())
+}
+
+fn run_counted(screenshot: Option<PathBuf>) -> Result<u64> {
+    let mut builder = EventLoop::<Event>::with_user_event();
+    #[cfg(test)]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        builder.with_any_thread(true);
+    }
+    let event_loop = builder.build()?;
     let mut runner = Runner {
         proxy: event_loop.create_proxy(),
         native: None,
@@ -51,7 +61,7 @@ pub fn run(screenshot: Option<PathBuf>) -> Result<()> {
     if let Some(error) = runner.error {
         return Err(error);
     }
-    Ok(())
+    Ok(runner.native.as_ref().map_or(0, |native| native.frames))
 }
 
 /// The taskbar/Alt-Tab icon. `None` when winit rejects the bitmap: a missing icon
@@ -143,7 +153,10 @@ impl ApplicationHandler<Event> for Runner {
             return;
         }
         let response = native.input.on_window_event(&native.window, &event);
-        if response.repaint {
+        // egui-winit also marks RedrawRequested as needing paint. We paint it
+        // below; requesting another one here makes every frame schedule itself,
+        // even when nothing changed (and even when draw skips a minimized window).
+        if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             native.window.request_redraw();
         }
         match event {
@@ -248,6 +261,7 @@ fn repaired_geometry(
 }
 
 struct Native {
+    frames: u64,
     // Drop GPU references before destroying the HWND.
     gpu: Gpu,
     app: crate::app::App,
@@ -336,6 +350,7 @@ impl Native {
         let mut info = egui::ViewportInfo::default();
         egui_winit::update_viewport_info(&mut info, &ctx, &window, true);
         Ok(Self {
+            frames: 0,
             gpu,
             app,
             ctx,
@@ -346,6 +361,7 @@ impl Native {
         })
     }
     fn draw(&mut self) -> Result<bool> {
+        self.frames += 1;
         if self.window.is_minimized() == Some(true) || self.gpu.target.is_none() {
             // Nothing can be drawn, so the confirmation cannot be shown either;
             // a pending close request just goes through.
@@ -657,6 +673,28 @@ mod tests {
     use super::*;
 
     const SCREEN: Area = (0, 0, 1920, 1080);
+
+    /// Exercises the real Windows event loop, not just egui frame generation.
+    /// Run explicitly on a desktop: cargo test --bin g-terminal native_idle -- --ignored
+    #[test]
+    #[ignore = "requires a Windows desktop and D3D11"]
+    fn native_idle_does_not_schedule_itself_forever() {
+        let capture =
+            std::env::temp_dir().join(format!("gterminal-idle-{}.png", std::process::id()));
+        let frames = run_counted(Some(capture.clone())).unwrap();
+        let captured = capture.is_file();
+        let _ = std::fs::remove_file(capture);
+        assert!(
+            captured,
+            "the native window must render and capture successfully"
+        );
+        // Allow startup and caret blinking, but reject a display-rate paint loop.
+        assert!(
+            frames < 40,
+            "idle window drew {frames} frames in four seconds"
+        );
+        println!("native idle smoke: {frames} redraws");
+    }
 
     fn repair(outer: Area, inner: (i32, i32), monitors: &[Area]) -> Option<Area> {
         repaired_geometry(

@@ -463,6 +463,77 @@ pub(crate) fn icon_field(
         .on_hover_text(placeholder)
 }
 
+/// Shared by the saved-profile editor and the reconnect credentials form.
+/// Cache validation while typing, and recheck on opening, blur and file selection.
+pub(crate) fn private_key_field(ui: &mut egui::Ui, value: &mut String, width: f32, p: Palette) {
+    ui.vertical(|ui| {
+        ui.set_width(width);
+        let mut picked = false;
+        let response = ui
+            .horizontal(|ui| {
+                let field = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2((width - 36.0).max(80.0), 28.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| icon_field(ui, Icon::Key, "私钥路径（可选）", value, false, p),
+                    )
+                    .inner;
+                if ui
+                    .add_sized([28.0, 28.0], egui::Button::new("…"))
+                    .on_hover_text("选择 SSH 私钥文件")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title("选择 SSH 私钥文件")
+                        .set_directory(
+                            g_terminal::config::expand_home(value)
+                                .parent()
+                                .unwrap_or(std::path::Path::new(".")),
+                        )
+                        .pick_file()
+                {
+                    let path = path.to_string_lossy();
+                    *value = g_terminal::config::portable_identity(&path)
+                        .unwrap_or_else(|| path.into_owned());
+                    picked = true;
+                }
+                field
+            })
+            .inner;
+        let id = response.id.with("key-validation");
+        let frame = ui.ctx().cumulative_frame_nr();
+        let previous = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<(String, Option<String>, u64)>(id));
+        let check = picked
+            || response.lost_focus()
+            || previous.as_ref().is_none_or(|(path, _, seen)| {
+                *seen + 1 < frame || (!response.has_focus() && path != value)
+            });
+        if check && let Some(portable) = g_terminal::config::portable_identity(value) {
+            *value = portable;
+        }
+        let error = if check {
+            if value.trim().is_empty() {
+                None
+            } else {
+                let path = g_terminal::config::expand_home(value);
+                match std::fs::metadata(&path) {
+                    Ok(info) if info.is_file() => None,
+                    Ok(_) => Some("请选择私钥文件，当前路径是目录".into()),
+                    Err(error) => Some(format!("私钥文件不可用：{}（{error}）", path.display())),
+                }
+            }
+        } else {
+            previous.and_then(|(_, error, _)| error)
+        };
+        if let Some(error) = &error {
+            ui.add(egui::Label::new(RichText::new(error).color(p.danger)).wrap());
+        }
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(id, (value.clone(), error, frame)));
+    });
+}
+
 pub(crate) fn primary(ui: &mut egui::Ui, label: &str, p: Palette) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(label).color(if p.panel.r() > 128 {
@@ -473,12 +544,6 @@ pub(crate) fn primary(ui: &mut egui::Ui, label: &str, p: Palette) -> egui::Respo
         .fill(p.accent)
         .min_size(egui::vec2(96.0, 32.0)),
     )
-}
-
-pub(crate) fn icon_button(ui: &mut egui::Ui, icon: Icon, p: Palette) -> egui::Response {
-    let response = ui.add_sized([28.0, 28.0], egui::Button::new(""));
-    icons::draw(ui.painter(), response.rect.shrink(6.0), icon, p.muted, 1.3);
-    response
 }
 
 /// A square accent button carrying only an icon, for a form's main action.
@@ -567,6 +632,38 @@ pub(crate) fn tab(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_key_validation_checks_missing_files_again_when_reopened() {
+        let ctx = egui::Context::default();
+        let path =
+            std::env::temp_dir().join(format!("g-terminal-key-{}.key", uuid::Uuid::new_v4()));
+        let mut value = path.to_string_lossy().into_owned();
+        let mut draw = |visible| {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if visible {
+                        private_key_field(ui, &mut value, 420.0, Palette::new(false));
+                    }
+                });
+            })
+        };
+        let has_error = |output: &egui::FullOutput| {
+            output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains("私钥文件不可用"))
+        })
+        };
+        let mut missing = false;
+        for _ in 0..3 {
+            missing |= has_error(&draw(true));
+        }
+        assert!(missing, "opening must report a missing key");
+        std::fs::write(&path, "validation checks existence, not key contents").unwrap();
+        let _ = draw(false);
+        let output = draw(true);
+        std::fs::remove_file(&path).unwrap();
+        assert!(!has_error(&output), "reopening must recheck the filesystem");
+    }
 
     fn render(
         ctx: &egui::Context,

@@ -347,27 +347,12 @@ impl App {
                                     }
                                     ui.end_row();
                                     ui.label("私钥路径");
-                                    ui.horizontal(|ui| {
-                                        editing::field_with(
-                                            ui,
-                                            &mut self.remote.identity,
-                                            |edit| {
-                                                edit.hint_text("可选，SSH 私钥文件路径")
-                                                    .desired_width((full - 34.0).max(100.0))
-                                            },
-                                        );
-                                        let browse =
-                                            crate::dialog::icon_button(ui, Icon::Folder, p)
-                                                .on_hover_text("选择 SSH 私钥文件");
-                                        if browse.clicked()
-                                            && let Some(path) = rfd::FileDialog::new()
-                                                .set_title("选择 SSH 私钥文件")
-                                                .pick_file()
-                                        {
-                                            self.remote.identity =
-                                                path.to_string_lossy().into_owned();
-                                        }
-                                    });
+                                    crate::dialog::private_key_field(
+                                        ui,
+                                        &mut self.remote.identity,
+                                        full,
+                                        p,
+                                    );
                                     ui.end_row();
                                     ui.label("标签颜色");
                                     ui.horizontal(|ui| {
@@ -415,9 +400,12 @@ impl App {
                                         });
                                         ui.end_row();
                                         ui.label("私钥");
-                                        editing::field_with(ui, &mut j.identity, |edit| {
-                                            edit.hint_text("可选").desired_width(full)
-                                        });
+                                        crate::dialog::private_key_field(
+                                            ui,
+                                            &mut j.identity,
+                                            full,
+                                            p,
+                                        );
                                         ui.end_row();
                                     });
                             }
