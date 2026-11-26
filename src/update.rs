@@ -1,55 +1,76 @@
-//! Manual update check against the project's GitHub releases, plus the
-//! self-replace that follows it.
-//!
-//! `curl` does the HTTP work rather than a new dependency: it ships with macOS,
-//! Windows 10+ and every Linux this runs on, and the release assets are already
-//! plain archives.
+//! Checks GitHub releases and prepares a verified update for the next restart.
 
+use reqwest::blocking::{Client, Response};
+use semver::Version;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Read;
+use std::time::Duration;
+
+#[cfg(any(windows, target_os = "macos"))]
+use std::{
+    fs::{self, File},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 const REPO: &str = "firmme/G-Terminal";
+const METADATA_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// What the 检查更新 window is showing.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Status {
+    Idle,
     Checking,
     UpToDate { current: String },
     Available(Release),
     Downloading,
-    Ready,
+    Ready(PreparedUpdate),
     Failed(String),
 }
 
-/// A newer release, with the download that fits this machine when there is one.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Release {
     pub version: String,
     pub url: String,
     pub notes: String,
-    pub asset: Option<String>,
-    pub asset_name: Option<String>,
-    /// The `<asset>.sha256` file published beside the archive. Without it the
-    /// download cannot be verified, so it is not installed.
-    pub checksum: Option<String>,
+    pub download: Download,
+}
+
+#[derive(Debug)]
+pub enum Download {
+    Available(Package),
+    MissingChecksum,
+    Unavailable,
+}
+
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub struct Package {
+    name: String,
+    url: String,
+    checksum_url: String,
 }
 
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Looks up the latest published release and compares it with this build.
 pub fn check() -> Result<Status, String> {
-    let body = curl(&format!(
-        "https://api.github.com/repos/{REPO}/releases/latest"
-    ))?;
-    parse_latest(&body, current_version())
+    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let response = client()?
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .timeout(METADATA_TIMEOUT)
+        .send()
+        .and_then(Response::error_for_status)
+        .map_err(|error| format!("检查更新失败：{error}"))?;
+    parse_latest(
+        &read_metadata(response, 1024 * 1024)?,
+        current_version(),
+        asset_suffix(),
+    )
 }
 
-/// Splits the release JSON into a status. Kept apart from the request so the
-/// comparison and asset choice can be tested without a network.
-fn parse_latest(json: &str, current: &str) -> Result<Status, String> {
+fn parse_latest(json: &str, current: &str, suffix: Option<&str>) -> Result<Status, String> {
     #[derive(Deserialize)]
     struct Asset {
         name: String,
@@ -59,71 +80,58 @@ fn parse_latest(json: &str, current: &str) -> Result<Status, String> {
     struct Latest {
         tag_name: String,
         html_url: String,
-        #[serde(default)]
         body: Option<String>,
         #[serde(default)]
         assets: Vec<Asset>,
     }
 
     let latest: Latest =
-        serde_json::from_str(json).map_err(|e| format!("解析发布信息失败：{e}"))?;
-    let version = latest.tag_name.trim_start_matches('v').to_string();
-    if !is_newer(&version, current) {
+        serde_json::from_str(json).map_err(|error| format!("解析发布信息失败：{error}"))?;
+    let version = latest
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&latest.tag_name);
+    if !is_newer(version, current)? {
         return Ok(Status::UpToDate {
             current: current.to_string(),
         });
     }
 
-    let expected = asset_suffix().map(|suffix| format!("G-Terminal-{version}-{suffix}"));
-    let checksum = expected.as_ref().and_then(|expected| {
-        let name = format!("{expected}.sha256");
-        latest
-            .assets
-            .iter()
-            .find(|asset| asset.name == name)
-            .map(|asset| asset.browser_download_url.clone())
-    });
-    let asset = expected.and_then(|expected| {
-        latest
-            .assets
-            .into_iter()
-            .find(|asset| asset.name == expected)
-    });
+    let download = suffix
+        .and_then(|suffix| {
+            let name = format!("G-Terminal-{version}-{suffix}");
+            latest.assets.iter().find(|asset| asset.name == name)
+        })
+        .map_or(Download::Unavailable, |asset| {
+            let checksum_name = format!("{}.sha256", asset.name);
+            latest
+                .assets
+                .iter()
+                .find(|item| item.name == checksum_name)
+                .map_or(Download::MissingChecksum, |checksum| {
+                    Download::Available(Package {
+                        name: asset.name.clone(),
+                        url: asset.browser_download_url.clone(),
+                        checksum_url: checksum.browser_download_url.clone(),
+                    })
+                })
+        });
+
     Ok(Status::Available(Release {
-        version,
+        version: version.to_string(),
         url: latest.html_url,
         notes: latest.body.unwrap_or_default(),
-        asset: asset
-            .as_ref()
-            .map(|asset| asset.browser_download_url.clone()),
-        asset_name: asset.map(|asset| asset.name),
-        checksum,
+        download,
     }))
 }
 
-/// Whether `candidate` is a later `major.minor.patch` than `current`. A tag
-/// that does not parse is treated as not newer, so a stray tag cannot offer a
-/// downgrade.
-fn is_newer(candidate: &str, current: &str) -> bool {
-    match (version_tuple(candidate), version_tuple(current)) {
-        (Some(candidate), Some(current)) => candidate > current,
-        _ => false,
-    }
+fn is_newer(candidate: &str, current: &str) -> Result<bool, String> {
+    let parse = |version: &str| {
+        Version::parse(version).map_err(|error| format!("无效的版本号 {version}：{error}"))
+    };
+    Ok(parse(candidate)?.cmp_precedence(&parse(current)?).is_gt())
 }
 
-fn version_tuple(version: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = version
-        .trim_start_matches('v')
-        .split('.')
-        .map(|part| part.parse::<u64>().ok());
-    let major = parts.next().flatten()?;
-    let minor = parts.next().flatten().unwrap_or(0);
-    let patch = parts.next().flatten().unwrap_or(0);
-    Some((major, minor, patch))
-}
-
-/// The asset name suffix this platform publishes, matching
-/// `scripts/package-macos.sh` and `scripts/package.ps1`.
 fn asset_suffix() -> Option<&'static str> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some("macos-arm64.tar.gz")
@@ -136,333 +144,319 @@ fn asset_suffix() -> Option<&'static str> {
     }
 }
 
-/// Downloads an asset into a per-run directory under the temp dir, checks it
-/// against the published SHA-256 and returns the file path. A mismatch deletes
-/// the file: nothing unverified is ever extracted.
-pub fn download(url: &str, name: &str, checksum_url: &str) -> Result<PathBuf, String> {
-    let expected =
-        parse_checksum(&curl(checksum_url)?).ok_or_else(|| "校验文件格式不正确".to_string())?;
-    let dir = update_dir()?;
-    let path = dir.join(name);
-    let status = Command::new("curl")
-        .args(["-fsSL", "-o"])
-        .arg(&path)
-        .arg(url)
-        .status()
-        .map_err(|e| format!("无法运行 curl：{e}"))?;
-    if !status.success() {
-        return Err(format!("下载失败（curl {status}）"));
-    }
-    if sha256_file(&path)? != expected {
-        let _ = std::fs::remove_file(&path);
-        return Err("下载文件校验失败，已删除".into());
-    }
-    Ok(path)
+fn client() -> Result<Client, String> {
+    Client::builder()
+        .user_agent(concat!("G-Terminal/", env!("CARGO_PKG_VERSION")))
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|error| format!("无法初始化更新请求：{error}"))
 }
 
-/// The hex digest at the start of a `sha256sum`-style line, lowercased.
+fn read_metadata(response: impl Read, limit: u64) -> Result<String, String> {
+    let mut text = String::new();
+    response
+        .take(limit + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("无法读取发布信息：{error}"))?;
+    if text.len() as u64 > limit {
+        return Err("发布信息超过大小限制".into());
+    }
+    Ok(text)
+}
+
+#[derive(Debug)]
+pub struct PreparedUpdate {
+    #[cfg(any(windows, target_os = "macos"))]
+    dir: tempfile::TempDir,
+    #[cfg(any(windows, target_os = "macos"))]
+    current: PathBuf,
+    #[cfg(any(windows, target_os = "macos"))]
+    staged: PathBuf,
+}
+
+impl PreparedUpdate {
+    #[cfg(any(windows, target_os = "macos"))]
+    pub fn prepare(package: &Package) -> Result<Self, String> {
+        let current = install_target()?;
+        let parent = current.parent().ok_or("无法找到安装目录")?;
+        // Keep the staged update and backup on the same filesystem as the installation.
+        let dir = tempfile::Builder::new()
+            .prefix(".gterminal-update-")
+            .tempdir_in(parent)
+            .map_err(|error| format!("无法在安装目录准备更新：{error}。请从发布页手动更新。"))?;
+        let archive = dir.path().join(&package.name);
+        download(package, &archive)?;
+        let member = package_member(&package.name)?;
+        extract(&archive, dir.path(), &member)?;
+        let staged = dir.path().join(member);
+        let metadata = fs::symlink_metadata(&staged)
+            .map_err(|error| format!("下载包缺少应用文件：{error}"))?;
+        #[cfg(windows)]
+        let valid = metadata.is_file();
+        #[cfg(target_os = "macos")]
+        let valid = metadata.is_dir() && staged.join("Contents/MacOS/g-terminal").is_file();
+        if !valid {
+            return Err("下载包里的应用文件格式不正确".into());
+        }
+        fs::remove_file(&archive).map_err(|error| format!("无法清理下载文件：{error}"))?;
+        Ok(Self {
+            dir,
+            current,
+            staged,
+        })
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    pub fn launch(&mut self) -> Result<(), String> {
+        let script = self.dir.path().join(INSTALLER_NAME);
+        fs::write(&script, INSTALLER).map_err(|error| format!("无法写入更新程序：{error}"))?;
+        installer_command(&script)?
+            .env("GTERMINAL_UPDATE_PARENT", std::process::id().to_string())
+            .env("GTERMINAL_UPDATE_DIR", self.dir.path())
+            .env("GTERMINAL_UPDATE_CURRENT", &self.current)
+            .env("GTERMINAL_UPDATE_STAGED", &self.staged)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("无法启动更新程序：{error}"))?;
+        // The installer owns the staging directory once it has been started.
+        self.dir.disable_cleanup(true);
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub fn prepare(_package: &Package) -> Result<Self, String> {
+        Err("当前平台请在发布页手动更新".into())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub fn launch(&mut self) -> Result<(), String> {
+        Err("当前平台请在发布页手动更新".into())
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn download(package: &Package, path: &Path) -> Result<(), String> {
+    let client = client()?;
+    let checksum = client
+        .get(&package.checksum_url)
+        .timeout(METADATA_TIMEOUT)
+        .send()
+        .and_then(Response::error_for_status)
+        .map_err(|error| format!("无法下载校验文件：{error}"))?;
+    let expected = parse_checksum(&read_metadata(checksum, 4096)?).ok_or("校验文件格式不正确")?;
+    {
+        let mut file =
+            File::create_new(path).map_err(|error| format!("无法创建下载文件：{error}"))?;
+        client
+            .get(&package.url)
+            .send()
+            .and_then(Response::error_for_status)
+            .and_then(|mut response| response.copy_to(&mut file))
+            .map_err(|error| format!("下载更新失败：{error}"))?;
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    File::open(path)
+        .and_then(|mut file| std::io::copy(&mut file, &mut hasher))
+        .map_err(|error| format!("无法读取下载文件：{error}"))?;
+    if format!("{:x}", hasher.finalize()) != expected {
+        return Err("下载文件 SHA-256 校验失败".into());
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
 fn parse_checksum(text: &str) -> Option<String> {
     let digest = text.split_whitespace().next()?.to_ascii_lowercase();
     (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let read_error = |e: std::io::Error| format!("无法读取下载文件：{e}");
-    let mut file = std::fs::File::open(path).map_err(read_error)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buffer).map_err(read_error)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+#[cfg(any(windows, target_os = "macos"))]
+fn package_member(name: &str) -> Result<String, String> {
+    #[cfg(windows)]
+    let (extension, member) = (".zip", "g-terminal.exe");
+    #[cfg(target_os = "macos")]
+    let (extension, member) = (".tar.gz", "G-Terminal.app");
+    let root = name.strip_suffix(extension).ok_or("更新包扩展名不正确")?;
+    Ok(format!("{root}/{member}"))
 }
 
-fn update_dir() -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!("gterminal-update-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建临时目录：{e}"))?;
-    Ok(dir)
-}
-
-/// Extracts the archive, then hands the swap to a detached script so it can run
-/// after this process exits — the bundle cannot be replaced from inside itself.
-pub fn install(archive: &Path) -> Result<(), String> {
-    let dir = archive
-        .parent()
-        .ok_or_else(|| "下载文件没有所在目录".to_string())?;
-    extract(archive, dir)?;
-    swap(dir)
-}
-
-#[cfg(target_os = "macos")]
-fn extract(archive: &Path, dir: &Path) -> Result<(), String> {
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dir)
-        .status()
-        .map_err(|e| format!("无法解压：{e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("解压失败（tar {status}）"))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn extract(archive: &Path, dir: &Path) -> Result<(), String> {
-    let status = Command::new("tar")
+#[cfg(any(windows, target_os = "macos"))]
+fn extract(archive: &Path, dir: &Path, member: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut tar = hidden_windows_command(windows_system_dir()?.join("tar.exe"));
+    #[cfg(target_os = "macos")]
+    let mut tar = Command::new("/usr/bin/tar");
+    let output = tar
         .arg("-xf")
         .arg(archive)
         .arg("-C")
         .arg(dir)
-        .status()
-        .map_err(|e| format!("无法解压：{e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("解压失败（tar {status}）"))
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn swap(dir: &Path) -> Result<(), String> {
-    let new_app =
-        find_with_extension(dir, "app").ok_or_else(|| "下载包里没有找到 .app".to_string())?;
-    let bundle = bundle_root().ok_or_else(|| {
-        "当前不是从 .app 运行的（开发构建），请用「打开发布页」手动更新".to_string()
-    })?;
-    let backup = dir.join("replaced.app");
-    let script = dir.join("apply.sh");
-    let quoted = |path: &Path| format!("'{}'", path.display());
-    let body = format!(
-        "#!/bin/sh\n\
-         sleep 1\n\
-         rm -rf {backup}\n\
-         mv {bundle} {backup} 2>/dev/null\n\
-         if mv {new_app} {bundle}; then\n\
-         \topen {bundle}\n\
-         \trm -rf {backup}\n\
-         else\n\
-         \tmv {backup} {bundle} 2>/dev/null\n\
-         fi\n",
-        backup = quoted(&backup),
-        bundle = quoted(&bundle),
-        new_app = quoted(&new_app),
-    );
-    std::fs::write(&script, body).map_err(|e| format!("无法写入更新脚本：{e}"))?;
-    let mut permissions = std::fs::metadata(&script)
-        .map_err(|e| e.to_string())?
-        .permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o755);
-    }
-    std::fs::set_permissions(&script, permissions).map_err(|e| e.to_string())?;
-    Command::new("sh")
-        .arg(&script)
-        .spawn()
-        .map_err(|e| format!("无法启动更新脚本：{e}"))?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn swap(dir: &Path) -> Result<(), String> {
-    let new_exe = find_named(dir, "g-terminal.exe")
-        .ok_or_else(|| "下载包里没有找到 g-terminal.exe".to_string())?;
-    let current = std::env::current_exe().map_err(|e| e.to_string())?;
-    let batch = dir.join("apply.bat");
-    let failed = dir.join("update-failed.txt");
-    // The exe stays locked while any window of it is open, so the move is
-    // retried for about 20 s. Only a successful move relaunches; a failure is
-    // left in a note beside the download instead of silently restarting the
-    // old version.
-    let body = format!(
-        "@echo off\r\n\
-         set tries=0\r\n\
-         :retry\r\n\
-         ping 127.0.0.1 -n 3 >nul\r\n\
-         move /y \"{new}\" \"{current}\" >nul 2>&1\r\n\
-         if not errorlevel 1 goto done\r\n\
-         set /a tries+=1\r\n\
-         if %tries% lss 10 goto retry\r\n\
-         echo Could not replace g-terminal.exe. Close every G-Terminal window and update again.>\"{failed}\"\r\n\
-         exit /b 1\r\n\
-         :done\r\n\
-         start \"\" \"{current}\"\r\n",
-        new = new_exe.display(),
-        current = current.display(),
-        failed = failed.display(),
-    );
-    std::fs::write(&batch, body).map_err(|e| format!("无法写入更新脚本：{e}"))?;
-    Command::new("cmd")
-        .args(["/C", "start", "", "/b"])
-        .arg(&batch)
-        .spawn()
-        .map_err(|e| format!("无法启动更新脚本：{e}"))?;
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn swap(_dir: &Path) -> Result<(), String> {
-    Err("当前平台不支持自动替换，请用「打开发布页」手动更新".to_string())
-}
-
-/// The `.app` this executable lives in, if it was launched from a bundle.
-#[cfg(target_os = "macos")]
-fn bundle_root() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let contents = exe.parent()?.parent()?;
-    let bundle = contents.parent()?;
-    (bundle.extension()? == "app").then(|| bundle.to_path_buf())
-}
-
-/// First entry under `dir` (recursively) whose extension matches.
-#[cfg(target_os = "macos")]
-fn find_with_extension(dir: &Path, extension: &str) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if entry.file_type().ok()?.is_dir() {
-            if path.extension().is_some_and(|value| value == extension) {
-                return Some(path);
-            }
-            if let Some(found) = find_with_extension(&path, extension) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-/// First file under `dir` (recursively) named `name`.
-#[cfg(target_os = "windows")]
-fn find_named(dir: &Path, name: &str) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_named(&path, name) {
-                return Some(found);
-            }
-        } else if path.file_name().is_some_and(|value| value == name) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Runs `curl` with the headers the GitHub API requires and returns stdout.
-fn curl(url: &str) -> Result<String, String> {
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-A",
-            "G-Terminal",
-        ])
-        .arg(url)
+        .arg(member)
         .output()
-        .map_err(|e| format!("无法运行 curl：{e}"))?;
+        .map_err(|error| format!("无法解压更新包：{error}"))?;
     if !output.status.success() {
-        return Err(format!("请求 GitHub 失败（curl {}）", output.status));
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("解压更新包失败：{}", error.trim()));
     }
-    String::from_utf8(output.stdout).map_err(|e| format!("响应不是文本：{e}"))
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_target() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|error| format!("无法找到当前程序：{error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn install_target() -> Result<PathBuf, String> {
+    let executable =
+        std::env::current_exe().map_err(|error| format!("无法找到当前程序：{error}"))?;
+    let bundle = executable.ancestors().nth(3).filter(|bundle| {
+        bundle
+            .extension()
+            .is_some_and(|extension| extension == "app")
+            && executable
+                .strip_prefix(bundle)
+                .is_ok_and(|path| path == Path::new("Contents/MacOS/g-terminal"))
+    });
+    bundle
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "当前程序从开发构建运行，请在发布页手动更新".into())
+}
+
+#[cfg(windows)]
+const INSTALLER_NAME: &str = "apply.ps1";
+#[cfg(windows)]
+const INSTALLER: &str = include_str!("update/apply.ps1");
+#[cfg(target_os = "macos")]
+const INSTALLER_NAME: &str = "apply.sh";
+#[cfg(target_os = "macos")]
+const INSTALLER: &str = include_str!("update/apply.sh");
+
+#[cfg(windows)]
+fn windows_system_dir() -> Result<PathBuf, String> {
+    std::env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32"))
+        .ok_or_else(|| "无法找到 Windows 系统目录".into())
+}
+
+#[cfg(windows)]
+fn hidden_windows_command(program: PathBuf) -> Command {
+    use std::os::windows::process::CommandExt;
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW.0);
+    command
+}
+
+#[cfg(windows)]
+fn installer_command(script: &Path) -> Result<Command, String> {
+    let mut command =
+        hidden_windows_command(windows_system_dir()?.join("WindowsPowerShell/v1.0/powershell.exe"));
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(script);
+    Ok(command)
+}
+
+#[cfg(target_os = "macos")]
+fn installer_command(script: &Path) -> Result<Command, String> {
+    let mut command = Command::new("/bin/sh");
+    command.arg(script);
+    Ok(command)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn versions_compare_numerically() {
-        assert!(is_newer("0.4.10", "0.4.9"));
-        assert!(is_newer("v0.5.0", "0.4.9"));
-        assert!(!is_newer("0.4.1", "0.4.10"));
-        assert!(!is_newer("0.4.1", "0.4.1"));
-        assert!(!is_newer("nightly", "0.4.1"));
-    }
+    const WINDOWS: &str = "windows-x64.zip";
+    const MAC_ARM: &str = "macos-arm64.tar.gz";
+    const RELEASE: &str = r#"{
+        "tag_name": "v9.9.9",
+        "html_url": "https://example.com/release",
+        "body": "notes",
+        "assets": [
+            {"name": "G-Terminal-9.9.9-windows-x64.zip", "browser_download_url": "https://example.com/win.zip"},
+            {"name": "G-Terminal-9.9.9-windows-x64.zip.sha256", "browser_download_url": "https://example.com/win.zip.sha256"},
+            {"name": "G-Terminal-9.9.9-macos-arm64.tar.gz", "browser_download_url": "https://example.com/mac.tar.gz"},
+            {"name": "G-Terminal-9.9.9-macos-x86_64.tar.gz.sha256", "browser_download_url": "https://example.com/intel.tar.gz.sha256"}
+        ]
+    }"#;
 
     #[test]
-    fn a_newer_release_picks_the_platform_asset() {
-        let json = r#"{
-            "tag_name": "v9.9.9",
-            "html_url": "https://example.com/release",
-            "body": "notes",
-            "assets": [
-                {"name": "G-Terminal-9.9.9-windows-x64.zip", "browser_download_url": "https://example.com/win.zip"},
-                {"name": "G-Terminal-9.9.9-macos-arm64.tar.gz", "browser_download_url": "https://example.com/mac.tar.gz"}
-            ]
-        }"#;
-        let status = parse_latest(json, "0.4.1").unwrap();
-        match status {
-            Status::Available(release) => {
-                assert_eq!(release.version, "9.9.9");
-                assert_eq!(release.url, "https://example.com/release");
-                // The chosen asset is the one for this machine.
-                if cfg!(target_os = "macos") {
-                    assert!(release.asset_name.unwrap().contains("macos-"));
-                }
-            }
-            other => panic!("expected an available release, got {other:?}"),
+    fn versions_follow_semver_precedence() {
+        assert!(is_newer("0.4.10", "0.4.9").unwrap());
+        assert!(is_newer("0.5.0", "0.5.0-rc.1").unwrap());
+        assert!(!is_newer("0.5.0-rc.1", "0.5.0").unwrap());
+        assert!(!is_newer("0.4.1+new", "0.4.1").unwrap());
+        for malformed in ["nightly", "1.bad.0", "1.0.0.1", "1.0"] {
+            assert!(is_newer(malformed, "0.4.1").is_err());
         }
     }
 
     #[test]
-    fn the_checksum_asset_is_found_and_parsed() {
-        let json = r#"{
-            "tag_name": "v9.9.9",
-            "html_url": "x",
-            "assets": [
-                {"name": "G-Terminal-9.9.9-windows-x64.zip", "browser_download_url": "https://example.com/win.zip"},
-                {"name": "G-Terminal-9.9.9-windows-x64.zip.sha256", "browser_download_url": "https://example.com/win.zip.sha256"},
-                {"name": "G-Terminal-9.9.9-macos-arm64.tar.gz", "browser_download_url": "https://example.com/mac.tar.gz"},
-                {"name": "G-Terminal-9.9.9-macos-arm64.tar.gz.sha256", "browser_download_url": "https://example.com/mac.tar.gz.sha256"}
-            ]
-        }"#;
-        if let Status::Available(release) = parse_latest(json, "0.4.1").unwrap()
-            && let Some(asset) = release.asset
-        {
-            assert_eq!(release.checksum, Some(format!("{asset}.sha256")));
+    fn a_newer_release_picks_the_platform_asset_and_its_checksum() {
+        let Status::Available(release) = parse_latest(RELEASE, "0.4.1", Some(WINDOWS)).unwrap()
+        else {
+            panic!("expected a release")
+        };
+        assert_eq!(release.version, "9.9.9");
+        assert_eq!(release.url, "https://example.com/release");
+        let Download::Available(package) = release.download else {
+            panic!("expected a package")
+        };
+        assert_eq!(package.name, "G-Terminal-9.9.9-windows-x64.zip");
+        assert_eq!(package.url, "https://example.com/win.zip");
+        assert_eq!(package.checksum_url, "https://example.com/win.zip.sha256");
+    }
+
+    #[test]
+    fn an_uninstallable_release_still_links_to_the_release_page() {
+        for (suffix, missing_checksum) in [
+            (Some(MAC_ARM), true),
+            (Some("macos-x86_64.tar.gz"), false),
+            (None, false),
+        ] {
+            let Status::Available(release) = parse_latest(RELEASE, "0.4.1", suffix).unwrap() else {
+                panic!("expected a release")
+            };
+            assert!(match release.download {
+                Download::MissingChecksum => missing_checksum,
+                Download::Unavailable => !missing_checksum,
+                Download::Available(_) => false,
+            });
+            assert_eq!(release.url, "https://example.com/release");
         }
+    }
+
+    #[test]
+    fn an_older_tag_is_not_an_update() {
+        let Status::UpToDate { current } = parse_latest(RELEASE, "10.0.0", Some(WINDOWS)).unwrap()
+        else {
+            panic!("expected the current version")
+        };
+        assert_eq!(current, "10.0.0");
+    }
+
+    #[test]
+    fn checksum_requires_a_full_hex_digest() {
         let digest = "AB".repeat(32);
         assert_eq!(
             parse_checksum(&format!("{digest}  G-Terminal.zip\n")),
             Some(digest.to_ascii_lowercase())
         );
         assert_eq!(parse_checksum("nothing useful"), None);
-    }
-
-    #[test]
-    fn an_older_tag_is_not_an_update() {
-        let json = r#"{"tag_name":"v0.4.0","html_url":"x","assets":[]}"#;
-        assert_eq!(
-            parse_latest(json, "0.4.1").unwrap(),
-            Status::UpToDate {
-                current: "0.4.1".into()
-            }
-        );
-    }
-
-    #[test]
-    fn a_tag_without_a_platform_asset_still_reports_the_release() {
-        let json = r#"{"tag_name":"v9.9.9","html_url":"x","assets":[]}"#;
-        match parse_latest(json, "0.4.1").unwrap() {
-            Status::Available(release) => {
-                assert!(release.asset.is_none());
-                assert!(release.asset_name.is_none());
-            }
-            other => panic!("expected an available release, got {other:?}"),
-        }
     }
 }

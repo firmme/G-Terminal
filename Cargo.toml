@@ -1,6 +1,6 @@
 [package]
 name = "g-terminal"
-version = "0.4.14"
+version = "0.4.15"
 edition = "2024"
 rust-version = "1.88"
 description = "A native GPU terminal, built for Windows and designed for multiple platforms"
@@ -15,6 +15,7 @@ serial2 = "=0.2.38"
 vt100 = "=0.16.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 directories = "6"
 arboard = { version = "3", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -41,6 +42,8 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 egui-directx11 = "=0.12.0"

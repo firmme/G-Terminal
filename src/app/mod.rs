@@ -320,6 +320,7 @@ pub struct App {
     /// What the 检查更新 window shows; written by its worker thread.
     update_status: Arc<Mutex<update::Status>>,
     update_open: bool,
+    restart_for_update: bool,
     /// The current OS window title, so it is only sent when it changes.
     window_title: String,
 }
@@ -418,8 +419,9 @@ impl App {
             navigation_selection: None,
             confirm_exit: capture_view.as_deref() == Some("confirm"),
             exit_confirmed: false,
-            update_status: Arc::new(Mutex::new(update::Status::Checking)),
+            update_status: Arc::new(Mutex::new(update::Status::Idle)),
             update_open: false,
+            restart_for_update: false,
             window_title: String::new(),
         };
         if app.settings.restore_tabs && app.screenshot.is_none() {
@@ -1360,10 +1362,21 @@ impl App {
     /// platform's close request, the dialog's own button 鈥?comes through here.
     pub(super) fn request_exit(&mut self, ctx: &egui::Context) {
         if self.exit_confirmed || !self.settings.confirm_on_exit || !self.has_live_sessions() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.finish_exit(ctx);
         } else {
             self.confirm_exit = true;
         }
+    }
+
+    fn finish_exit(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.restart_for_update)
+            && let Err(error) = self.launch_prepared_update()
+        {
+            self.notify(error);
+            return;
+        }
+        self.exit_confirmed = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     fn find(&mut self, next: bool) {
         if let Some(t) = self.tabs.get_mut(self.active) {

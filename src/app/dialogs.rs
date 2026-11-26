@@ -1123,7 +1123,16 @@ impl App {
         if self.confirm_exit {
             let mut open = true;
             let mut keep_tabs_changed = false;
-            crate::dialog::Dialog::new("确认退出", Icon::Warning, self.palette)
+            let (title, message, button) = if self.restart_for_update {
+                (
+                    "确认重启",
+                    "重启更新会断开当前连接，确定要继续吗？",
+                    "重启并安装",
+                )
+            } else {
+                ("确认退出", "仍有未断开的连接，确定要退出吗？", "退出")
+            };
+            crate::dialog::Dialog::new(title, Icon::Warning, self.palette)
                 .open(&mut open)
                 .default_width(360.0)
                 .collapsible(false)
@@ -1131,7 +1140,7 @@ impl App {
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label("仍有未断开的连接，确定要退出吗？");
+                    ui.label(message);
                     ui.add_space(8.0);
                     keep_tabs_changed = ui
                         .checkbox(&mut self.settings.restore_tabs, "保留当前选项卡")
@@ -1139,15 +1148,15 @@ impl App {
                         .changed();
                     ui.add_space(12.0);
                     crate::dialog::footer(ui, |ui| {
-                        if crate::dialog::primary(ui, "退出", self.palette).clicked() {
-                            self.exit_confirmed = true;
+                        if crate::dialog::primary(ui, button, self.palette).clicked() {
                             self.confirm_exit = false;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            self.finish_exit(ctx);
                         }
                         let cancel = crate::dialog::secondary(ui, "取消");
                         focus.request(ui, &cancel);
                         if cancel.clicked() {
                             self.confirm_exit = false;
+                            self.restart_for_update = false;
                         }
                     });
                 });
@@ -1156,6 +1165,7 @@ impl App {
             }
             if !open {
                 self.confirm_exit = false;
+                self.restart_for_update = false;
             }
         }
     }

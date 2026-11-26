@@ -9,7 +9,16 @@ impl App {
     pub(super) fn check_updates(&mut self, ctx: &egui::Context) {
         self.update_open = true;
         let status = self.update_status.clone();
-        *status.locked() = update::Status::Checking;
+        {
+            let mut state = status.locked();
+            if matches!(
+                *state,
+                update::Status::Checking | update::Status::Downloading | update::Status::Ready(_)
+            ) {
+                return;
+            }
+            *state = update::Status::Checking;
+        }
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let next = update::check().unwrap_or_else(update::Status::Failed);
@@ -18,34 +27,25 @@ impl App {
         });
     }
 
-    /// Downloads the release and lets `update::install` swap the bundle once
-    /// this process is gone, then quits.
-    pub(super) fn start_update(&mut self, ctx: &egui::Context, release: update::Release) {
-        let (Some(url), Some(name), Some(checksum)) =
-            (release.asset, release.asset_name, release.checksum)
-        else {
-            return;
-        };
+    fn start_update(&mut self, ctx: &egui::Context, package: update::Package) {
         let status = self.update_status.clone();
         *status.locked() = update::Status::Downloading;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = update::download(&url, &name, &checksum)
-                .and_then(|archive| update::install(&archive));
-            match result {
-                Ok(()) => {
-                    *status.locked() = update::Status::Ready;
-                    ctx.request_repaint();
-                    // Let the "正在重启" note paint before the process goes away.
-                    std::thread::sleep(std::time::Duration::from_millis(600));
-                    std::process::exit(0);
-                }
-                Err(error) => {
-                    *status.locked() = update::Status::Failed(error);
-                    ctx.request_repaint();
-                }
-            }
+            let next = match update::PreparedUpdate::prepare(&package) {
+                Ok(prepared) => update::Status::Ready(prepared),
+                Err(error) => update::Status::Failed(error),
+            };
+            *status.locked() = next;
+            ctx.request_repaint();
         });
+    }
+
+    pub(super) fn launch_prepared_update(&self) -> Result<(), String> {
+        match &mut *self.update_status.locked() {
+            update::Status::Ready(prepared) => prepared.launch(),
+            _ => Err("更新文件尚未准备完成".into()),
+        }
     }
 
     /// The 检查更新 window.
@@ -53,16 +53,18 @@ impl App {
         if !self.update_open {
             return;
         }
-        let status = self.update_status.locked().clone();
+        let status = self.update_status.locked();
         let mut open = true;
         let mut retry = false;
         let mut start = None;
+        let mut restart = false;
         crate::dialog::Dialog::new("检查更新", Icon::Refresh, p)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .default_width(400.0)
-            .show(ctx, |ui| match &status {
+            .show(ctx, |ui| match &*status {
+                update::Status::Idle => {}
                 update::Status::Checking => {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -94,14 +96,18 @@ impl App {
                     }
                     ui.separator();
                     crate::dialog::footer(ui, |ui| {
-                        if release.asset.is_some() && release.checksum.is_some() {
-                            if crate::dialog::primary(ui, "下载并更新", p).clicked() {
-                                start = Some(release.clone());
+                        match &release.download {
+                            update::Download::Available(package) => {
+                                if crate::dialog::primary(ui, "下载更新", p).clicked() {
+                                    start = Some(package.clone());
+                                }
                             }
-                        } else if release.asset.is_some() {
-                            ui.label(hint("发布缺少校验文件，请在发布页手动下载。", p));
-                        } else {
-                            ui.label(hint("当前平台没有预编译包，请在发布页手动下载。", p));
+                            update::Download::MissingChecksum => {
+                                ui.label(hint("发布缺少校验文件，请在发布页手动下载。", p));
+                            }
+                            update::Download::Unavailable => {
+                                ui.label(hint("当前平台没有预编译包，请在发布页手动下载。", p));
+                            }
                         }
                         if crate::dialog::secondary(ui, "打开发布页").clicked() {
                             let _ = crate::remote_ui::open_url(&release.url);
@@ -111,19 +117,28 @@ impl App {
                 update::Status::Downloading => {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("正在下载新版本…");
+                        ui.label("正在下载并校验更新…");
                     });
                 }
-                update::Status::Ready => {
-                    ui.label("更新已就绪，正在重启…");
+                update::Status::Ready(_) => {
+                    ui.label("更新已就绪。现在重启会断开当前连接。");
+                    crate::dialog::footer(ui, |ui| {
+                        restart = crate::dialog::primary(ui, "重启并安装", p).clicked();
+                    });
                 }
             });
+        drop(status);
         self.update_open = open;
         if retry {
             self.check_updates(ctx);
         }
-        if let Some(release) = start {
-            self.start_update(ctx, release);
+        if let Some(package) = start {
+            self.start_update(ctx, package);
+        }
+        if restart {
+            self.restart_for_update = true;
+            self.request_exit(ctx);
+            ctx.request_repaint();
         }
     }
 }

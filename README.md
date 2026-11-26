@@ -2,7 +2,7 @@
 
 原生 GPU 终端，Rust + egui。Windows 默认 Direct3D 11 渲染，其余平台走 wgpu；无 Electron / Chromium / WebView。
 
-当前版本 **0.4.14**，提供 Windows x64 便携版与 macOS arm64 应用包，新增菜单 GitHub 入口，macOS 改用固定自签名身份与完整应用包签名。Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
+当前版本 **0.4.15**，支持后台下载并校验更新，准备就绪后可选择重启安装。项目提供 Windows x64 便携版与 macOS arm64 应用包，各版本的下载请见 [GitHub Releases](https://github.com/firmme/G-Terminal/releases)。Linux 入口保留、尚未实机验证。推荐 Windows 11（ConPTY 需 Windows 10 1809+）。
 
 ## 截图
 
